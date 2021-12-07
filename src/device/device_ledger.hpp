@@ -164,6 +164,7 @@ namespace hw {
         void logCMD();
         void logRESP();
         unsigned int exchange(bool wait_on_input = false);
+        unsigned int exchange_wait_on_input(unsigned int ok=SW_OK, unsigned int mask=0xFFFF);
         void reset_buffer();
         int set_command_header(unsigned char ins, unsigned char p1 = 0x00, unsigned char p2 = 0x00);
         int set_command_header_noopt(unsigned char ins, unsigned char p1 = 0x00, unsigned char p2 = 0x00);

@@ -50,12 +50,12 @@ set(serialization_private_headers
 json_archive.h
 json_utils.h)
 
-add_library(serialization
+add_library(serialization INTERFACE
   ${serialization_sources}
   ${serialization_private_headers})
-  
+SET_TARGET_PROPERTIES(serialization PROPERTIES LINKER_LANGUAGE CXX)
 target_link_libraries(serialization
-  LINK_PRIVATE
+        INTERFACE
     cryptonote_basic
     cryptonote_core
     cryptonote_protocol

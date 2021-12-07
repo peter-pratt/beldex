@@ -55,11 +55,33 @@ namespace hw {
     /* ===================================================================== */
     /* ===                           Debug                              ==== */
     /* ===================================================================== */
+    #define TRACKD MTRACE("hw")
+    #define ASSERT_SW(sw,ok,msk) CHECK_AND_ASSERT_THROW_MES(((sw)&(mask))==(ok), \
+      "Wrong Device Status: " << "0x" << std::hex << (sw) << " (" << Status::to_string(sw) << "), " << \
+      "EXPECTED 0x" << std::hex << (ok) << " (" << Status::to_string(ok) << "), " << \
+      "MASK 0x" << std::hex << (mask));
+    #define ASSERT_T0(exp)       CHECK_AND_ASSERT_THROW_MES(exp, "Protocol assert failure: "#exp ) ;
+    #define ASSERT_X(exp,msg)    CHECK_AND_ASSERT_THROW_MES(exp, msg);
+
 
     namespace {
 
     bool apdu_verbose = true;
 
+    struct Status
+    {
+      unsigned int code;
+      const char *string;
+
+      constexpr operator unsigned int() const
+      {
+        return this->code;
+      }
+
+      static const char *to_string(unsigned int code);
+    };
+
+    // Must be sorted in ascending order by the code
     #define LEDGER_STATUS(status) {status, #status##sv}
     constexpr std::pair<unsigned int, std::string_view> status_codes[] = {
       LEDGER_STATUS(SW_SECURITY_PIN_LOCKED),
@@ -93,14 +115,13 @@ namespace hw {
       LEDGER_STATUS(SW_UNKNOWN),
     };
 
-    std::string status_string(unsigned int code)
+ const char *Status::to_string(unsigned int code)
     {
-      for (auto& [code_, str] : status_codes)
-        if (code_ == code)
-          return std::string{str};
-      if ((code & 0xff00) == SW_WRONG_LENGTH)
-        return "SW_WRONG_LENGTH(" + std::to_string(code & 0xff) + ")";
-      return "UNKNOWN"s;
+      constexpr size_t status_codes_size = sizeof(status_codes) / sizeof(status_codes[0]);
+      constexpr const Status *status_codes_end = &status_codes[status_codes_size];
+
+      const Status *item = std::lower_bound(&status_codes[0], status_codes_end, code);
+      return (item == status_codes_end || code < *item) ? "UNKNOWN" : item->string;
     }
 
     } // anon namespace
@@ -293,6 +314,7 @@ namespace hw {
     LEDGER_INS(GEN_TXOUT_KEYS,                  0x7B);
     LEDGER_INS(PREFIX_HASH,                     0x7D);
     LEDGER_INS(VALIDATE,                        0x7C);
+    LEDGER_INS(MLSAG,                           0x7E);
     LEDGER_INS(CLSAG,                           0x7F);
     LEDGER_INS(CLOSE_TX,                        0x80);
 
@@ -513,10 +535,29 @@ namespace hw {
         return sw;
 
       CHECK_AND_ASSERT_THROW_MES(sw == SW_OK,
-        "Wrong Device Status: " << "0x" << std::hex << sw << " (" << status_string(sw) << "), " <<
-        "EXPECTED 0x" << std::hex << SW_OK << " (" << status_string(SW_OK) << "), ");
+        "Wrong Device Status: " << "0x" << std::hex << sw << " (" << Status::to_string(sw) << "), " <<
+        "EXPECTED 0x" << std::hex << SW_OK << " (" << Status::to_string(SW_OK) << "), ");
 
       return sw;
+    }
+
+    unsigned int device_ledger::exchange_wait_on_input(unsigned int ok, unsigned int mask) {
+      logCMD();
+      unsigned int deny = 0;
+      this->length_recv =  hw_device.exchange(this->buffer_send, this->length_send, this->buffer_recv, BUFFER_SEND_SIZE, true);
+      CHECK_AND_ASSERT_THROW_MES(this->length_recv>=2, "Communication error, less than two bytes received");
+
+      this->length_recv -= 2;
+      this->sw = (this->buffer_recv[length_recv]<<8) | this->buffer_recv[length_recv+1];
+      if (this->sw == IO_SW_DENY) {
+        // cancel on device
+        deny = 1;
+      } else {
+        ASSERT_SW(this->sw,ok,mask);
+      }
+
+      logRESP();
+      return deny;
     }
 
     void device_ledger::reset_buffer() {
@@ -1785,8 +1826,8 @@ namespace hw {
         // check fee user input
         CHECK_AND_ASSERT_THROW_MES(this->exchange_wait_on_input() == 0, "Fee denied on device.");
 
-        //pseudoOuts
-        if (type == rct::RCTTypeSimple) {
+        //pseudoOutsrct
+        if (type == rct::RCTType::Simple) {
           for ( i = 0; i < inputs_size; i++) {
             offset = set_command_header(INS_VALIDATE, 0x01, i+2);
             //options
@@ -1805,7 +1846,7 @@ namespace hw {
 
         // ======  Aout, Bout, AKout, C, v, k ======
         kv_offset = data_offset;
-        if (type==rct::RCTTypeBulletproof2 || type==rct::RCTTypeCLSAG) {
+        if (type==rct::RCTType::Bulletproof2 || type==rct::RCTType::CLSAG) {
           C_offset = kv_offset+ (8)*outputs_size;
         } else {
           C_offset = kv_offset+ (32+32)*outputs_size;
@@ -1822,7 +1863,7 @@ namespace hw {
           offset = set_command_header(INS_VALIDATE, 0x02, i+1);
           //options
           this->buffer_send[offset] = (i==outputs_size-1)? 0x00:0x80 ;
-          this->buffer_send[offset] |= (type==rct::RCTTypeBulletproof2 || type==rct::RCTTypeCLSAG)?0x02:0x00;
+          this->buffer_send[offset] |= (type==rct::RCTType::Bulletproof2 || type==rct::RCTType::CLSAG)?0x02:0x00;
           offset += 1;
           //is_subaddress
           this->buffer_send[offset] = outKeys.is_subaddress;
@@ -1843,7 +1884,7 @@ namespace hw {
           memmove(this->buffer_send+offset, data+C_offset,32);
           offset += 32;
           C_offset += 32;
-          if (type==rct::RCTTypeBulletproof2 || type==rct::RCTTypeCLSAG) {
+          if (type==rct::RCTType::Bulletproof2 || type==rct::RCTType::CLSAG) {
             //k
             memset(this->buffer_send+offset, 0, 32);
             offset += 32;

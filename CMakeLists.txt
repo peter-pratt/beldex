@@ -251,6 +251,7 @@ endif()
 
 enable_testing()
 
+
 option(BUILD_DOCUMENTATION "Build the Doxygen documentation." ON)
 option(BUILD_TESTS "Build tests." OFF)
 if (BUILD_TESTS)
@@ -303,7 +304,19 @@ option(PER_BLOCK_CHECKPOINT "Enables per-block checkpointing" ON)
 list(INSERT CMAKE_MODULE_PATH 0
   "${CMAKE_SOURCE_DIR}/cmake")
 
-option(BOOST_IGNORE_SYSTEM_PATHS "Ignore boost system paths for local boost installation" OFF)
+if (NOT DEFINED ENV{DEVELOPER_LOCAL_TOOLS})
+  message(STATUS "Could not find DEVELOPER_LOCAL_TOOLS in env (not required)")
+  set(BOOST_IGNORE_SYSTEM_PATHS_DEFAULT OFF)
+elseif ("$ENV{DEVELOPER_LOCAL_TOOLS}" EQUAL 1)
+  message(STATUS "Found: env DEVELOPER_LOCAL_TOOLS = 1")
+  set(BOOST_IGNORE_SYSTEM_PATHS_DEFAULT ON)
+else()
+  message(STATUS "Found: env DEVELOPER_LOCAL_TOOLS = 0")
+  set(BOOST_IGNORE_SYSTEM_PATHS_DEFAULT OFF)
+endif()
+
+message(STATUS "BOOST_IGNORE_SYSTEM_PATHS defaults to ${BOOST_IGNORE_SYSTEM_PATHS_DEFAULT}")
+option(BOOST_IGNORE_SYSTEM_PATHS "Ignore boost system paths for local boost installation" ${BOOST_IGNORE_SYSTEM_PATHS_DEFAULT})
 
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
@@ -356,7 +369,13 @@ if(APPLE)
   endif()
 endif()
 
-option(BUILD_STATIC_DEPS "Download, build and statically link against core dependencies" OFF)
+
+if(APPLE)
+  option(BUILD_STATIC_DEPS "Download, build and statically link against core dependencies" ON)
+else()
+  option(BUILD_STATIC_DEPS "Download, build and statically link against core dependencies" OFF)
+endif()
+
 if(BUILD_STATIC_DEPS)
   include(StaticBuild)
 endif()
@@ -458,7 +477,6 @@ add_subdirectory(translations)
 
 add_library(miniupnpc INTERFACE)
 add_library(systemd INTERFACE)  # Will do nothing unless we find and enable systemd support
-
 if(NOT TARGET sodium)
 # Allow -D DOWNLOAD_SODIUM=FORCE to download without even checking for a local libsodium
   option(DOWNLOAD_SODIUM "Allow libsodium to be downloaded and built locally if not found on the system" OFF)
@@ -495,12 +513,12 @@ if (WITH_SYSTEMD AND NOT BUILD_STATIC_DEPS)
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(SYSTEMD libsystemd IMPORTED_TARGET)
 
-    if(SYSTEMD_FOUND)
-      target_compile_definitions(systemd INTERFACE ENABLE_SYSTEMD)
-      target_link_libraries(systemd INTERFACE PkgConfig::SYSTEMD)
-    elseif(CMAKE_SYSTEM_NAME STREQUAL Linux)
-      message(WARNING "systemd not found; building without systemd support (use -DWITH_SYSTEMD=OFF to suppress this warning)")
-    endif()
+  if(SYSTEMD_FOUND)
+    target_compile_definitions(systemd INTERFACE ENABLE_SYSTEMD)
+    target_link_libraries(systemd INTERFACE PkgConfig::SYSTEMD)
+  elseif(CMAKE_SYSTEM_NAME STREQUAL Linux)
+    message(WARNING "systemd not found; building without systemd support (use -DWITH_SYSTEMD=OFF to suppress this warning)")
+  endif()
 endif()
 
 
@@ -771,40 +789,42 @@ endif()
 
 
 
+
 if (${BOOST_IGNORE_SYSTEM_PATHS} STREQUAL "ON")
   set(Boost_NO_SYSTEM_PATHS TRUE)
 endif()
 
 set(OLD_LIB_SUFFIXES ${CMAKE_FIND_LIBRARY_SUFFIXES})
+set(Boost_NO_BOOST_CMAKE ON)
 if(STATIC)
   if(MINGW)
     set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
-    set(Boost_NO_BOOST_CMAKE ON)
   endif()
 
   set(Boost_USE_STATIC_LIBS ON)
   set(Boost_USE_STATIC_RUNTIME ON)
 endif()
-set(Boost_USE_MULTITHREADED TRUE) # Needed for macOS, at least, and won't hurt elsewhere
-
-if(BUILD_STATIC_DEPS)
-  # StaticBuild.cmake sets Boost targets up for us
-else()
-  find_package(Boost 1.58 QUIET REQUIRED COMPONENTS system thread serialization program_options)
-endif()
+find_package(Boost 1.58 QUIET REQUIRED COMPONENTS system filesystem thread date_time chrono regex serialization program_options locale)
 
 set(CMAKE_FIND_LIBRARY_SUFFIXES ${OLD_LIB_SUFFIXES})
 if(NOT Boost_FOUND)
-  message(FATAL_ERROR "Could not find Boost libraries, please make sure you have installed Boost or libboost-all-dev (>=1.58) or the equivalent")
+  die("Could not find Boost libraries, please make sure you have installed Boost or libboost-all-dev (>=1.58) or the equivalent")
 elseif(Boost_FOUND)
   message(STATUS "Found Boost Version: ${Boost_VERSION}")
-  if (OPENSSL_VERSION VERSION_GREATER_EQUAL 1.1 AND (
-        Boost_VERSION VERSION_LESS 1.62.0 OR (Boost_VERSION VERSION_GREATER 100000 AND Boost_VERSION VERSION_LESS 106200)))
+  if (Boost_VERSION VERSION_LESS 10 AND Boost_VERSION VERSION_LESS 1.62.0 AND NOT (OPENSSL_VERSION VERSION_LESS 1.1))
+    set(BOOST_BEFORE_1_62 true)
+  endif()
+  if (NOT Boost_VERSION VERSION_LESS 10 AND Boost_VERSION VERSION_LESS 106200 AND NOT (OPENSSL_VERSION VERSION_LESS 1.1))
+    set(BOOST_BEFORE_1_62 true)
+  endif()
+  if (BOOST_BEFORE_1_62)
       message(FATAL_ERROR "Boost ${Boost_VERSION} (older than 1.62) is too old to link with OpenSSL ${OPENSSL_VERSION} (1.1 or newer) found at ${OPENSSL_INCLUDE_DIR} and ${OPENSSL_LIBRARIES}. "
                           "Update Boost or install OpenSSL 1.0 and set path to it when running cmake: "
                           "cmake -DOPENSSL_ROOT_DIR='/usr/include/openssl-1.0'")
   endif()
 endif()
+
+include_directories(SYSTEM ${Boost_INCLUDE_DIRS})
 
 # Interface target for random extra system libraries that we need to link everything against
 add_library(extra INTERFACE)

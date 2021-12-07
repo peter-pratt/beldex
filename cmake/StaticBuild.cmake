@@ -19,10 +19,10 @@ set(EXPAT_SOURCE expat-${EXPAT_VERSION}.tar.xz)
 set(EXPAT_HASH SHA512=dde8a9a094b18d795a0e86ca4aa68488b352dc67019e0d669e8b910ed149628de4c2a49bc3a5b832f624319336a01f9e4debe03433a43e1c420f36356d886820
     CACHE STRING "expat source hash")
 
-set(UNBOUND_VERSION 1.13.1 CACHE STRING "unbound version")
+set(UNBOUND_VERSION 1.13.2 CACHE STRING "unbound version")
 set(UNBOUND_MIRROR ${LOCAL_MIRROR} https://nlnetlabs.nl/downloads/unbound CACHE STRING "unbound download mirror(s)")
 set(UNBOUND_SOURCE unbound-${UNBOUND_VERSION}.tar.gz)
-set(UNBOUND_HASH SHA256=8504d97b8fc5bd897345c95d116e0ee0ddf8c8ff99590ab2b4bd13278c9f50b8
+set(UNBOUND_HASH SHA256=0a13b547f3b92a026b5ebd0423f54c991e5718037fd9f72445817f6a040e1a83
     CACHE STRING "unbound source hash")
 
 set(BOOST_VERSION 1.76.0 CACHE STRING "boost version")
@@ -105,6 +105,14 @@ set(ZLIB_MIRROR ${LOCAL_MIRROR} https://zlib.net
 set(ZLIB_SOURCE zlib-${ZLIB_VERSION}.tar.gz)
 set(ZLIB_HASH SHA512=73fd3fff4adeccd4894084c15ddac89890cd10ef105dd5e1835e1e9bbb6a49ff229713bd197d203edfa17c2727700fce65a2a235f07568212d820dca88b528ae
     CACHE STRING "zlib source hash")
+
+
+set(NGHTTP2_VERSION 1.46.0 CACHE STRING "nghttp2 version")
+set(NGHTTP2_MIRROR ${LOCAL_MIRROR} https://github.com/nghttp2/nghttp2/releases/download/
+        CACHE STRING "nghttp2 mirror(s)")
+set(NGHTTP2_SOURCE v${NGHTTP2_VERSION}/nghttp2-${NGHTTP2_VERSION}.tar.xz)
+set(NGHTTP2_HASH SHA256=1a68cc4a5732afb735baf50aaac3cb3a6771e49f744bd5db6c49ab5042f12a43
+        CACHE STRING "nghttp2 source hash")
 
 set(CURL_VERSION 7.76.1 CACHE STRING "curl version")
 set(CURL_MIRROR ${LOCAL_MIRROR} https://curl.haxx.se/download https://curl.askapache.com
@@ -229,6 +237,7 @@ set(build_def_BUILD_BYPRODUCTS ${DEPS_DESTDIR}/lib/lib___TARGET___.a ${DEPS_DEST
 set(build_dep_TARGET_SUFFIX "")
 
 function(build_external target)
+
   set(options TARGET_SUFFIX DEPENDS PATCH_COMMAND CONFIGURE_COMMAND BUILD_COMMAND INSTALL_COMMAND BUILD_BYPRODUCTS)
   cmake_parse_arguments(PARSE_ARGV 1 arg "" "" "${options}")
   foreach(o ${options})
@@ -240,6 +249,7 @@ function(build_external target)
 
   string(TOUPPER "${target}" prefix)
   expand_urls(urls ${${prefix}_SOURCE} ${${prefix}_MIRROR})
+  message(STATUS "build_external_arg:${target} ${arg_CONFIGURE_COMMAND}")
   ExternalProject_Add("${target}${arg_TARGET_SUFFIX}_external"
     DEPENDS ${arg_DEPENDS}
     BUILD_IN_SOURCE ON
@@ -326,7 +336,7 @@ build_external(unbound
   --enable-static --with-libunbound-only --with-pic --disable-gost
   --$<IF:$<BOOL:${USE_LTO}>,enable,disable>-flto --with-ssl=${DEPS_DESTDIR}
   --with-libexpat=${DEPS_DESTDIR}
-  "CC=${deps_cc}" "CFLAGS=${deps_CFLAGS}" ${unbound_extra}
+  #"CC=${deps_cc}" "CFLAGS=${deps_CFLAGS}" ${unbound_extra}
 )
 add_static_target(libunbound unbound_external libunbound.a)
 if(WIN32)
@@ -336,7 +346,7 @@ endif()
 
 
 set(boost_threadapi "pthread")
-set(boost_bootstrap_cxx "--cxx=${deps_cxx}")
+set(boost_bootstrap_cxx "--cxx ${deps_cxx}")
 set(boost_toolset "")
 set(boost_extra "")
 if(USE_LTO)
@@ -390,21 +400,22 @@ set(boost_buildflags "cxxflags=-fPIC")
 if(IOS)
   set(boost_buildflags)
 elseif(APPLE)
-  set(boost_buildflags "cxxflags=-fPIC -mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}" "cflags=-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+  set(boost_buildflags "cxxflags=-fPIC -isysroot ${CMAKE_OSX_SYSROOT} -mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}" "cflags=-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
 endif()
 
+message(STATUS, "boost info: ${CMAKE_OSX_SYSROOT}")
 build_external(boost
   #  PATCH_COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_BINARY_DIR}/user-config.bjam tools/build/src/user-config.jam
   ${boost_patch_commands}
   CONFIGURE_COMMAND
-    ./tools/build/src/engine/build.sh ${boost_toolset} ${boost_bootstrap_cxx}
+    ./tools/build/src/engine/build.sh --verbose ${boost_bootstrap_cxx} --cxxflags -isysroot ${CMAKE_OSX_SYSROOT} ${boost_toolset}
   BUILD_COMMAND
-    cp tools/build/src/engine/b2 .
+        cp tools/build/src/engine/b2 .
   INSTALL_COMMAND
-    ./b2 -d0 variant=release link=static runtime-link=static optimization=speed ${boost_extra}
+    ./b2 -q variant=release link=static runtime-link=static optimization=speed ${boost_extra}
       threading=multi threadapi=${boost_threadapi} ${boost_buildflags} cxxstd=17 visibility=global
       --disable-icu --user-config=${CMAKE_CURRENT_BINARY_DIR}/user-config.bjam
-      --prefix=${DEPS_DESTDIR} --exec-prefix=${DEPS_DESTDIR} --libdir=${DEPS_DESTDIR}/lib --includedir=${DEPS_DESTDIR}/include
+      --prefix=${DEPS_DESTDIR} --exec-prefix=${DEPS_DESTDIR} --libdir=${DEPS_DESTDIR}/lib --includedir=${DEPS_DESTDIR}/include --includedir=${CMAKE_OSX_SYSROOT}
       --with-program_options --with-system --with-thread --with-serialization
       install
   BUILD_BYPRODUCTS
@@ -433,8 +444,8 @@ build_external(sqlite3
 add_static_target(sqlite3 sqlite3_external libsqlite3.a)
 
 
-
 if (NOT (WIN32 OR ANDROID OR IOS))
+  message(STATUS "ncurses would use but overruled ${deps_cc}")
   build_external(ncurses
     CONFIGURE_COMMAND ./configure ${cross_host} --prefix=${DEPS_DESTDIR} --without-debug --without-ada
       --without-cxx-binding --without-cxx --without-ticlib --without-tic --without-progs
@@ -443,7 +454,7 @@ if (NOT (WIN32 OR ANDROID OR IOS))
       --disable-rpath --disable-colorfgbg --disable-ext-mouse --disable-symlinks --enable-warnings
       --enable-assertions --with-default-terminfo-dir=/etc/_terminfo_
       --with-terminfo-dirs=/etc/_terminfo_ --disable-pc-files --enable-database --enable-sp-funcs
-      --disable-term-driver --enable-interop --enable-widec "CC=${CMAKE_C_COMPILER}" "CFLAGS=${deps_CFLAGS} -fPIC"
+      --disable-term-driver --enable-interop --enable-widec "CFLAGS=${deps_CFLAGS} -fPIC"
     INSTALL_COMMAND make install.libs
     BUILD_BYPRODUCTS
       ${DEPS_DESTDIR}/lib/libncursesw.a
@@ -603,6 +614,15 @@ set_target_properties(libzmq PROPERTIES
     INTERFACE_COMPILE_DEFINITIONS "ZMQ_STATIC")
 
 
+build_external(nghttp2
+        DEPENDS zlib_external openssl_external
+        CONFIGURE_COMMAND ./configure --prefix=${DEPS_DESTDIR} --disable-threads --disable-failmalloc --enable-dependency-tracking
+        --with-pic "CFLAGS=-O2 -flto -isysroot ${CMAKE_OSX_SYSROOT} -mmacosx-version-min=10.12 -fPIC"
+        LDFLAGS=-L${DEPS_DESTDIR}/lib ZLIB_CFLAGS=-I${DEPS_DESTDIR}/include ZLIB_LIBS=-L${DEPS_DESTDIR}/lib
+        OPENSSL_CFLAGS=-I${DEPS_DESTDIR}/include OPENSSL_LIBS=-L${DEPS_DESTDIR}/lib
+        )
+add_static_target(nghttp2 nghttp2_external libnghttp2.a)
+
 
 set(curl_extra)
 if(WIN32)
@@ -646,18 +666,18 @@ foreach(curl_arch ${curl_arches})
 
   build_external(curl
     TARGET_SUFFIX ${curl_target_suffix}
-    DEPENDS openssl_external zlib_external
+    DEPENDS openssl_external zlib_external nghttp2_external
     CONFIGURE_COMMAND ./configure ${cross_host} ${cross_extra} --prefix=${curl_prefix} --disable-shared
     --enable-static --disable-ares --disable-ftp --disable-ldap --disable-laps --disable-rtsp
     --disable-dict --disable-telnet --disable-tftp --disable-pop3 --disable-imap --disable-smb
-    --disable-smtp --disable-gopher --disable-manual --disable-libcurl-option --enable-http
+    --disable-smtp --enable-dependency-tracking --disable-gopher --disable-manual --disable-libcurl-option --enable-http
     --enable-ipv6 --disable-threaded-resolver --disable-pthreads --disable-verbose --disable-sspi
     --enable-crypto-auth --disable-ntlm-wb --disable-tls-srp --disable-unix-sockets --disable-cookies
     --enable-http-auth --enable-doh --disable-mime --enable-dateparse --disable-netrc --without-libidn2
     --disable-progress-meter --without-brotli --with-zlib=${DEPS_DESTDIR} ${curl_ssl_opts}
     --without-libmetalink --without-librtmp --disable-versioned-symbols --enable-hidden-symbols
     --without-zsh-functions-dir --without-fish-functions-dir
-    "CC=${deps_cc}" "CFLAGS=${deps_noarch_CFLAGS}${cflags_extra}" ${curl_extra}
+    "CFLAGS=${deps_noarch_CFLAGS}${cflags_extra}" ${curl_extra}
     BUILD_COMMAND true
     INSTALL_COMMAND make -C lib install && make -C include install
     BUILD_BYPRODUCTS

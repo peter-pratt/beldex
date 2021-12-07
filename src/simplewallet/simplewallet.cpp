@@ -5772,7 +5772,7 @@ bool simple_wallet::confirm_and_send_tx(std::vector<cryptonote::address_parse_in
               tools::fail_msg_writer() << tools::ERR_MSG_NETWORK_VERSION_QUERY_FAILED;
               return false;
           }
-          float days = lock_time_in_blocks / float{BLOCKS_EXPECTED_IN_DAYS(1,*hf_version)};
+          float days = lock_time_in_blocks / static_cast<float>(BLOCKS_EXPECTED_IN_DAYS(1,*hf_version));
         prompt << boost::format(tr(".\nThis transaction (including %s change) will unlock on block %llu, in approximately %s days (assuming 2 minutes per block)")) % cryptonote::print_money(change) % ((unsigned long long)unlock_block) % days;
       }
 
