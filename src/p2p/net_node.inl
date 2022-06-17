@@ -610,8 +610,9 @@ namespace nodetool
     std::set<std::string> full_addrs;
     if (nettype == cryptonote::TESTNET)
     {
-		full_addrs.insert("test1.rpcnode.stream:29090");
-        full_addrs.insert("test2.rpcnode.stream:29090");
+        full_addrs.insert("2a01:7c8:fffd:1c:5054:ff:fe7c:90c6");
+        full_addrs.insert("2a01:7c8:bb0c:20e:5054:ff:fe24:82cc");
+        full_addrs.insert("2a01:7c8:fffd:20:5054:ff:fe63:7bbb");
     }
     else if (nettype == cryptonote::DEVNET)
     {
@@ -642,10 +643,12 @@ namespace nodetool
     }
     if (m_nettype == cryptonote::TESTNET)
     {
+      LOG_PRINT_L0("get_seed_nodes TESTNET");
       return get_seed_nodes(cryptonote::TESTNET);
     }
     if (m_nettype == cryptonote::DEVNET)
     {
+        LOG_PRINT_L0("get_seed_nodes DEVNET");
       return get_seed_nodes(cryptonote::DEVNET);
     }
 
@@ -700,6 +703,7 @@ namespace nodetool
     bool res = handle_command_line(vm);
     CHECK_AND_ASSERT_MES(res, false, "Failed to handle command line");
 
+    LOG_PRINT_L0("node_server init");
     if (m_nettype == cryptonote::TESTNET)
     {
       memcpy(&m_network_id, &::config::testnet::NETWORK_ID, 16);
@@ -725,6 +729,7 @@ namespace nodetool
     for (auto& zone : m_network_zones)
     {
       res = zone.second.m_peerlist.init(m_peerlist_storage.take_zone(zone.first), m_allow_local_ip);
+      LOG_PRINT_L0("Before init peerlist");
       CHECK_AND_ASSERT_MES(res, false, "Failed to init peerlist.");
     }
 
@@ -768,6 +773,7 @@ namespace nodetool
     if (m_offline)
       return res;
 
+    LOG_PRINT_L0("from here onwards, it's online stuff, try to bind");
     //try to bind
     for (auto& zone : m_network_zones)
     {
@@ -779,12 +785,12 @@ namespace nodetool
         std::string ipv6_addr = "";
         std::string ipv6_port = "";
         zone.second.m_net_server.set_connection_filter(this);
-        MINFO("Binding (IPv4) on " << zone.second.m_bind_ip << ":" << zone.second.m_port);
+        LOG_PRINT_L0("Binding (IPv4) on " << zone.second.m_bind_ip << ":" << zone.second.m_port);
         if (!zone.second.m_bind_ipv6_address.empty() && m_use_ipv6)
         {
           ipv6_addr = zone.second.m_bind_ipv6_address;
           ipv6_port = zone.second.m_port_ipv6;
-          MINFO("Binding (IPv6) on " << zone.second.m_bind_ipv6_address << ":" << zone.second.m_port_ipv6);
+            LOG_PRINT_L0("Binding (IPv6) on " << zone.second.m_bind_ipv6_address << ":" << zone.second.m_port_ipv6);
         }
         res = zone.second.m_net_server.init_server(zone.second.m_port, zone.second.m_bind_ip, ipv6_port, ipv6_addr, m_use_ipv6, m_require_ipv4);
         CHECK_AND_ASSERT_MES(res, false, "Failed to bind server");
@@ -1490,17 +1496,20 @@ namespace nodetool
   template<class t_payload_net_handler>
   bool node_server<t_payload_net_handler>::connect_to_seed()
   {
+      LOG_PRINT_L0("connect_to_seed");
       if (!m_seed_nodes_initialized)
       {
+          LOG_PRINT_L0("!m_seed_nodes_initialized");
         std::unique_lock lock{m_seed_nodes_mutex};
         if (!m_seed_nodes_initialized)
         {
+            LOG_PRINT_L0("before get_seed_nodes");
           for (const auto& full_addr : get_seed_nodes())
           {
-            MDEBUG("Seed node: " << full_addr);
+              LOG_PRINT_L0("Seed node: " << full_addr);
             append_net_address(m_seed_nodes, full_addr, cryptonote::get_config(m_nettype).P2P_DEFAULT_PORT);
           }
-          MDEBUG("Number of seed nodes: " << m_seed_nodes.size());
+            LOG_PRINT_L0("Number of seed nodes: " << m_seed_nodes.size());
           m_seed_nodes_initialized = true;
         }
       }
@@ -1521,8 +1530,10 @@ namespace nodetool
 
         peerlist_entry pe_seed{};
         pe_seed.adr = m_seed_nodes[current_index];
-        if (is_peer_used(pe_seed))
-          is_connected_to_at_least_one_seed_node = true;
+        if (is_peer_used(pe_seed)){
+            LOG_PRINT_L0("is_connected_to_at_least_one_seed_node=TRUE");
+            is_connected_to_at_least_one_seed_node = true;
+        }
         else if (try_to_connect_and_handshake_with_new_peer(m_seed_nodes[current_index], true))
           break;
         if(++try_count > m_seed_nodes.size())
@@ -1816,16 +1827,19 @@ namespace nodetool
     // This really should be spaced out, i.e. the 60s sync timing should apply per peer, not
     // globally.
 
-    MDEBUG("STARTED PEERLIST IDLE HANDSHAKE");
+    LOG_PRINT_L0("STARTED PEERLIST IDLE HANDSHAKE");
     typedef std::list<std::pair<epee::net_utils::connection_context_base, peerid_type> > local_connects_type;
     local_connects_type cncts;
     for(auto& zone : m_network_zones)
     {
+      LOG_PRINT_L0("peer_sync_idle_maker m_network_zones");
       zone.second.m_net_server.get_config_object().foreach_connection([&](p2p_connection_context& cntxt)
       {
+          LOG_PRINT_L0("peer_sync_idle_maker  foreach_connection");
         if(cntxt.peer_id && !cntxt.m_in_timedsync)
         {
-          cntxt.m_in_timedsync = true;
+            LOG_PRINT_L0("peer_sync_idle_maker  cntxt.peer_id && !cntxt.m_in_timedsync");
+            cntxt.m_in_timedsync = true;
           cncts.push_back(local_connects_type::value_type(cntxt, cntxt.peer_id));//do idle sync only with handshaked connections
         }
         return true;
@@ -1834,7 +1848,7 @@ namespace nodetool
 
     std::for_each(cncts.begin(), cncts.end(), [&](const typename local_connects_type::value_type& vl){do_peer_timed_sync(vl.first, vl.second);});
 
-    MDEBUG("FINISHED PEERLIST IDLE HANDSHAKE");
+      LOG_PRINT_L0("FINISHED PEERLIST IDLE HANDSHAKE");
     return true;
   }
   //-----------------------------------------------------------------------------------
@@ -1889,13 +1903,13 @@ namespace nodetool
     {
       if(peer.adr.get_zone() != zone)
       {
-        MWARNING(context << " sent peerlist from another zone, dropping");
+          LOG_PRINT_L0(context << " sent peerlist from another zone, dropping");
         return false;
       }
     }
 
-    LOG_DEBUG_CC(context, "REMOTE PEERLIST: remote peerlist size=" << peerlist_.size());
-    LOG_TRACE_CC(context, "REMOTE PEERLIST: \n" << print_peerlist_to_string(peerlist_));
+      LOG_PRINT_L0( "REMOTE PEERLIST: remote peerlist size=" << peerlist_.size());
+      LOG_PRINT_L0( "REMOTE PEERLIST: \n" << print_peerlist_to_string(peerlist_));
     return m_network_zones.at(context.m_remote_address.get_zone()).m_peerlist.merge_peerlist(peerlist_, [this](const peerlist_entry &pe) { return !is_addr_recently_failed(pe.adr); });
   }
   //-----------------------------------------------------------------------------------
@@ -2065,6 +2079,7 @@ namespace nodetool
       ipv6_addr = na.as<const epee::net_utils::ipv6_network_address>().ip();
       ip = ipv6_addr.to_string();
     }
+      LOG_PRINT_L0("try_ping" << ip);
     network_zone& zone = m_network_zones.at(na.get_zone());
 
     if(!zone.m_peerlist.is_host_allowed(context.m_remote_address))

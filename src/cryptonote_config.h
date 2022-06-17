@@ -278,16 +278,16 @@ namespace config
     inline constexpr uint16_t ZMQ_RPC_DEFAULT_PORT = 29092;
     inline constexpr uint16_t QNET_DEFAULT_PORT = 29095;
     inline constexpr boost::uuids::uuid const NETWORK_ID = { {
-        0x12 ,0x30, 0xF1, 0x71 , 0x61, 0x04 , 0x41, 0x61, 0x17, 0x31, 0x00, 0x82, 0x17, 0xA1, 0xB6, 0x91
+        0x42 ,0x30, 0xF1, 0x71 , 0x61, 0x04 , 0x41, 0x61, 0x17, 0x31, 0x00, 0x82, 0x17, 0xA1, 0xB6, 0x91
       } }; // Bender's daydream
-    inline constexpr std::string_view GENESIS_TX = "023c01ff0001d7c1c4e81402a4b3be74714906edf0d798d22083d36983e80086d62436302684ca5bea0f312b420195937f9cb7005504052c96bf73d65d55f611c141876e5e519cef59fcb041d90872000000000000000000000000000000000000000000000000000000000000000000"sv;
+    inline constexpr std::string_view GENESIS_TX = "04013c3c01ff0001ffffffffff010299ca8399d09094a8425c4a99b42cb596628022de15b6595a408cb61876b08f5a4201de6fe4bb8895e0ce3b0a96a6157a403bd85adc80282d524c6036a55c4f7812d77200000000000000000000000000000000000000000000000000000000000000000000"sv;
     inline constexpr uint32_t GENESIS_NONCE = 11012;
 
     inline constexpr uint64_t GOVERNANCE_REWARD_INTERVAL_IN_BLOCKS = 500;
     inline constexpr std::array GOVERNANCE_WALLET_ADDRESS =
     {
-      "A1cuNRow8sMLmKCwTWvBM2EsNUNLdkrVLLqjdagqA7XQbRcrVKNo1Cbedk1iK2b1rPFj36Jv6RKhV7J72Rs7SSL7HKFMwva"sv,
-      "9zjbG8Pcv3YGXxpRaDtmApCaNRHkTwizaDBS7SXtf9AndKfxVZhPki23sFTsnJcBhuKzBgTipNtMyFzzG13ax5MFUmmLmcW"sv, // hardfork >=V17
+      "A1mc3q3c3WFddaiwSYMmFrGbBzLQowkxW7y8WTiMvGCPLLQSe6krXzqeF12So64ivL6Y8qr8kYj1kAvP9ieRJdCq8KNtpLz"sv,
+      "A1mc3q3c3WFddaiwSYMmFrGbBzLQowkxW7y8WTiMvGCPLLQSe6krXzqeF12So64ivL6Y8qr8kYj1kAvP9ieRJdCq8KNtpLz"sv, // hardfork >=V17
     };
 
     inline constexpr auto UPTIME_PROOF_FREQUENCY = 10min;
