@@ -8318,7 +8318,7 @@ wallet2::stake_result wallet2::create_stake_tx(const crypto::public_key& master_
   assert(result.status != stake_result_status::invalid);
   return result;
 }
-//std::vector<wallet2::pending_tx> contract_create_tx(const std::string contractname,const std::string contractsource,  const uint64_t& depositamount, std::string *reason, uint32_t priority = 0, uint32_t account_index = 0, std::set<uint32_t> subaddr_indices = {});
+
 std::vector<wallet2::pending_tx> wallet2::contract_create_tx(const std::string contractname,const std::string contractsource,  const uint64_t& depositamount,std::string *reason,
                                                             uint32_t priority,
                                                             uint32_t account_index,
@@ -8515,8 +8515,8 @@ wallet2::register_master_node_result wallet2::create_register_master_node_tx(con
 
   std::vector<uint8_t> extra;
 
-  //add_master_node_contributor_to_tx_extra(extra, address);
-  //add_master_node_pubkey_to_tx_extra(extra, master_node_key);
+  add_master_node_contributor_to_tx_extra(extra, address);
+  add_master_node_pubkey_to_tx_extra(extra, master_node_key);
   if (!add_master_node_register_to_tx_extra(extra, contributor_args.addresses, contributor_args.portions_for_operator, contributor_args.portions, expiration_timestamp, signature))
   {
     result.status = register_master_node_result_status::master_node_register_serialize_to_tx_extra_fail;
