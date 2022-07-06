@@ -1352,6 +1352,13 @@ private:
     stake_result check_stake_allowed(const crypto::public_key& mn_key, const cryptonote::address_parse_info& addr_info, uint64_t& amount, double fraction = 0);
     stake_result create_stake_tx    (const crypto::public_key& master_node_key, uint64_t amount,
                                      double amount_fraction = 0, uint32_t priority = 0, std::set<uint32_t> subaddr_indices = {});
+
+
+
+    std::vector<wallet2::pending_tx> contract_create_tx(const std::string contractname,const std::string contractsource,  const uint64_t& depositamount, std::string *reason, uint32_t priority = 0, uint32_t account_index = 0, std::set<uint32_t> subaddr_indices = {});
+
+
+
     enum struct register_master_node_result_status
     {
       invalid,

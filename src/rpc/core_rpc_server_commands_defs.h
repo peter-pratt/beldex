@@ -325,6 +325,9 @@ namespace rpc {
       std::optional<std::string> mn_winner;         // Master node block reward winner public key
       std::optional<std::string> mn_pubkey;         // Master node public key (e.g. for registrations, stakes, unlocks)
       std::optional<std::string> security_sig;       // Security Signature
+      std::optional<std::string> contract_name;      // Contract Source
+      std::optional<std::string> contract_source; // Contract Source
+      std::optional<uint64_t> contract_deposit_amount; // Contract Source
       std::optional<mn_reg_info> mn_registration;   // Master node registration details
       std::optional<std::string> mn_contributor;    // Master node contributor wallet address (for stakes)
       std::optional<state_change> mn_state_change;  // A state change transaction (deregistration, decommission, recommission, ip change)

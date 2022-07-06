@@ -184,7 +184,7 @@ namespace cryptonote
     txversion version;
     txtype type;
 
-    bool is_transfer() const { return type == txtype::standard || type == txtype::stake || type == txtype::beldex_name_system; }
+    bool is_transfer() const { return type == txtype::standard || type == txtype::stake || type == txtype::beldex_name_system|| type == txtype::contract ; }
 
     // not used after version 2, but remains for compatibility
     uint64_t unlock_time;  //number of block (or time), used as a limitation like: spend this tx not early then block/time
@@ -529,7 +529,8 @@ namespace cryptonote
   constexpr txtype transaction_prefix::get_max_type_for_hf(uint8_t hf_version)
   {
     txtype result = txtype::standard;
-    if      (hf_version >= network_version_16_bns)              result = txtype::beldex_name_system;
+    if      (hf_version >= network_version_18)              result = txtype::contract;
+    else if (hf_version >= network_version_16_bns)              result = txtype::beldex_name_system;
     else if (hf_version >= network_version_15_flash)            result = txtype::stake;
     else if (hf_version >= network_version_11_infinite_staking) result = txtype::key_image_unlock;
     else if (hf_version >= network_version_9_master_nodes)     result = txtype::state_change;
@@ -557,7 +558,8 @@ namespace cryptonote
       case txtype::state_change:            return "state_change";
       case txtype::key_image_unlock:        return "key_image_unlock";
       case txtype::stake:                   return "stake";
-      case txtype::beldex_name_system:        return "beldex_name_system";
+      case txtype::beldex_name_system:      return "beldex_name_system";
+      case txtype::contract:                return "contract";
       default: assert(false);               return "xx_unhandled_type";
     }
   }

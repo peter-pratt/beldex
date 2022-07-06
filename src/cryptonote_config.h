@@ -268,7 +268,7 @@ namespace config
 
   namespace testnet
   {
-    inline constexpr uint64_t HEIGHT_ESTIMATE_HEIGHT = 339767;
+    inline constexpr uint64_t HEIGHT_ESTIMATE_HEIGHT = 1000;
     inline constexpr time_t HEIGHT_ESTIMATE_TIMESTAMP = 1595360006;
     inline constexpr uint64_t CRYPTONOTE_PUBLIC_ADDRESS_BASE58_PREFIX = 53;
     inline constexpr uint64_t CRYPTONOTE_PUBLIC_INTEGRATED_ADDRESS_BASE58_PREFIX = 54;

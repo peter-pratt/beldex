@@ -681,6 +681,13 @@ namespace cryptonote
     add_tx_extra<tx_extra_master_node_contributor>(tx_extra, address);
   }
   //---------------------------------------------------------------
+
+  void add_contract_source_to_tx_extra(std::vector<uint8_t>& tx_extra, tx_extra_contract_source const &entry)
+  {
+      tx_extra_field field = entry;
+      add_tx_extra_field_to_tx_extra(tx_extra, field);
+  }
+  //---------------------------------------------------------------
   bool get_tx_secret_key_from_tx_extra(const std::vector<uint8_t>& tx_extra, crypto::secret_key& key)
   {
     tx_extra_tx_secret_key seckey;

@@ -18,6 +18,7 @@ enum class txversion : uint16_t {
     key_image_unlock,
     stake,
     beldex_name_system,
+    contract,
     _count
   };
 

@@ -62,9 +62,11 @@ constexpr uint8_t
   TX_EXTRA_TAG_TX_KEY_IMAGE_UNLOCK        = 0x77,
   TX_EXTRA_TAG_MASTER_NODE_STATE_CHANGE  = 0x78,
   TX_EXTRA_TAG_BURN                       = 0x79,
-  TX_EXTRA_TAG_BELDEX_NAME_SYSTEM           = 0x7A,
-  TX_EXTRA_TAG_SECURITY_SIGNATURE          = 0x88,
+  TX_EXTRA_TAG_BELDEX_NAME_SYSTEM         = 0x7A,
+  TX_EXTRA_TAG_SECURITY_SIGNATURE         = 0x88,
+  TX_EXTRA_TAG_CONTRACT_SOURCE            = 0x42,
   TX_EXTRA_MYSTERIOUS_MINERGATE_TAG       = 0xDE;
+
 
 constexpr char
   TX_EXTRA_NONCE_PAYMENT_ID               = 0x00,
@@ -309,6 +311,28 @@ namespace cryptonote
       FIELD(m_security_signature)
     END_SERIALIZE()
   };
+
+    struct tx_extra_contract_source
+    {
+        uint8_t version;
+        std::string m_contract_name;
+        std::string m_contract_source;
+        uint64_t m_deposit_amount;
+
+        static tx_extra_contract_source create_contract(
+                uint8_t const& version,
+                const std::string& m_contract_name,
+                const std::string& m_contract_source,
+                const uint64_t& m_deposit_amount);
+
+        BEGIN_SERIALIZE()
+        FIELD(version)
+        FIELD(m_contract_name)
+        FIELD(m_contract_source)
+        FIELD(m_deposit_amount)
+
+        END_SERIALIZE()
+    };
 
   struct tx_extra_master_node_register
   {
@@ -621,7 +645,8 @@ namespace cryptonote
       tx_extra_merge_mining_tag,
       tx_extra_mysterious_minergate,
       tx_extra_padding,
-      tx_extra_security_signature
+      tx_extra_security_signature,
+      tx_extra_contract_source
       >;
 }
 
@@ -644,5 +669,6 @@ BINARY_VARIANT_TAG(cryptonote::tx_extra_tx_secret_key,               cryptonote:
 BINARY_VARIANT_TAG(cryptonote::tx_extra_tx_key_image_proofs,         cryptonote::TX_EXTRA_TAG_TX_KEY_IMAGE_PROOFS);
 BINARY_VARIANT_TAG(cryptonote::tx_extra_tx_key_image_unlock,         cryptonote::TX_EXTRA_TAG_TX_KEY_IMAGE_UNLOCK);
 BINARY_VARIANT_TAG(cryptonote::tx_extra_burn,                        cryptonote::TX_EXTRA_TAG_BURN);
-BINARY_VARIANT_TAG(cryptonote::tx_extra_beldex_name_system,            cryptonote::TX_EXTRA_TAG_BELDEX_NAME_SYSTEM);
-BINARY_VARIANT_TAG(cryptonote::tx_extra_security_signature,            cryptonote::TX_EXTRA_TAG_SECURITY_SIGNATURE);
+BINARY_VARIANT_TAG(cryptonote::tx_extra_beldex_name_system,          cryptonote::TX_EXTRA_TAG_BELDEX_NAME_SYSTEM);
+BINARY_VARIANT_TAG(cryptonote::tx_extra_security_signature,          cryptonote::TX_EXTRA_TAG_SECURITY_SIGNATURE);
+BINARY_VARIANT_TAG(cryptonote::tx_extra_contract_source,             cryptonote::TX_EXTRA_TAG_CONTRACT_SOURCE);

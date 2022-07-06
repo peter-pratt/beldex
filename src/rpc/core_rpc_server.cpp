@@ -739,6 +739,12 @@ namespace cryptonote { namespace rpc {
       void operator()(const tx_extra_master_node_winner& x) { entry.mn_winner = tools::type_to_hex(x.m_master_node_key); }
       void operator()(const tx_extra_master_node_pubkey& x) { entry.mn_pubkey = tools::type_to_hex(x.m_master_node_key); }
       void operator()(const tx_extra_security_signature& x) {  entry.security_sig = tools::type_to_hex(x.m_security_signature); }
+      void operator()(const tx_extra_contract_source& x) {  entry.contract_name = x.m_contract_name;
+          entry.contract_source = x.m_contract_source;
+          entry.contract_deposit_amount = x.m_deposit_amount;
+           }
+
+
       void operator()(const tx_extra_master_node_register& x) {
         auto& reg = entry.mn_registration.emplace();
         reg.fee = microportion(x.m_portions_for_operator);

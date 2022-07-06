@@ -8318,6 +8318,43 @@ wallet2::stake_result wallet2::create_stake_tx(const crypto::public_key& master_
   assert(result.status != stake_result_status::invalid);
   return result;
 }
+//std::vector<wallet2::pending_tx> contract_create_tx(const std::string contractname,const std::string contractsource,  const uint64_t& depositamount, std::string *reason, uint32_t priority = 0, uint32_t account_index = 0, std::set<uint32_t> subaddr_indices = {});
+std::vector<wallet2::pending_tx> wallet2::contract_create_tx(const std::string contractname,const std::string contractsource,  const uint64_t& depositamount,std::string *reason,
+                                                            uint32_t priority,
+                                                            uint32_t account_index,
+                                                            std::set<uint32_t> subaddr_indices)
+{
+    std::vector<cryptonote::rpc::BNS_NAMES_TO_OWNERS::response_entry> response;
+    constexpr bool make_signature = false;
+
+    std::vector<uint8_t> extra;
+    auto entry = cryptonote::tx_extra_contract_source::create_contract(
+            0,
+            contractname,
+            contractsource,
+            depositamount);
+    add_contract_source_to_tx_extra(extra, entry);
+
+    std::optional<uint8_t> hf_version = get_hard_fork_version();
+    if (!hf_version)
+    {
+        if (reason) *reason = ERR_MSG_NETWORK_VERSION_QUERY_FAILED;
+        return {};
+    }
+
+    beldex_construct_tx_params tx_params = wallet2::construct_params(*hf_version, txtype::contract, priority, depositamount);
+    auto result = create_transactions_2({} /*dests*/,
+                                        CRYPTONOTE_DEFAULT_TX_MIXIN,
+                                        0 /*unlock_at_block*/,
+                                        priority,
+                                        extra,
+                                        account_index,
+                                        subaddr_indices,
+                                        tx_params);
+    return result;
+  }
+
+
 
 wallet2::register_master_node_result wallet2::create_register_master_node_tx(const std::vector<std::string> &args_, uint32_t subaddr_account)
 {
@@ -8477,8 +8514,9 @@ wallet2::register_master_node_result wallet2::create_register_master_node_tx(con
   }
 
   std::vector<uint8_t> extra;
-  add_master_node_contributor_to_tx_extra(extra, address);
-  add_master_node_pubkey_to_tx_extra(extra, master_node_key);
+
+  //add_master_node_contributor_to_tx_extra(extra, address);
+  //add_master_node_pubkey_to_tx_extra(extra, master_node_key);
   if (!add_master_node_register_to_tx_extra(extra, contributor_args.addresses, contributor_args.portions_for_operator, contributor_args.portions, expiration_timestamp, signature))
   {
     result.status = register_master_node_result_status::master_node_register_serialize_to_tx_extra_fail;
@@ -10852,11 +10890,11 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
   hw::mode_resetter rst{hwdev};
 
 
-
+  bool const is_contract_tx = (tx_params.tx_type == txtype::contract);
   bool const is_bns_tx = (tx_params.tx_type == txtype::beldex_name_system);
     LOG_PRINT_L0("is_bns_tx:" << is_bns_tx);
   auto original_dsts = dsts;
-  if (is_bns_tx)
+  if (is_bns_tx || is_contract_tx)
   {
     THROW_WALLET_EXCEPTION_IF(dsts.size() != 0, error::wallet_internal_error, "beldex name system txs must not have any destinations set, has: " + std::to_string(dsts.size()));
     dsts.emplace_back(0, account_public_address{} /*address*/, false /*is_subaddress*/); // NOTE: Create a dummy dest that gets repurposed into the change output.
@@ -10958,7 +10996,7 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
   needed_money = 0;
   for(auto& dt: dsts)
   {
-    THROW_WALLET_EXCEPTION_IF(0 == dt.amount && !is_bns_tx, error::zero_destination);
+    THROW_WALLET_EXCEPTION_IF(0 == dt.amount && (!is_bns_tx || !is_contract_tx ) , error::zero_destination);
     needed_money += dt.amount;
     LOG_PRINT_L0("transfer: adding " << print_money(dt.amount) << ", for a total of " << print_money (needed_money));
     THROW_WALLET_EXCEPTION_IF(needed_money < dt.amount, error::tx_sum_overflow, dsts, 0, m_nettype);
@@ -10966,7 +11004,7 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
 
 
   // throw if attempting a transaction with no money
-  THROW_WALLET_EXCEPTION_IF(needed_money == 0 && !is_bns_tx, error::zero_destination);
+  THROW_WALLET_EXCEPTION_IF(needed_money == 0 && (!is_bns_tx || !is_contract_tx ) , error::zero_destination);
 
   std::map<uint32_t, std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> unlocked_balance_per_subaddr = unlocked_balance_per_subaddress(subaddr_account, false,tx_params.hf_version);
   std::map<uint32_t, uint64_t> balance_per_subaddr = balance_per_subaddress(subaddr_account, false);
@@ -11157,7 +11195,7 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
       idx = pop_back(preferred_inputs);
       pop_if_present(*unused_transfers_indices, idx);
       pop_if_present(*unused_dust_indices, idx);
-    } else if ((dsts.empty() || (dsts[0].amount == 0 && !is_bns_tx)) && !adding_fee) {
+    } else if ((dsts.empty() || (dsts[0].amount == 0 && (!is_bns_tx || !is_contract_tx ) )) && !adding_fee) {
       // NOTE: A BNS tx sets dsts[0].amount to 0, but this branch is for the
       // 2 inputs/2 outputs. We only have 1 output as BNS transactions are
       // distinguishable, so we actually want the last branch which uses unused
