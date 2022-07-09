@@ -321,9 +321,9 @@ namespace cryptonote
 
         static tx_extra_contract_source create_contract(
                 uint8_t const& version,
-                const std::string& m_contract_name,
-                const std::string& m_contract_source,
-                const uint64_t& m_deposit_amount);
+                const std::string& contract_name,
+                const std::string& contract_source,
+                const uint64_t& deposit_amount);
 
         BEGIN_SERIALIZE()
         FIELD(version)
