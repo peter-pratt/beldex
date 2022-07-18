@@ -8270,7 +8270,7 @@ bool simple_wallet::contract_create(std::vector<std::string> args)
     std::string const &contractname  = args[0];
     std::string const &contractsource = args[1];
     uint64_t deposit_amount;
-    if(tools::parse_int(args[2], deposit_amount))
+    if(!tools::parse_int(args[2], deposit_amount))
     {
         fail_msg_writer() << tr("failed to parse deposit amount: ") + std::string{args[2]};
         return false;

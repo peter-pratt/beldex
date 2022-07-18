@@ -186,7 +186,7 @@ constexpr uint64_t DIFFICULTY_BLOCKS_COUNT(bool before_hf16)
 #define HF_VERSION_EFFECTIVE_SHORT_TERM_MEDIAN_IN_PENALTY cryptonote::network_version_17_POS
 #define HF_VERSION_POS                          cryptonote::network_version_17_POS
 #define HF_VERSION_CLSAG                        cryptonote::network_version_15_flash
-#define HF_VERSION_PROOF_BTENC                  cryptonote::network_version_18
+#define HF_VERSION_PROOF_BTENC                  cryptonote::network_version_19
 
 #define PER_KB_FEE_QUANTIZATION_DECIMALS        8
 
@@ -344,7 +344,8 @@ namespace cryptonote
     network_version_15_flash,
     network_version_16_bns,
     network_version_17_POS,
-    network_version_18,
+    network_version_18_EVM_POC,
+    network_version_19,
 
     network_version_count,
   };

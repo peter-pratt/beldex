@@ -529,7 +529,7 @@ namespace cryptonote
   constexpr txtype transaction_prefix::get_max_type_for_hf(uint8_t hf_version)
   {
     txtype result = txtype::standard;
-    if      (hf_version >= network_version_18)              result = txtype::contract;
+    if      (hf_version >= network_version_18_EVM_POC)          result = txtype::contract;
     else if (hf_version >= network_version_16_bns)              result = txtype::beldex_name_system;
     else if (hf_version >= network_version_15_flash)            result = txtype::stake;
     else if (hf_version >= network_version_11_infinite_staking) result = txtype::key_image_unlock;

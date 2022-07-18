@@ -538,7 +538,7 @@ cryptonote::transaction beldex_chain_generator::create_state_change_tx(master_no
 
   using scver = cryptonote::tx_extra_master_node_state_change::version_t;
   cryptonote::tx_extra_master_node_state_change state_change_extra(
-          hf_version >= cryptonote::network_version_18 ? scver::v4_reasons : scver::v0,
+          hf_version >= cryptonote::network_version_19 ? scver::v4_reasons : scver::v0,
           state, height, worker_index, reasons_all, reasons_any, {});
   if (voters.size())
   {
@@ -958,7 +958,7 @@ bool beldex_chain_generator::block_begin(beldex_blockchain_entry &entry, beldex_
     constexpr uint64_t num_blocks       = cryptonote::get_config(cryptonote::FAKECHAIN).GOVERNANCE_REWARD_INTERVAL_IN_BLOCKS;
     uint64_t start_height               = height - num_blocks;
 
-    static_assert(cryptonote::network_version_count == cryptonote::network_version_18 + 1,
+    static_assert(cryptonote::network_version_count == cryptonote::network_version_19 + 1,
             "The code below needs to be updated to support higher hard fork versions");
     if (blk.major_version <= cryptonote::network_version_16_bns)
       miner_tx_context.batched_governance = 0;

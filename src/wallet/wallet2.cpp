@@ -236,7 +236,7 @@ namespace {
       found_money += transfers[idx].amount();
     if (found_money != needed_money)
       ++outputs; // change
-    if (outputs < (tx_params.tx_type == cryptonote::txtype::beldex_name_system ? 1 : 2))
+    if (outputs < (tx_params.tx_type == cryptonote::txtype::beldex_name_system ? 1 : tx_params.tx_type == cryptonote::txtype::contract ?1: 2))
       ++outputs; // extra 0 dummy output
     return outputs;
   }
@@ -7845,7 +7845,7 @@ beldex_construct_tx_params wallet2::construct_params(uint8_t hf_version, txtype 
   tx_params.hf_version = hf_version;
   tx_params.tx_type    = tx_type;
 
-  if (tx_type == txtype::beldex_name_system)
+  if (tx_type == txtype::beldex_name_system || tx_type == txtype::contract)
   {
     assert(priority != tools::tx_priority_flash);
     tx_params.burn_fixed = bns::burn_needed(hf_version, type);
@@ -9943,7 +9943,7 @@ void wallet2::transfer_selected_rct(std::vector<cryptonote::tx_destination_entry
   // throw if total amount overflows uint64_t
   for(auto& dt: dsts)
   {
-    THROW_WALLET_EXCEPTION_IF(0 == dt.amount && (tx_params.tx_type != txtype::beldex_name_system), error::zero_destination);
+    THROW_WALLET_EXCEPTION_IF(0 == dt.amount && (tx_params.tx_type != txtype::beldex_name_system) && (tx_params.tx_type != txtype::contract), error::zero_destination);
     needed_money += dt.amount;
     LOG_PRINT_L2("transfer: adding " << print_money(dt.amount) << ", for a total of " << print_money (needed_money));
     THROW_WALLET_EXCEPTION_IF(needed_money < dt.amount, error::tx_sum_overflow, dsts, fee, m_nettype);
@@ -10097,7 +10097,7 @@ void wallet2::transfer_selected_rct(std::vector<cryptonote::tx_destination_entry
   bool update_splitted_dsts                                   = true;
   if (change_dts.amount == 0)
   {
-    if (splitted_dsts.size() == 1 || tx.type == txtype::beldex_name_system)
+    if (splitted_dsts.size() == 1 || tx.type == txtype::beldex_name_system|| tx.type == txtype::contract)
     {
       // If the change is 0, send it to a random address, to avoid confusing
       // the sender with a 0 amount output. We send a 0 amount in order to avoid
@@ -10126,7 +10126,7 @@ void wallet2::transfer_selected_rct(std::vector<cryptonote::tx_destination_entry
     // NOTE: If ONS, there's already a dummy destination entry in there that
     // we placed in (for fake calculating the TX fees and parts) that we
     // repurpose for change after the fact.
-    if (tx_params.tx_type == txtype::beldex_name_system)
+    if (tx_params.tx_type == txtype::beldex_name_system || tx_params.tx_type == txtype::contract)
     {
       assert(splitted_dsts.size() == 1);
       splitted_dsts.back() = change_dts;
@@ -10996,7 +10996,7 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
   needed_money = 0;
   for(auto& dt: dsts)
   {
-    THROW_WALLET_EXCEPTION_IF(0 == dt.amount && (!is_bns_tx || !is_contract_tx ) , error::zero_destination);
+    THROW_WALLET_EXCEPTION_IF(0 == dt.amount && (!is_bns_tx && !is_contract_tx ) , error::zero_destination);
     needed_money += dt.amount;
     LOG_PRINT_L0("transfer: adding " << print_money(dt.amount) << ", for a total of " << print_money (needed_money));
     THROW_WALLET_EXCEPTION_IF(needed_money < dt.amount, error::tx_sum_overflow, dsts, 0, m_nettype);
@@ -11004,7 +11004,7 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
 
 
   // throw if attempting a transaction with no money
-  THROW_WALLET_EXCEPTION_IF(needed_money == 0 && (!is_bns_tx || !is_contract_tx ) , error::zero_destination);
+  THROW_WALLET_EXCEPTION_IF(needed_money == 0 && (!is_bns_tx && !is_contract_tx ) , error::zero_destination);
 
   std::map<uint32_t, std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> unlocked_balance_per_subaddr = unlocked_balance_per_subaddress(subaddr_account, false,tx_params.hf_version);
   std::map<uint32_t, uint64_t> balance_per_subaddr = balance_per_subaddress(subaddr_account, false);
@@ -11018,7 +11018,7 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
   // early out if we know we can't make it anyway
   // we could also check for being within FEE_PER_KB, but if the fee calculation
   // ever changes, this might be missed, so let this go through
-  const uint64_t min_outputs = tx_params.tx_type == cryptonote::txtype::beldex_name_system ? 1 : 2; // if ons, only request the change output
+  const uint64_t min_outputs = tx_params.tx_type == cryptonote::txtype::beldex_name_system ? 1 : tx_params.tx_type == cryptonote::txtype::contract ? 1: 2; // if ons, only request the change output
   {
     uint64_t min_fee = (
         base_fee.first * estimate_rct_tx_size(1, fake_outs_count, min_outputs, extra.size(), clsag) +
@@ -11195,7 +11195,7 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
       idx = pop_back(preferred_inputs);
       pop_if_present(*unused_transfers_indices, idx);
       pop_if_present(*unused_dust_indices, idx);
-    } else if ((dsts.empty() || (dsts[0].amount == 0 && (!is_bns_tx || !is_contract_tx ) )) && !adding_fee) {
+    } else if ((dsts.empty() || (dsts[0].amount == 0 && (!is_bns_tx && !is_contract_tx ) )) && !adding_fee) {
       // NOTE: A BNS tx sets dsts[0].amount to 0, but this branch is for the
       // 2 inputs/2 outputs. We only have 1 output as BNS transactions are
       // distinguishable, so we actually want the last branch which uses unused

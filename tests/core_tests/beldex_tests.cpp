@@ -700,9 +700,9 @@ bool beldex_core_block_rewards_lrc6::generate(std::vector<test_event_entry>& eve
   constexpr auto& network = cryptonote::get_config(cryptonote::FAKECHAIN);
   std::vector<cryptonote::hard_fork> hard_forks = beldex_generate_hard_fork_table(cryptonote::network_version_16_bns);
   hard_forks.push_back({cryptonote::network_version_17_POS,0, hard_forks.back().height + network.GOVERNANCE_REWARD_INTERVAL_IN_BLOCKS + 10});
-  hard_forks.push_back({cryptonote::network_version_18,0, hard_forks.back().height + network.GOVERNANCE_REWARD_INTERVAL_IN_BLOCKS});
+  hard_forks.push_back({cryptonote::network_version_19,0, hard_forks.back().height + network.GOVERNANCE_REWARD_INTERVAL_IN_BLOCKS});
   beldex_chain_generator batched_governance_generator(events, hard_forks);
-  batched_governance_generator.add_blocks_until_version(cryptonote::network_version_18);
+  batched_governance_generator.add_blocks_until_version(cryptonote::network_version_19);
   batched_governance_generator.add_n_blocks(network.GOVERNANCE_REWARD_INTERVAL_IN_BLOCKS);
 
   uint64_t hf15_height = 0, hf16_height = 0, hf17_height = 0;
@@ -2554,7 +2554,7 @@ bool beldex_name_system_wrong_burn::generate(std::vector<test_event_entry> &even
         else            burn += 1;
 
         cryptonote::transaction tx = gen.create_beldex_name_system_tx(miner, gen.hardfork(), type, name, value, nullptr /*owner*/, nullptr /*backup_owner*/, burn);
-        if (new_hf_version == cryptonote::network_version_18 && !under_burn && new_height < 524'000)
+        if (new_hf_version == cryptonote::network_version_19 && !under_burn && new_height < 524'000)
         {
           gen.add_tx(tx, true /*can_be_added_to_blockchain*/, "Wrong burn for a ONS tx but workaround for testnet", true /*kept_by_block*/);
         } else {

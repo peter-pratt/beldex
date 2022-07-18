@@ -135,7 +135,7 @@ namespace master_nodes
             result.storage_server_reachable = false;
         }
         // TODO: perhaps come back and make this activate on some "soft fork" height before HF19?
-        if (!belnet_reachable && hf_version >= cryptonote::network_version_18) {
+        if (!belnet_reachable && hf_version >= cryptonote::network_version_19) {
             LOG_PRINT_L1("Master Node belnet is not reachable for node: " << pubkey);
             result.belnet_reachable = false;
         }
