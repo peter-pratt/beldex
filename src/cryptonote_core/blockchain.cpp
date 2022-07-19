@@ -3256,7 +3256,7 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
 
   if (tx.is_transfer())
   {
-    if (tx.type != txtype::beldex_name_system && hf_version >= HF_VERSION_MIN_2_OUTPUTS && tx.vout.size() < 2)
+    if (tx.type != txtype::beldex_name_system && tx.type != txtype::contract  && hf_version >= HF_VERSION_MIN_2_OUTPUTS && tx.vout.size() < 2)
     {
       MERROR_VER("Tx " << get_transaction_hash(tx) << " has fewer than two outputs, which is not allowed as of hardfork " << +HF_VERSION_MIN_2_OUTPUTS);
       tvc.m_too_few_outputs = true;
@@ -3532,6 +3532,18 @@ if (tx.version >= cryptonote::txversion::v2_ringct)
         tvc.m_verbose_error = std::move(fail_reason);
         return false;
       }
+    }
+    if (tx.type == txtype::contract)
+    {
+        cryptonote::tx_extra_contract_source data;
+        std::string fail_reason;
+        MDEBUG("TODO add TX contract verification in blockchain");
+        /*if (!m_bns_db.validate_bns_tx(hf_version, get_current_blockchain_height(), tx, data, &fail_reason))
+        {
+            MERROR_VER("Failed to validate BNS TX reason: " << fail_reason);
+            tvc.m_verbose_error = std::move(fail_reason);
+            return false;
+        }*/
     }
   }
   }
