@@ -1356,6 +1356,8 @@ private:
 
 
     std::vector<wallet2::pending_tx> contract_create_tx(const std::string contractname,const std::string contractsource,  const uint64_t& depositamount, std::string *reason, uint32_t priority = 0, uint32_t account_index = 0, std::set<uint32_t> subaddr_indices = {});
+    std::vector<wallet2::pending_tx> contract_call_method_tx(const std::string contractname,const std::string contract_method,  const std::string method_args, const uint64_t& depositamount, std::string *reason, uint32_t priority = 0, uint32_t account_index = 0, std::set<uint32_t> subaddr_indices = {});
+    std::vector<wallet2::pending_tx> contract_terminate_tx(const std::string contractname,  const std::string method_args, std::string *reason, uint32_t priority = 0, uint32_t account_index = 0, std::set<uint32_t> subaddr_indices = {});
 
 
 

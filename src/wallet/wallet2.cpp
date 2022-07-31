@@ -8324,16 +8324,12 @@ std::vector<wallet2::pending_tx> wallet2::contract_create_tx(const std::string c
                                                             uint32_t account_index,
                                                             std::set<uint32_t> subaddr_indices)
 {
-    std::vector<cryptonote::rpc::BNS_NAMES_TO_OWNERS::response_entry> response;
-    constexpr bool make_signature = false;
-
     std::vector<uint8_t> extra;
-    auto entry = cryptonote::tx_extra_contract_source::create_contract(
-            0,
+    auto entry = cryptonote::tx_extra_contract::create_contract(
             contractname,
             contractsource,
             depositamount);
-    add_contract_source_to_tx_extra(extra, entry);
+    add_contract_to_tx_extra(extra, entry);
 
     std::optional<uint8_t> hf_version = get_hard_fork_version();
     if (!hf_version)
@@ -8342,7 +8338,7 @@ std::vector<wallet2::pending_tx> wallet2::contract_create_tx(const std::string c
         return {};
     }
 
-    beldex_construct_tx_params tx_params = wallet2::construct_params(*hf_version, txtype::contract, priority, depositamount);
+    beldex_construct_tx_params tx_params = wallet2::construct_params(*hf_version, txtype::contract, priority, depositamount*COIN);
     auto result = create_transactions_2({} /*dests*/,
                                         CRYPTONOTE_DEFAULT_TX_MIXIN,
                                         0 /*unlock_at_block*/,
@@ -8354,7 +8350,67 @@ std::vector<wallet2::pending_tx> wallet2::contract_create_tx(const std::string c
     return result;
   }
 
+std::vector<wallet2::pending_tx> wallet2::contract_call_method_tx(const std::string contractname,const std::string contract_method,  const std::string method_args,  const uint64_t& depositamount, std::string *reason,
+                                                             uint32_t priority,
+                                                             uint32_t account_index,
+                                                             std::set<uint32_t> subaddr_indices)
+{
+    std::vector<uint8_t> extra;
+    auto entry = cryptonote::tx_extra_contract::call_method(
+            contractname,
+            contract_method,
+            method_args,
+            depositamount);
+    add_contract_to_tx_extra(extra, entry);
 
+    std::optional<uint8_t> hf_version = get_hard_fork_version();
+    if (!hf_version)
+    {
+        if (reason) *reason = ERR_MSG_NETWORK_VERSION_QUERY_FAILED;
+        return {};
+    }
+
+    beldex_construct_tx_params tx_params = wallet2::construct_params(*hf_version, txtype::contract, priority, depositamount*COIN);
+    auto result = create_transactions_2({} /*dests*/,
+                                        CRYPTONOTE_DEFAULT_TX_MIXIN,
+                                        0 /*unlock_at_block*/,
+                                        priority,
+                                        extra,
+                                        account_index,
+                                        subaddr_indices,
+                                        tx_params);
+    return result;
+}
+
+std::vector<wallet2::pending_tx> wallet2::contract_terminate_tx(const std::string contractname,  const std::string method_args, std::string *reason,
+                                                                  uint32_t priority,
+                                                                  uint32_t account_index,
+                                                                  std::set<uint32_t> subaddr_indices)
+{
+    std::vector<uint8_t> extra;
+    auto entry = cryptonote::tx_extra_contract::terminate(
+            contractname,
+            method_args);
+    add_contract_to_tx_extra(extra, entry);
+
+    std::optional<uint8_t> hf_version = get_hard_fork_version();
+    if (!hf_version)
+    {
+        if (reason) *reason = ERR_MSG_NETWORK_VERSION_QUERY_FAILED;
+        return {};
+    }
+
+    beldex_construct_tx_params tx_params = wallet2::construct_params(*hf_version, txtype::contract, priority);
+    auto result = create_transactions_2({} /*dests*/,
+                                        CRYPTONOTE_DEFAULT_TX_MIXIN,
+                                        0 /*unlock_at_block*/,
+                                        priority,
+                                        extra,
+                                        account_index,
+                                        subaddr_indices,
+                                        tx_params);
+    return result;
+}
 
 wallet2::register_master_node_result wallet2::create_register_master_node_tx(const std::vector<std::string> &args_, uint32_t subaddr_account)
 {

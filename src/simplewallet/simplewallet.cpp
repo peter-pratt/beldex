@@ -179,7 +179,9 @@ namespace
   const char* USAGE_GET_TX_KEY("get_tx_key <txid>");
   const char* USAGE_SET_TX_KEY("set_tx_key <txid> <tx_key>");
   const char* USAGE_CHECK_TX_KEY("check_tx_key <txid> <txkey> <address>");
-  const char* USAGE_CONTRACT_CREATE("contract_create <contractname> <contractsourcecode> <depositamount>");
+  const char* USAGE_CONTRACT_CREATE("contract_create <contractname> <contract sourcecode> <deposit amount>");
+  const char* USAGE_CONTRACT_METHOD("contract_method <contractname> <contract method> <method_arguments> <deposit amount (can be 0)>");
+  const char* USAGE_CONTRACT_TERMINATE("contract_terminate <contractname> <terminate_arguments>");
   const char* USAGE_GET_TX_PROOF("get_tx_proof <txid> <address> [<message>]");
   const char* USAGE_CHECK_TX_PROOF("check_tx_proof <txid> <address> <signature_file> [<message>]");
   const char* USAGE_GET_SPEND_PROOF("get_spend_proof <txid> [<message>]");
@@ -2839,6 +2841,14 @@ simple_wallet::simple_wallet()
                              [this](const auto& x) { return contract_create(x); },
                              tr(USAGE_CONTRACT_CREATE),
                              tr("To create a contract you need to supply the bytecode of the contract in sourcecode and the amount to deposit from your wallet to the contract."));
+    m_cmd_binder.set_handler("contract_method",
+                             [this](const auto& x) { return contract_method(x); },
+                             tr(USAGE_CONTRACT_METHOD),
+                             tr("To call a method on contract with argument, use quotes in case of \"white spaces\", deposit amount can be 0"));
+    m_cmd_binder.set_handler("contract_terminate",
+                             [this](const auto& x) { return contract_terminate(x); },
+                             tr(USAGE_CONTRACT_TERMINATE),
+                             tr("This terminates a contract with arguments, for example a hashed password as argument "));
   m_cmd_binder.set_handler("check_spend_proof",
                            [this](const auto& x) { return check_spend_proof(x); },
                            tr(USAGE_CHECK_SPEND_PROOF),
@@ -7296,7 +7306,7 @@ bool simple_wallet::sweep_main_internal(sweep_type_t sweep_type, std::vector<too
   if (!process_ring_members(ptx_vector, prompt, m_wallet->print_ring_members()))
     return true;
 
-  const char *label = (sweep_type == sweep_type_t::stake || sweep_type == sweep_type_t::register_stake) ? "Staking" : (sweep_type == sweep_type_t::contract_create)?"Creating Contract":"Sweeping";
+  const char *label = (sweep_type == sweep_type_t::stake || sweep_type == sweep_type_t::register_stake) ? "Staking" : (sweep_type == sweep_type_t::contract)?"Contract":"Sweeping";
   if (ptx_vector.size() > 1) {
     prompt << boost::format(tr("%s %s in %llu transactions for a total fee of %s. Is this okay?")) %
       label %
@@ -8331,6 +8341,163 @@ bool simple_wallet::contract_create(std::vector<std::string> args)
 
     return true;
 }
+
+
+//---------------------------------------------------------------------------------------------------
+bool simple_wallet::contract_method(std::vector<std::string> args)
+{
+    uint32_t priority = 0;
+    std::set<uint32_t> subaddr_indices  = {};
+    if (!parse_subaddr_indices_and_priority(*m_wallet, args, subaddr_indices, priority, m_current_subaddress_account)) return false;
+
+
+    if (args.size() != 4)
+    {
+        PRINT_USAGE(USAGE_CONTRACT_METHOD);
+        return true;
+    }
+
+    std::string const &contractname  = args[0];
+    std::string const &contractmethod = args[1];
+    std::string const &contractmethod_args = args[2];
+    uint64_t deposit_amount;
+    if(!tools::parse_int(args[3], deposit_amount))
+    {
+        fail_msg_writer() << tr("failed to parse deposit amount: ") + std::string{args[3]};
+        return false;
+    }
+
+
+
+    SCOPED_WALLET_UNLOCK();
+    std::string reason;
+    std::vector<tools::wallet2::pending_tx> ptx_vector;
+
+    try
+    {
+        ptx_vector = m_wallet->contract_call_method_tx(contractname,
+                                                  contractmethod,
+                                                  contractmethod_args,
+                                                  deposit_amount,
+                                                  &reason,
+                                                  priority,
+                                                  m_current_subaddress_account,
+                                                  subaddr_indices);
+
+        if (ptx_vector.empty())
+        {
+            tools::fail_msg_writer() << reason;
+            return true;
+        }
+
+        std::vector<cryptonote::address_parse_info> dsts;
+        cryptonote::address_parse_info info = {};
+        info.address                        = m_wallet->get_subaddress({m_current_subaddress_account, 0});
+        info.is_subaddress                  = m_current_subaddress_account != 0;
+        dsts.push_back(info);
+
+        std::cout << std::endl << tr("Calling Contract Method") << std::endl << std::endl;
+        std::cout << boost::format(tr("Contract Name:         %s")) % contractname << std::endl;
+        std::cout << boost::format(tr("Contract Method:         %s")) % contractmethod << std::endl;
+        std::cout << boost::format(tr("Method arguments:        %s")) % contractmethod_args << std::endl;
+        std::cout << boost::format(tr("Depositamount:        %s")) % deposit_amount << std::endl;
+
+
+
+        if (!confirm_and_send_tx(dsts, ptx_vector, priority == tools::tx_priority_flash))
+            return false;
+
+
+
+    }
+    catch (const std::exception &e)
+    {
+        handle_transfer_exception(std::current_exception(), m_wallet->is_trusted_daemon());
+        return true;
+    }
+    catch (...)
+    {
+        LOG_ERROR("unknown error");
+        fail_msg_writer() << tr("unknown error");
+        return true;
+    }
+
+    return true;
+}
+
+//---------------------------------------------------------------------------------------------------
+bool simple_wallet::contract_terminate(std::vector<std::string> args)
+{
+    uint32_t priority = 0;
+    std::set<uint32_t> subaddr_indices  = {};
+    if (!parse_subaddr_indices_and_priority(*m_wallet, args, subaddr_indices, priority, m_current_subaddress_account)) return false;
+
+
+    if (args.size() != 2)
+    {
+        PRINT_USAGE(USAGE_CONTRACT_TERMINATE);
+        return true;
+    }
+
+    std::string const &contractname  = args[0];
+    std::string const &contractmethod_args = args[1];
+
+
+
+
+    SCOPED_WALLET_UNLOCK();
+    std::string reason;
+    std::vector<tools::wallet2::pending_tx> ptx_vector;
+
+    try
+    {
+        ptx_vector = m_wallet->contract_terminate_tx(contractname,
+                                                       contractmethod_args,
+                                                       &reason,
+                                                       priority,
+                                                       m_current_subaddress_account,
+                                                       subaddr_indices);
+
+        if (ptx_vector.empty())
+        {
+            tools::fail_msg_writer() << reason;
+            return true;
+        }
+
+        std::vector<cryptonote::address_parse_info> dsts;
+        cryptonote::address_parse_info info = {};
+        info.address                        = m_wallet->get_subaddress({m_current_subaddress_account, 0});
+        info.is_subaddress                  = m_current_subaddress_account != 0;
+        dsts.push_back(info);
+
+        std::cout << std::endl << tr("Calling Contract Terminate") << std::endl << std::endl;
+        std::cout << boost::format(tr("Contract Name:         %s")) % contractname << std::endl;
+        std::cout << boost::format(tr("Arguments:        %s")) % contractmethod_args << std::endl;
+
+
+
+        if (!confirm_and_send_tx(dsts, ptx_vector, priority == tools::tx_priority_flash))
+            return false;
+
+
+
+    }
+    catch (const std::exception &e)
+    {
+        handle_transfer_exception(std::current_exception(), m_wallet->is_trusted_daemon());
+        return true;
+    }
+    catch (...)
+    {
+        LOG_ERROR("unknown error");
+        fail_msg_writer() << tr("unknown error");
+        return true;
+    }
+
+    return true;
+}
+
+
 
 //----------------------------------------------------------------------------------------------------
 bool simple_wallet::get_spend_proof(const std::vector<std::string> &args)

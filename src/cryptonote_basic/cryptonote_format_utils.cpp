@@ -682,7 +682,7 @@ namespace cryptonote
   }
   //---------------------------------------------------------------
 
-  void add_contract_source_to_tx_extra(std::vector<uint8_t>& tx_extra, tx_extra_contract_source const &entry)
+  void add_contract_to_tx_extra(std::vector<uint8_t>& tx_extra, tx_extra_contract const &entry)
   {
       tx_extra_field field = entry;
       add_tx_extra_field_to_tx_extra(tx_extra, field);

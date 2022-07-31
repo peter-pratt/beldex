@@ -2,18 +2,44 @@
 
 namespace cryptonote {
 
-tx_extra_contract_source tx_extra_contract_source::create_contract(
-                uint8_t const& version,
+tx_extra_contract tx_extra_contract::create_contract(
                 const std::string& contract_name,
                 const std::string& contract_source,
                 const uint64_t& deposit_amount)
 {
-    tx_extra_contract_source result{};
+    tx_extra_contract result{};
+    result.type = contract::contract_type::create;
     result.m_contract_name = contract_name;
     result.m_contract_source = contract_source;
     result.m_deposit_amount = deposit_amount;
     return result;
 }
+
+tx_extra_contract tx_extra_contract::call_method(
+        const std::string& contract_name,
+        const std::string& contract_method,
+        const std::string& method_args,
+        const uint64_t& deposit_amount)
+{
+    tx_extra_contract result{};
+    result.type = contract::contract_type::method;
+    result.m_contract_name = contract_name;
+    result.m_contract_method= contract_method;
+    result.m_method_args = method_args;
+    result.m_deposit_amount = deposit_amount;
+    return result;
+}
+
+    tx_extra_contract tx_extra_contract::terminate(
+            const std::string& contract_name,
+            const std::string& method_args)
+    {
+        tx_extra_contract result{};
+        result.type = contract::contract_type::terminate;
+        result.m_contract_name = contract_name;
+        result.m_method_args = method_args;
+        return result;
+    }
 
 tx_extra_beldex_name_system tx_extra_beldex_name_system::make_buy(
     bns::generic_owner const& owner,

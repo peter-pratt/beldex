@@ -38,6 +38,7 @@
 #include "common/hex.h"
 #include "beldex_economy.h"
 #include "cryptonote_basic.h"
+#include "cryptonote_core/beldex_contract.h"
 
 
 namespace cryptonote {
@@ -64,7 +65,7 @@ constexpr uint8_t
   TX_EXTRA_TAG_BURN                       = 0x79,
   TX_EXTRA_TAG_BELDEX_NAME_SYSTEM         = 0x7A,
   TX_EXTRA_TAG_SECURITY_SIGNATURE         = 0x88,
-  TX_EXTRA_TAG_CONTRACT_SOURCE            = 0x42,
+  TX_EXTRA_TAG_CONTRACT                   = 0x42,
   TX_EXTRA_MYSTERIOUS_MINERGATE_TAG       = 0xDE;
 
 
@@ -312,24 +313,46 @@ namespace cryptonote
     END_SERIALIZE()
   };
 
-    struct tx_extra_contract_source
+    struct tx_extra_contract
     {
-        uint8_t version;
+        contract::contract_type type;
         std::string m_contract_name;
         std::string m_contract_source;
+        std::string m_contract_method;
+        std::string m_method_args;
         uint64_t m_deposit_amount;
 
-        static tx_extra_contract_source create_contract(
-                uint8_t const& version,
+        static tx_extra_contract create_contract(
                 const std::string& contract_name,
                 const std::string& contract_source,
                 const uint64_t& deposit_amount);
 
+        static tx_extra_contract call_method(
+                const std::string& contract_name,
+                const std::string& contract_method,
+                const std::string& method_args,
+                const uint64_t& deposit_amount);
+
+        static tx_extra_contract terminate(
+                const std::string& contract_name,
+                const std::string& method_args);
+
         BEGIN_SERIALIZE()
-        FIELD(version)
+        ENUM_FIELD(type, type < contract::contract_type::_count)
         FIELD(m_contract_name)
-        FIELD(m_contract_source)
-        FIELD(m_deposit_amount)
+        if (type == contract::contract_type::create)
+        {
+            FIELD(m_contract_source)
+            FIELD(m_deposit_amount)
+        }
+        else if (type == contract::contract_type::method)
+        {
+            FIELD(m_contract_method)
+        }
+        if (type == contract::contract_type::method || type == contract::contract_type::terminate)
+        {
+            FIELD(m_method_args)
+        }
 
         END_SERIALIZE()
     };
@@ -646,7 +669,7 @@ namespace cryptonote
       tx_extra_mysterious_minergate,
       tx_extra_padding,
       tx_extra_security_signature,
-      tx_extra_contract_source
+      tx_extra_contract
       >;
 }
 
@@ -671,4 +694,4 @@ BINARY_VARIANT_TAG(cryptonote::tx_extra_tx_key_image_unlock,         cryptonote:
 BINARY_VARIANT_TAG(cryptonote::tx_extra_burn,                        cryptonote::TX_EXTRA_TAG_BURN);
 BINARY_VARIANT_TAG(cryptonote::tx_extra_beldex_name_system,          cryptonote::TX_EXTRA_TAG_BELDEX_NAME_SYSTEM);
 BINARY_VARIANT_TAG(cryptonote::tx_extra_security_signature,          cryptonote::TX_EXTRA_TAG_SECURITY_SIGNATURE);
-BINARY_VARIANT_TAG(cryptonote::tx_extra_contract_source,             cryptonote::TX_EXTRA_TAG_CONTRACT_SOURCE);
+BINARY_VARIANT_TAG(cryptonote::tx_extra_contract,                    cryptonote::TX_EXTRA_TAG_CONTRACT);

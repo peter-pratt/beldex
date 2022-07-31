@@ -3535,7 +3535,7 @@ if (tx.version >= cryptonote::txversion::v2_ringct)
     }
     if (tx.type == txtype::contract)
     {
-        cryptonote::tx_extra_contract_source data;
+        cryptonote::tx_extra_contract data;
         std::string fail_reason;
         MDEBUG("TODO add TX contract verification in blockchain");
         /*if (!m_bns_db.validate_bns_tx(hf_version, get_current_blockchain_height(), tx, data, &fail_reason))

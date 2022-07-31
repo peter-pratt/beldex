@@ -191,7 +191,7 @@ namespace cryptonote
     bool bns_by_owner(const std::vector<std::string> &args);
     bool bns_lookup(std::vector<std::string> args);
 
-    enum class sweep_type_t { stake, register_stake, all_or_below, single, contract_create };
+    enum class sweep_type_t { stake, register_stake, all_or_below, single, contract };
     bool sweep_main_internal(sweep_type_t sweep_type, std::vector<tools::wallet2::pending_tx> &ptx_vector, cryptonote::address_parse_info const &dest, bool flash);
     bool sweep_main(uint32_t account, uint64_t below, Transfer transfer_type, const std::vector<std::string> &args);
     bool sweep_all(const std::vector<std::string> &args);
@@ -221,6 +221,8 @@ namespace cryptonote
     bool get_tx_proof(const std::vector<std::string> &args);
     bool check_tx_proof(const std::vector<std::string> &args);
     bool contract_create(std::vector<std::string> args);
+    bool contract_method(std::vector<std::string> args);
+    bool contract_terminate(std::vector<std::string> args);
     bool get_spend_proof(const std::vector<std::string> &args);
     bool check_spend_proof(const std::vector<std::string> &args);
     bool get_reserve_proof(const std::vector<std::string> &args);

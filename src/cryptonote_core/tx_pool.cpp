@@ -188,7 +188,7 @@ namespace cryptonote
     }
     else if (tx.type == txtype::contract)
     {
-        tx_extra_contract_source data;
+        tx_extra_contract data;
         if (!cryptonote::get_field_from_tx_extra(tx.extra, data))
         {
             MERROR("Could not get acquire name master from tx: " << get_transaction_hash(tx) << ", tx to add is possibly invalid, rejecting");
@@ -202,16 +202,16 @@ namespace cryptonote
             if (pool_tx.type != tx.type)
                 continue;
 
-            tx_extra_contract_source pool_data;
+            tx_extra_contract pool_data;
             if (!cryptonote::get_field_from_tx_extra(pool_tx.extra, pool_data))
             {
                 LOG_PRINT_L1("Could not get acquire name master from tx: " << get_transaction_hash(tx) << ", possibly corrupt tx in the pool");
                 return true;
             }
 
-            if (data.m_contract_name == pool_data.m_contract_name && data.version == pool_data.version)
+            if (data.m_contract_name == pool_data.m_contract_name && data.type == pool_data.type)
             {
-                LOG_PRINT_L1("New TX: " << get_transaction_hash(tx) << ", has TX: " << get_transaction_hash(pool_tx) << " from the pool that is requesting the same BNS entry already.");
+                LOG_PRINT_L1("New TX: " << get_transaction_hash(tx) << ", has TX: " << get_transaction_hash(pool_tx) << " from the pool that is requesting the same Contract entry already.");
                 return true;
             }
         }
