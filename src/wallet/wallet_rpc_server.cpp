@@ -57,6 +57,7 @@
 #include "cryptonote_core/beldex_name_system.h"
 #include "serialization/boost_std_variant.h"
 
+
 #undef BELDEX_DEFAULT_LOG_CATEGORY
 #define BELDEX_DEFAULT_LOG_CATEGORY "wallet.rpc"
 
@@ -1237,7 +1238,7 @@ namespace tools
         for (size_t d = 0; d < cd.splitted_dsts.size(); ++d)
         {
           const cryptonote::tx_destination_entry &entry = cd.splitted_dsts[d];
-          std::string address = cryptonote::get_account_address_as_str(m_wallet->nettype(), entry.is_subaddress, entry.addr);
+          std::string address = cryptonote::get_account_address_as_str(m_wallet->nettype(), entry.is_subaddress, entry.is_contractaddress, entry.addr);
           if (has_encrypted_payment_id && !entry.is_subaddress && address != entry.original)
             address = cryptonote::get_account_integrated_address_as_str(m_wallet->nettype(), entry.addr, payment_id8);
           auto i = dests.find(entry.addr);
@@ -1279,11 +1280,14 @@ namespace tools
             ++desc.dummy_outputs;
           ++i;
         }
-
+        bool is_contract=false;
         if (desc.change_amount > 0)
         {
           const auto &cd0 = tx_constructions[0];
-          desc.change_address = get_account_address_as_str(m_wallet->nettype(), cd0.subaddr_account > 0, cd0.change_dts.addr);
+            if (cd0.tx_type==cryptonote::txtype::contract){
+                is_contract=true;
+            }
+          desc.change_address = get_account_address_as_str(m_wallet->nettype(), cd0.subaddr_account > 0,is_contract, cd0.change_dts.addr);
         }
 
         desc.fee = desc.amount_in - desc.amount_out;
@@ -1510,7 +1514,7 @@ namespace tools
         throw wallet_rpc_error{error_code::WRONG_ADDRESS, "Invalid address"};
       if(!info.has_payment_id)
         throw wallet_rpc_error{error_code::WRONG_ADDRESS, "Address is not an integrated address"};
-      res.standard_address = get_account_address_as_str(m_wallet->nettype(), info.is_subaddress, info.address);
+      res.standard_address = get_account_address_as_str(m_wallet->nettype(), info.is_subaddress, info.is_contractaddress, info.address);
       res.payment_id = tools::type_to_hex(info.payment_id);
     }
     return res;
@@ -2272,7 +2276,7 @@ namespace tools
         if (entry.m_has_payment_id)
           address = cryptonote::get_account_integrated_address_as_str(m_wallet->nettype(), entry.m_address, entry.m_payment_id);
         else
-          address = get_account_address_as_str(m_wallet->nettype(), entry.m_is_subaddress, entry.m_address);
+          address = get_account_address_as_str(m_wallet->nettype(), entry.m_is_subaddress, entry.m_is_contractaddress, entry.m_address);
         res.entries.push_back(wallet_rpc::GET_ADDRESS_BOOK_ENTRY::entry{idx++, address, entry.m_description});
       }
     }
@@ -2287,7 +2291,7 @@ namespace tools
         if (entry.m_has_payment_id)
           address = cryptonote::get_account_integrated_address_as_str(m_wallet->nettype(), entry.m_address, entry.m_payment_id);
         else
-          address = get_account_address_as_str(m_wallet->nettype(), entry.m_is_subaddress, entry.m_address);
+          address = get_account_address_as_str(m_wallet->nettype(), entry.m_is_subaddress, entry.m_is_contractaddress, entry.m_address);
         res.entries.push_back(wallet_rpc::GET_ADDRESS_BOOK_ENTRY::entry{idx, address, entry.m_description});
       }
     }
@@ -2301,7 +2305,7 @@ namespace tools
 
     cryptonote::address_parse_info info = extract_account_addr(m_wallet->nettype(), req.address);
 
-    if (!m_wallet->add_address_book_row(info.address, info.has_payment_id ? &info.payment_id : NULL, req.description, info.is_subaddress))
+    if (!m_wallet->add_address_book_row(info.address, info.has_payment_id ? &info.payment_id : NULL, req.description, info.is_subaddress, info.is_contractaddress))
       throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "Failed to add address book entry"};
     res.index = m_wallet->get_address_book().size() - 1;
     return res;
@@ -2322,6 +2326,7 @@ namespace tools
       cryptonote::address_parse_info info = extract_account_addr(m_wallet->nettype(), req.address);
       entry.m_address = info.address;
       entry.m_is_subaddress = info.is_subaddress;
+      entry.m_is_contractaddress = info.is_contractaddress;
       if (info.has_payment_id)
         entry.m_payment_id = info.payment_id;
     }
@@ -2329,7 +2334,7 @@ namespace tools
     if (req.set_description)
       entry.m_description = req.description;
 
-    if (!m_wallet->set_address_book_row(req.index, entry.m_address, req.set_address && entry.m_has_payment_id ? &entry.m_payment_id : NULL, entry.m_description, entry.m_is_subaddress))
+    if (!m_wallet->set_address_book_row(req.index, entry.m_address, req.set_address && entry.m_has_payment_id ? &entry.m_payment_id : NULL, entry.m_description, entry.m_is_subaddress, entry.m_is_contractaddress))
       throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "Failed to edit address book entry"};
     return {};
   }

@@ -1623,7 +1623,7 @@ namespace cryptonote
 std::string bns::generic_owner::to_string(cryptonote::network_type nettype) const
 {
   if (type == bns::generic_owner_sig_type::monero)
-    return cryptonote::get_account_address_as_str(nettype, wallet.is_subaddress, wallet.address);
+    return cryptonote::get_account_address_as_str(nettype, wallet.is_subaddress, false, wallet.address);
   else
     return tools::type_to_hex(ed25519);
 }

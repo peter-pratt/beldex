@@ -474,7 +474,7 @@ TEST(get_account_address_as_str, works_correctly)
 {
   cryptonote::account_public_address addr;
   ASSERT_NO_THROW(serialization::parse_binary(test_serialized_keys, addr));
-  std::string addr_str = cryptonote::get_account_address_as_str(cryptonote::MAINNET, false, addr);
+  std::string addr_str = cryptonote::get_account_address_as_str(cryptonote::MAINNET, false, false, addr);
   ASSERT_EQ(addr_str, test_keys_addr_str);
 }
 

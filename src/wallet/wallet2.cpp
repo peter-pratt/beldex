@@ -263,6 +263,7 @@ struct options {
 
   const command_line::arg_descriptor<bool> testnet = {"testnet", tools::wallet2::tr("For testnet. Daemon must also be launched with --testnet flag"), false};
   const command_line::arg_descriptor<bool> devnet = {"devnet", tools::wallet2::tr("For devnet. Daemon must also be launched with --devnet flag"), false};
+  const command_line::arg_descriptor<bool> contract = {"contract", tools::wallet2::tr("For creating a contract account"), false};
   const command_line::arg_descriptor<bool> regtest = {"regtest", tools::wallet2::tr("For regression testing. Daemon must also be launched with --regtest flag"), false};
   const command_line::arg_descriptor<bool> disable_rpc_long_poll = {"disable-rpc-long-poll", tools::wallet2::tr("Disable TX pool long polling functionality for instantaneous TX detection"), false};
 
@@ -328,6 +329,8 @@ std::unique_ptr<tools::wallet2> make_basic(const boost::program_options::variabl
   network_type nettype = testnet ? TESTNET : devnet ? DEVNET : fakenet ? FAKECHAIN : MAINNET;
 
   THROW_WALLET_EXCEPTION_IF(testnet + devnet + fakenet > 1, tools::error::wallet_internal_error, "At most one of --testnet, --devnet, or --regtest may be specified");
+
+  const bool contract = command_line::get_arg(vm, opts.contract);
 
   const uint64_t kdf_rounds = command_line::get_arg(vm, opts.kdf_rounds);
   THROW_WALLET_EXCEPTION_IF(kdf_rounds == 0, tools::error::wallet_internal_error, "KDF rounds must not be 0");
@@ -405,7 +408,7 @@ std::unique_ptr<tools::wallet2> make_basic(const boost::program_options::variabl
   else if (trusted_daemon)
     MINFO(tools::wallet2::tr("Daemon is local, assuming trusted"));
 
-  auto wallet = std::make_unique<tools::wallet2>(nettype, kdf_rounds, unattended);
+  auto wallet = std::make_unique<tools::wallet2>(nettype, kdf_rounds, unattended, contract);
   wallet->init(std::move(daemon_address), std::move(login), std::move(proxy), 0, trusted_daemon);
   auto ringdb_path = fs::u8path(command_line::get_arg(vm, opts.shared_ringdb_dir));
   wallet->set_ring_database(ringdb_path);
@@ -1020,7 +1023,7 @@ void wallet_device_callback::on_progress(const hw::device_progress& event)
     wallet->on_device_progress(event);
 }
 
-wallet2::wallet2(network_type nettype, uint64_t kdf_rounds, bool unattended):
+wallet2::wallet2(network_type nettype, uint64_t kdf_rounds, bool unattended, bool contract):
   m_multisig_rescan_info(NULL),
   m_multisig_rescan_k(NULL),
   m_upper_transaction_weight_limit(0),
@@ -1082,7 +1085,8 @@ wallet2::wallet2(network_type nettype, uint64_t kdf_rounds, bool unattended):
   m_device_last_key_image_sync(0),
   m_offline(false),
   m_rpc_version(0),
-  m_export_format(ExportFormat::Binary)
+  m_export_format(ExportFormat::Binary),
+  m_contract(contract)
 {
 }
 
@@ -1429,7 +1433,7 @@ crypto::public_key wallet2::get_subaddress_spend_public_key(const cryptonote::su
 std::string wallet2::get_subaddress_as_str(const cryptonote::subaddress_index& index) const
 {
   cryptonote::account_public_address address = get_subaddress(index);
-  return cryptonote::get_account_address_as_str(m_nettype, !index.is_zero(), address);
+  return cryptonote::get_account_address_as_str(m_nettype, !index.is_zero(), false/*not contract*/, address);
 }
 //----------------------------------------------------------------------------------------------------
 std::string wallet2::get_integrated_address_as_str(const crypto::hash8& payment_id) const
@@ -3363,7 +3367,7 @@ void wallet2::fast_refresh(uint64_t stop_height, uint64_t &blocks_start_height, 
 }
 
 
-bool wallet2::add_address_book_row(const cryptonote::account_public_address &address, const crypto::hash8 *payment_id, const std::string &description, bool is_subaddress)
+bool wallet2::add_address_book_row(const cryptonote::account_public_address &address, const crypto::hash8 *payment_id, const std::string &description, bool is_subaddress, bool is_contractaddress)
 {
   wallet2::address_book_row a;
   a.m_address = address;
@@ -3371,6 +3375,7 @@ bool wallet2::add_address_book_row(const cryptonote::account_public_address &add
   a.m_payment_id = payment_id ? *payment_id : crypto::null_hash8;
   a.m_description = description;
   a.m_is_subaddress = is_subaddress;
+  a.m_is_contractaddress = is_contractaddress;
 
   auto old_size = m_address_book.size();
   m_address_book.push_back(a);
@@ -3379,7 +3384,7 @@ bool wallet2::add_address_book_row(const cryptonote::account_public_address &add
   return false;
 }
 
-bool wallet2::set_address_book_row(size_t row_id, const cryptonote::account_public_address &address, const crypto::hash8 *payment_id, const std::string &description, bool is_subaddress)
+bool wallet2::set_address_book_row(size_t row_id, const cryptonote::account_public_address &address, const crypto::hash8 *payment_id, const std::string &description, bool is_subaddress, bool is_contractaddress)
 {
   wallet2::address_book_row a;
   a.m_address = address;
@@ -3387,6 +3392,7 @@ bool wallet2::set_address_book_row(size_t row_id, const cryptonote::account_publ
   a.m_payment_id = payment_id ? *payment_id : crypto::null_hash8;
   a.m_description = description;
   a.m_is_subaddress = is_subaddress;
+  a.m_is_contractaddress = is_contractaddress;
 
   const auto size = m_address_book.size();
   if (row_id >= size)
@@ -4075,7 +4081,7 @@ std::optional<wallet2::keys_file_data> wallet2::get_keys_file_data(const epee::w
   std::string original_view_secret_key;
   if (m_original_keys_available)
   {
-    original_address = get_account_address_as_str(m_nettype, false, m_original_address);
+    original_address = get_account_address_as_str(m_nettype, false, false, m_original_address);
     value.SetString(original_address.c_str(), original_address.length());
     json.AddMember("original_address", value, json.GetAllocator());
     original_view_secret_key = tools::type_to_hex(m_original_view_secret_key);
@@ -4455,7 +4461,7 @@ bool wallet2::load_keys_buf(const std::string& keys_buf, const epee::wipeable_st
     THROW_WALLET_EXCEPTION_IF(!hwdev.get_public_address(device_account_public_address), error::wallet_internal_error, "Cannot get a device address");
     THROW_WALLET_EXCEPTION_IF(device_account_public_address != m_account.get_keys().m_account_address, error::wallet_internal_error,
             "Device wallet does not match wallet address. "
-            "Device address: " + cryptonote::get_account_address_as_str(m_nettype, false, device_account_public_address) +
+            "Device address: " + cryptonote::get_account_address_as_str(m_nettype, false, false, device_account_public_address) +
             ", wallet address: " + m_account.get_public_address_str(m_nettype));
     LOG_PRINT_L0("Device initialized...");
   } else if (key_on_device()) {
@@ -6543,7 +6549,7 @@ std::optional<std::string> wallet2::resolve_address(std::string address, uint64_
         {
           info = std::move(*addr_info);
           result = true;
-          LOG_PRINT_L2("Resolved BNS name: "<< address << " to address: " << get_account_address_as_str(m_nettype, info.is_subaddress, info.address));
+          LOG_PRINT_L2("Resolved BNS name: "<< address << " to address: " << get_account_address_as_str(m_nettype, info.is_subaddress,info.is_contractaddress, info.address));
         }
       }
 
@@ -6553,7 +6559,7 @@ std::optional<std::string> wallet2::resolve_address(std::string address, uint64_
   }
 
   if (result)
-    return get_account_address_as_str(m_nettype, info.is_subaddress, info.address);
+    return get_account_address_as_str(m_nettype, info.is_subaddress, info.is_contractaddress, info.address);
   else
     return std::nullopt;
 }
@@ -11310,7 +11316,7 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
       while (!dsts.empty() && dsts[0].amount <= available_amount && estimate_tx_weight(tx.selected_transfers.size(), fake_outs_count, tx.dsts.size()+1, extra.size(), clsag) < tx_weight_target(upper_transaction_weight_limit))
       {
         // we can fully pay that destination
-        LOG_PRINT_L2("We can fully pay " << get_account_address_as_str(m_nettype, dsts[0].is_subaddress, dsts[0].addr) <<
+        LOG_PRINT_L2("We can fully pay " << get_account_address_as_str(m_nettype, dsts[0].is_subaddress,dsts[0].is_contractaddress, dsts[0].addr) <<
           " for " << print_money(dsts[0].amount));
         tx.add(dsts[0], dsts[0].amount, original_output_index, m_merge_destinations);
         available_amount -= dsts[0].amount;
@@ -11321,7 +11327,7 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
 
       if (available_amount > 0 && !dsts.empty() && estimate_tx_weight(tx.selected_transfers.size(), fake_outs_count, tx.dsts.size()+1, extra.size(), clsag) < tx_weight_target(upper_transaction_weight_limit)) {
         // we can partially fill that destination
-        LOG_PRINT_L2("We can partially pay " << get_account_address_as_str(m_nettype, dsts[0].is_subaddress, dsts[0].addr) <<
+        LOG_PRINT_L2("We can partially pay " << get_account_address_as_str(m_nettype, dsts[0].is_subaddress, dsts[0].is_contractaddress, dsts[0].addr) <<
           " for " << print_money(available_amount) << "/" << print_money(dsts[0].amount));
         tx.add(dsts[0], available_amount, original_output_index, m_merge_destinations);
         dsts[0].amount -= available_amount;
@@ -11388,7 +11394,7 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
         if (i->amount > needed_fee)
         {
           uint64_t new_paid_amount = i->amount /*+ test_ptx.fee*/ - needed_fee;
-          LOG_PRINT_L2("Adjusting amount paid to " << get_account_address_as_str(m_nettype, i->is_subaddress, i->addr) << " from " <<
+          LOG_PRINT_L2("Adjusting amount paid to " << get_account_address_as_str(m_nettype, i->is_subaddress, i->is_contractaddress,  i->addr) << " from " <<
             print_money(i->amount) << " to " << print_money(new_paid_amount) << " to accommodate " <<
             print_money(needed_fee) << " fee");
           dsts[0].amount += i->amount - new_paid_amount;
@@ -11520,11 +11526,12 @@ bool wallet2::sanity_check(const std::vector<wallet2::pending_tx> &ptx_vector, s
   THROW_WALLET_EXCEPTION_IF(ptx_vector.empty(), error::wallet_internal_error, "No transactions");
 
   // check every party in there does receive at least the required amount
-  std::unordered_map<account_public_address, std::pair<uint64_t, bool>> required;
+  std::unordered_map<account_public_address, std::tuple<uint64_t, bool, bool>> required;
   for (const auto &d: dsts)
   {
-    required[d.addr].first += d.amount;
-    required[d.addr].second = d.is_subaddress;
+    std::get<0>(required[d.addr]) += d.amount;
+    std::get<1>(required[d.addr]) = d.is_subaddress;
+    std::get<2>(required[d.addr]) = d.is_contractaddress;
   }
 
   // add change
@@ -11536,7 +11543,7 @@ bool wallet2::sanity_check(const std::vector<wallet2::pending_tx> &ptx_vector, s
     change -= ptx.fee;
   }
   for (const auto &r: required)
-    change -= r.second.first;
+    change -= std::get<0>(r.second);
   MDEBUG("Adding " << cryptonote::print_money(change) << " expected change");
 
   // for all txes that have actual change, check change is coming back to the sending wallet
@@ -11546,8 +11553,9 @@ bool wallet2::sanity_check(const std::vector<wallet2::pending_tx> &ptx_vector, s
       continue;
     THROW_WALLET_EXCEPTION_IF(m_subaddresses.find(ptx.change_dts.addr.m_spend_public_key) == m_subaddresses.end(),
          error::wallet_internal_error, "Change address is not ours");
-    required[ptx.change_dts.addr].first += ptx.change_dts.amount;
-    required[ptx.change_dts.addr].second = ptx.change_dts.is_subaddress;
+    std::get<0>(required[ptx.change_dts.addr]) += ptx.change_dts.amount;
+    std::get<1>(required[ptx.change_dts.addr]) = ptx.change_dts.is_subaddress;
+    std::get<2>(required[ptx.change_dts.addr]) = ptx.change_dts.is_contractaddress;
   }
 
   for (const auto &r: required)
@@ -11561,18 +11569,18 @@ bool wallet2::sanity_check(const std::vector<wallet2::pending_tx> &ptx_vector, s
       uint64_t received = 0;
       try
       {
-        std::string proof = get_tx_proof(ptx.tx, ptx.tx_key, ptx.additional_tx_keys, address, r.second.second, "automatic-sanity-check");
-        check_tx_proof(ptx.tx, address, r.second.second, "automatic-sanity-check", proof, received);
+        std::string proof = get_tx_proof(ptx.tx, ptx.tx_key, ptx.additional_tx_keys, address, std::get<1>(r.second), "automatic-sanity-check");
+        check_tx_proof(ptx.tx, address, std::get<1>(r.second), "automatic-sanity-check", proof, received);
       }
       catch (const std::exception &e) { received = 0; }
       total_received += received;
     }
 
     std::stringstream ss;
-    ss << "Total received by " << cryptonote::get_account_address_as_str(m_nettype, r.second.second, address) << ": "
-        << cryptonote::print_money(total_received) << ", expected " << cryptonote::print_money(r.second.first);
+    ss << "Total received by " << cryptonote::get_account_address_as_str(m_nettype, std::get<1>(r.second), std::get<2>(r.second), address) << ": "
+        << cryptonote::print_money(total_received) << ", expected " << cryptonote::print_money(std::get<0>(r.second));
     MDEBUG(ss.str());
-    THROW_WALLET_EXCEPTION_IF(total_received < r.second.first, error::wallet_internal_error, ss.str());
+    THROW_WALLET_EXCEPTION_IF(total_received < std::get<0>(r.second), error::wallet_internal_error, ss.str());
   }
 
   return true;

@@ -239,7 +239,7 @@ namespace cryptonote
     bool status(const std::vector<std::string> &args);
     bool wallet_info(const std::vector<std::string> &args);
     bool set_default_priority(const std::vector<std::string> &args);
-    bool sign_string(std::string_view value, const subaddress_index& index);
+    bool sign_string(std::string_view value, const subaddress_index& index, const bool is_contractaddress);
     bool verify_string(std::string_view value, std::string_view address, std::string_view signature);
     bool sign(const std::vector<std::string> &args);
     bool verify(const std::vector<std::string> &args);

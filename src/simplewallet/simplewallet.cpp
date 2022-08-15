@@ -7752,11 +7752,14 @@ bool simple_wallet::accept_loaded_tx(const std::function<size_t()> get_num_txes,
     for (size_t d = 0; d < cd.splitted_dsts.size(); ++d)
     {
       const tx_destination_entry &entry = cd.splitted_dsts[d];
-      std::string address, standard_address = get_account_address_as_str(m_wallet->nettype(), entry.is_subaddress, entry.addr);
-      if (has_encrypted_payment_id && !entry.is_subaddress && standard_address != entry.original)
+      std::string address, standard_address = get_account_address_as_str(m_wallet->nettype(), entry.is_subaddress, false, entry.addr);
+      if (has_encrypted_payment_id && !entry.is_subaddress && standard_address != entry.original && !entry.is_contractaddress )
       {
         address = get_account_integrated_address_as_str(m_wallet->nettype(), entry.addr, payment_id8);
         address += std::string(" (" + standard_address + " with encrypted payment id " + tools::type_to_hex(payment_id8) + ")");
+      }
+      else if (entry.is_contractaddress){
+        address = get_account_address_as_str(m_wallet->nettype(), entry.is_subaddress, true, entry.addr);
       }
       else
         address = standard_address;
@@ -7824,9 +7827,14 @@ bool simple_wallet::accept_loaded_tx(const std::function<size_t()> get_num_txes,
     dest_string = tr("with no destinations");
 
   std::string change_string;
+  bool is_contract=false;
   if (change > 0)
   {
-    std::string address = get_account_address_as_str(m_wallet->nettype(), get_tx(0).subaddr_account > 0, get_tx(0).change_dts.addr);
+
+   if (get_tx(0).tx_type==txtype::contract){
+      is_contract=true;
+   }
+    std::string address = get_account_address_as_str(m_wallet->nettype(), get_tx(0).subaddr_account > 0, is_contract, get_tx(0).change_dts.addr);
     change_string += (boost::format(tr("%s change to %s")) % print_money(change) % address).str();
   }
   else
@@ -8155,7 +8163,7 @@ bool simple_wallet::check_tx_key(const std::vector<std::string> &args_)
 
     if (received > 0)
     {
-      success_msg_writer() << get_account_address_as_str(m_wallet->nettype(), info.is_subaddress, info.address) << " " << tr("received") << " " << print_money(received) << " " << tr("in txid") << " " << txid;
+      success_msg_writer() << get_account_address_as_str(m_wallet->nettype(), info.is_subaddress, info.is_contractaddress, info.address) << " " << tr("received") << " " << print_money(received) << " " << tr("in txid") << " " << txid;
       if (in_pool)
       {
         success_msg_writer() << tr("WARNING: this transaction is not yet included in the blockchain!");
@@ -8174,7 +8182,7 @@ bool simple_wallet::check_tx_key(const std::vector<std::string> &args_)
     }
     else
     {
-      fail_msg_writer() << get_account_address_as_str(m_wallet->nettype(), info.is_subaddress, info.address) << " " << tr("received nothing in txid") << " " << txid;
+      fail_msg_writer() << get_account_address_as_str(m_wallet->nettype(), info.is_subaddress, info.is_contractaddress, info.address) << " " << tr("received nothing in txid") << " " << txid;
     }
   }
   catch (const std::exception &e)
@@ -8228,7 +8236,7 @@ bool simple_wallet::check_tx_proof(const std::vector<std::string> &args)
       success_msg_writer(true) << tr("Good signature");
       if (received > 0)
       {
-        success_msg_writer() << get_account_address_as_str(m_wallet->nettype(), info.is_subaddress, info.address) << " " << tr("received") << " " << print_money(received) << " " << tr("in txid") << " " << txid;
+        success_msg_writer() << get_account_address_as_str(m_wallet->nettype(), info.is_subaddress, info.is_contractaddress, info.address) << " " << tr("received") << " " << print_money(received) << " " << tr("in txid") << " " << txid;
         if (in_pool)
         {
           success_msg_writer() << tr("WARNING: this transaction is not yet included in the blockchain!");
@@ -8247,7 +8255,7 @@ bool simple_wallet::check_tx_proof(const std::vector<std::string> &args)
       }
       else
       {
-        fail_msg_writer() << get_account_address_as_str(m_wallet->nettype(), info.is_subaddress, info.address) << " " << tr("received nothing in txid") << " " << txid;
+        fail_msg_writer() << get_account_address_as_str(m_wallet->nettype(), info.is_subaddress, info.is_contractaddress, info.address) << " " << tr("received nothing in txid") << " " << txid;
       }
     }
     else
@@ -9711,12 +9719,12 @@ bool simple_wallet::print_integrated_address(const std::vector<std::string> &arg
       if (info.has_payment_id)
       {
         success_msg_writer() << boost::format(tr("Integrated address: %s, payment ID: %s")) %
-          get_account_address_as_str(m_wallet->nettype(), false, info.address) % tools::type_to_hex(info.payment_id);
+          get_account_address_as_str(m_wallet->nettype(), false, false, info.address) % tools::type_to_hex(info.payment_id);
         device_show_integrated(info.payment_id);
       }
       else
       {
-        success_msg_writer() << (info.is_subaddress ? tr("Subaddress: ") : tr("Standard address: ")) << get_account_address_as_str(m_wallet->nettype(), info.is_subaddress, info.address);
+        success_msg_writer() << (info.is_subaddress ? tr("Subaddress: ") : tr("Standard address: ")) << get_account_address_as_str(m_wallet->nettype(), info.is_subaddress, false, info.address);
       }
       return true;
     }
@@ -9751,7 +9759,7 @@ bool simple_wallet::address_book(const std::vector<std::string> &args/* = std::v
         description += " ";
       description += args[i];
     }
-    m_wallet->add_address_book_row(info.address, info.has_payment_id ? &info.payment_id : NULL, description, info.is_subaddress);
+    m_wallet->add_address_book_row(info.address, info.has_payment_id ? &info.payment_id : NULL, description, info.is_subaddress, info.is_contractaddress);
   }
   else
   {
@@ -9777,7 +9785,7 @@ bool simple_wallet::address_book(const std::vector<std::string> &args/* = std::v
       if (row.m_has_payment_id)
         address = cryptonote::get_account_integrated_address_as_str(m_wallet->nettype(), row.m_address, row.m_payment_id);
       else
-        address = get_account_address_as_str(m_wallet->nettype(), row.m_is_subaddress, row.m_address);
+        address = get_account_address_as_str(m_wallet->nettype(), row.m_is_subaddress, row.m_is_contractaddress, row.m_address);
       success_msg_writer() << tr("Address: ") << address;
       success_msg_writer() << tr("Description: ") << row.m_description << "\n";
     }
@@ -9923,7 +9931,7 @@ bool simple_wallet::wallet_info(const std::vector<std::string> &args)
   return true;
 }
 
-bool simple_wallet::sign_string(std::string_view value, const subaddress_index& index)
+bool simple_wallet::sign_string(std::string_view value, const subaddress_index& index, const bool is_contractaddress)
 {
   if (m_wallet->key_on_device())
     fail_msg_writer() << tr("command not supported by HW wallet");
@@ -9935,7 +9943,7 @@ bool simple_wallet::sign_string(std::string_view value, const subaddress_index& 
   {
     SCOPED_WALLET_UNLOCK();
 
-    std::string addr = get_account_address_as_str(m_wallet->nettype(), !index.is_zero(), m_wallet->get_subaddress(index));
+    std::string addr = get_account_address_as_str(m_wallet->nettype(), !index.is_zero(), is_contractaddress, m_wallet->get_subaddress(index));
     std::string signature = m_wallet->sign(value, index);
     // Print the string directly if it's ascii without control characters, up to 100 bytes, and
     // doesn't contain any doubled, leading, or trailing spaces (because we can't feed those back
@@ -9978,8 +9986,8 @@ bool simple_wallet::sign(const std::vector<std::string> &args)
     fail_msg_writer() << tr("failed to read file ") << filename.u8string();
     return true;
   }
-
-  return sign_string(data, index);
+  bool is_contractaddress = false; //TODO
+  return sign_string(data, index, is_contractaddress);
 }
 
 bool simple_wallet::verify_string(std::string_view value, std::string_view address, std::string_view signature)
@@ -10046,7 +10054,8 @@ bool simple_wallet::sign_value(const std::vector<std::string> &args)
   // sequential spaces or tabs or something, but in that case you should be using the `sign` (file)
   // command.
   std::string value = tools::join(" ", begin, end);
-  return sign_string(value, index);
+  bool is_contractaddress = false; //TODO
+  return sign_string(value, index, is_contractaddress);
 }
 
 bool simple_wallet::verify_value(const std::vector<std::string> &args)
@@ -10769,7 +10778,7 @@ void simple_wallet::list_signers(const std::vector<mms::authorized_signer> &sign
     std::string monero_address;
     if (signer.monero_address_known)
     {
-      monero_address = get_account_address_as_str(m_wallet->nettype(), false, signer.monero_address);
+      monero_address = get_account_address_as_str(m_wallet->nettype(), false, false, signer.monero_address);
     }
     else
     {

@@ -114,7 +114,7 @@ std::string bns::mapping_value::to_readable_value(cryptonote::network_type netty
     std::optional<cryptonote::address_parse_info> addr = get_wallet_address_info();
     if(addr)
     {
-      result = cryptonote::get_account_address_as_str(nettype, (*addr).is_subaddress, (*addr).address);
+      result = cryptonote::get_account_address_as_str(nettype, (*addr).is_subaddress, false, (*addr).address);
     } else {
       result = oxenmq::to_hex(to_view());
     }

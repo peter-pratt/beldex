@@ -46,7 +46,6 @@ struct tx_construction_data
   std::vector<cryptonote::tx_destination_entry> dests; // original setup, does not include change
   uint32_t subaddr_account;   // subaddress account of your wallet to be used in this transfer
   std::set<uint32_t> subaddr_indices;  // set of address indices used as inputs in this transfer
-
   uint8_t            hf_version;
   cryptonote::txtype tx_type;
 };

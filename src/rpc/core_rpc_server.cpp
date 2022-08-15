@@ -751,12 +751,12 @@ namespace cryptonote { namespace rpc {
         reg.expiry = x.m_expiration_timestamp;
         for (size_t i = 0; i < x.m_portions.size(); i++) {
           auto& [wallet, portion] = reg.contributors.emplace_back();
-          wallet = get_account_address_as_str(nettype, false, {x.m_public_spend_keys[i], x.m_public_view_keys[i]});
+          wallet = get_account_address_as_str(nettype, false, false, {x.m_public_spend_keys[i], x.m_public_view_keys[i]});
           portion = microportion(x.m_portions[i]);
         }
       }
       void operator()(const tx_extra_master_node_contributor& x) {
-        entry.mn_contributor = get_account_address_as_str(nettype, false, {x.m_spend_public_key, x.m_view_public_key});
+        entry.mn_contributor = get_account_address_as_str(nettype, false, false, {x.m_spend_public_key, x.m_view_public_key});
       }
       template <typename T>
       auto& _state_change(const T& x) {
@@ -800,7 +800,7 @@ namespace cryptonote { namespace rpc {
         if (!owner)
           return;
         if (owner.type == bns::generic_owner_sig_type::monero)
-          entry = get_account_address_as_str(nettype, owner.wallet.is_subaddress, owner.wallet.address);
+          entry = get_account_address_as_str(nettype, owner.wallet.is_subaddress, false, owner.wallet.address);
         else if (owner.type == bns::generic_owner_sig_type::ed25519)
           entry = tools::type_to_hex(owner.ed25519);
       }
@@ -1328,7 +1328,7 @@ namespace cryptonote { namespace rpc {
     }
     const account_public_address& lMiningAdr = lMiner.get_mining_address();
     if (lMiner.is_mining())
-      res.address = get_account_address_as_str(nettype(), false, lMiningAdr);
+      res.address = get_account_address_as_str(nettype(), false, false, lMiningAdr);
     const uint8_t major_version = m_core.get_blockchain_storage().get_network_version();
 
     res.pow_algorithm =
@@ -3133,7 +3133,7 @@ namespace cryptonote { namespace rpc {
       auto &new_contributor = entry.contributors.back();
       new_contributor.amount   = contributor.amount;
       new_contributor.reserved = contributor.reserved;
-      new_contributor.address  = cryptonote::get_account_address_as_str(m_core.get_nettype(), false/*is_subaddress*/, contributor.address);
+      new_contributor.address  = cryptonote::get_account_address_as_str(m_core.get_nettype(), false/*is_subaddress*/, false/*is_contractaddress*/,contributor.address);
 
       new_contributor.locked_contributions.reserve(contributor.locked_contributions.size());
       for (master_node_info::contribution_t const &src : contributor.locked_contributions)
@@ -3150,7 +3150,7 @@ namespace cryptonote { namespace rpc {
     entry.total_reserved                = info.total_reserved;
     entry.staking_requirement           = info.staking_requirement;
     entry.portions_for_operator         = info.portions_for_operator;
-    entry.operator_address              = cryptonote::get_account_address_as_str(m_core.get_nettype(), false/*is_subaddress*/, info.operator_address);
+    entry.operator_address              = cryptonote::get_account_address_as_str(m_core.get_nettype(), false/*is_subaddress*/, false/*is_contractaddress*/, info.operator_address);
     entry.swarm_id                      = info.swarm_id;
     entry.registration_hf_version       = info.registration_hf_version;
 

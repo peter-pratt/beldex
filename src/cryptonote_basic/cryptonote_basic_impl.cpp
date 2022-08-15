@@ -205,10 +205,11 @@ namespace cryptonote {
   std::string get_account_address_as_str(
       network_type nettype
     , bool subaddress
+    , bool contractaddress
     , account_public_address const & adr
     )
   {
-    uint64_t address_prefix = subaddress ? get_config(nettype).CRYPTONOTE_PUBLIC_SUBADDRESS_BASE58_PREFIX : get_config(nettype).CRYPTONOTE_PUBLIC_ADDRESS_BASE58_PREFIX;
+    uint64_t address_prefix = contractaddress ? get_config(nettype).CRYPTONOTE_CONTRACT_ADDRESS_BASE58_PREFIX:(subaddress ? get_config(nettype).CRYPTONOTE_PUBLIC_SUBADDRESS_BASE58_PREFIX : get_config(nettype).CRYPTONOTE_PUBLIC_ADDRESS_BASE58_PREFIX);
 
     return tools::base58::encode_addr(address_prefix, t_serializable_object_to_blob(adr));
   }
@@ -241,6 +242,7 @@ namespace cryptonote {
     uint64_t address_prefix = get_config(nettype).CRYPTONOTE_PUBLIC_ADDRESS_BASE58_PREFIX;
     uint64_t integrated_address_prefix = get_config(nettype).CRYPTONOTE_PUBLIC_INTEGRATED_ADDRESS_BASE58_PREFIX;
     uint64_t subaddress_prefix = get_config(nettype).CRYPTONOTE_PUBLIC_SUBADDRESS_BASE58_PREFIX;
+    uint64_t contractaddress_prefix = get_config(nettype).CRYPTONOTE_CONTRACT_ADDRESS_BASE58_PREFIX;
 
     blobdata data;
     uint64_t prefix{0};
@@ -254,16 +256,25 @@ namespace cryptonote {
     {
       info.is_subaddress = false;
       info.has_payment_id = true;
+      info.is_contractaddress = false;
     }
     else if (address_prefix == prefix)
     {
       info.is_subaddress = false;
       info.has_payment_id = false;
+      info.is_contractaddress = false;
     }
     else if (subaddress_prefix == prefix)
     {
       info.is_subaddress = true;
       info.has_payment_id = false;
+      info.is_contractaddress = false;
+    }
+    else if (contractaddress_prefix == prefix)
+    {
+        info.is_subaddress = false;
+        info.has_payment_id = false;
+        info.is_contractaddress = true;
     }
     else {
       LOG_PRINT_L1("Wrong address prefix: " << prefix << ", expected " << address_prefix 
@@ -325,6 +336,7 @@ namespace cryptonote {
 KV_SERIALIZE_MAP_CODE_BEGIN(cryptonote::address_parse_info)
   KV_SERIALIZE(address)
   KV_SERIALIZE(is_subaddress)
+  KV_SERIALIZE(is_contractaddress)
   KV_SERIALIZE(has_payment_id)
   KV_SERIALIZE_VAL_POD_AS_BLOB_FORCE(payment_id)
 KV_SERIALIZE_MAP_CODE_END()

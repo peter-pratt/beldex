@@ -134,7 +134,7 @@ bool UnsignedTransactionImpl::checkLoadedTx(const std::function<size_t()> get_nu
     for (size_t d = 0; d < cd.splitted_dsts.size(); ++d)
     {
       const cryptonote::tx_destination_entry &entry = cd.splitted_dsts[d];
-      std::string address, standard_address = get_account_address_as_str(m_wallet.m_wallet->nettype(), entry.is_subaddress, entry.addr);
+      std::string address, standard_address = get_account_address_as_str(m_wallet.m_wallet->nettype(), entry.is_subaddress, entry.is_contractaddress, entry.addr);
       if (has_encrypted_payment_id && !entry.is_subaddress)
       {
         address = get_account_integrated_address_as_str(m_wallet.m_wallet->nettype(), entry.addr, payment_id8);
@@ -190,9 +190,13 @@ bool UnsignedTransactionImpl::checkLoadedTx(const std::function<size_t()> get_nu
     dest_string = tr("with no destinations");
 
   std::string change_string;
+  bool is_contract=false;
   if (change > 0)
   {
-    std::string address = get_account_address_as_str(m_wallet.m_wallet->nettype(), get_tx(0).subaddr_account > 0, get_tx(0).change_dts.addr);
+    if (get_tx(0).tx_type==txtype::contract){
+       is_contract=true;
+    }
+    std::string address = get_account_address_as_str(m_wallet.m_wallet->nettype(), get_tx(0).subaddr_account > 0, is_contract, get_tx(0).change_dts.addr);
     change_string += (boost::format(tr("%s change to %s")) % cryptonote::print_money(change) % address).str();
   }
   else
@@ -290,7 +294,7 @@ std::vector<std::string> UnsignedTransactionImpl::recipientAddress() const
           MERROR("empty destinations, skipped");
           continue;
         }
-        result.push_back(cryptonote::get_account_address_as_str(m_wallet.m_wallet->nettype(), utx.dests[0].is_subaddress, utx.dests[0].addr));
+        result.push_back(cryptonote::get_account_address_as_str(m_wallet.m_wallet->nettype(), utx.dests[0].is_subaddress, utx.dests[0].is_contractaddress, utx.dests[0].addr));
     }
     return result;
 }

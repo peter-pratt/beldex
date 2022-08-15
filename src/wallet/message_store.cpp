@@ -1337,7 +1337,7 @@ void message_store::delete_transport_message(uint32_t id)
 
 std::string message_store::account_address_to_string(const cryptonote::account_public_address &account_address) const
 {
-  return get_account_address_as_str(m_nettype, false, account_address);
+  return get_account_address_as_str(m_nettype, false, false,   account_address);
 }
 
 const char* message_store::message_type_to_string(message_type type)

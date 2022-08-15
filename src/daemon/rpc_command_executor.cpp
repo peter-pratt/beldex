@@ -1085,7 +1085,7 @@ bool rpc_command_executor::start_mining(const cryptonote::account_public_address
   START_MINING::request req{};
   START_MINING::response res{};
   req.num_blocks    = num_blocks;
-  req.miner_address = cryptonote::get_account_address_as_str(nettype, false, address);
+  req.miner_address = cryptonote::get_account_address_as_str(nettype, false, false, address);
   req.threads_count = num_threads;
 
   if (!invoke<START_MINING>(std::move(req), res, "Unable to start mining"))

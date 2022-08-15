@@ -1243,7 +1243,7 @@ bool beldex_name_system_get_mappings_by_owner::generate(std::vector<test_event_e
   crypto::hash wallet_name1_txid = {}, wallet_name2_txid = {};
   if (bns::mapping_type_allowed(gen.hardfork(), bns::mapping_type::wallet))
   {
-    std::string bob_addr = cryptonote::get_account_address_as_str(cryptonote::FAKECHAIN, false, bob.get_keys().m_account_address);
+    std::string bob_addr = cryptonote::get_account_address_as_str(cryptonote::FAKECHAIN, false, false, bob.get_keys().m_account_address);
     cryptonote::transaction tx1 = gen.create_and_add_beldex_name_system_tx(bob, gen.hardfork(), bns::mapping_type::wallet, wallet_name1, bob_key.wallet_value);
     cryptonote::transaction tx2 = gen.create_and_add_beldex_name_system_tx(miner, gen.hardfork(), bns::mapping_type::wallet, wallet_name2, bob_key.wallet_value, &bob_key.owner);
     gen.create_and_add_next_block({tx1, tx2});

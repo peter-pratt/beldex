@@ -298,7 +298,7 @@ private:
     static bool verify_password(const fs::path& keys_file_name, const epee::wipeable_string& password, bool no_spend_key, hw::device &hwdev, uint64_t kdf_rounds);
     static bool query_device(hw::device::device_type& device_type, const fs::path& keys_file_name, const epee::wipeable_string& password, uint64_t kdf_rounds = 1);
 
-    wallet2(cryptonote::network_type nettype = cryptonote::MAINNET, uint64_t kdf_rounds = 1, bool unattended = false);
+    wallet2(cryptonote::network_type nettype = cryptonote::MAINNET, uint64_t kdf_rounds = 1, bool unattended = false, bool contract = false);
     ~wallet2();
 
     struct tx_scan_info_t
@@ -433,6 +433,7 @@ private:
       std::string m_description;
       bool m_is_subaddress;
       bool m_has_payment_id;
+      bool m_is_contractaddress;
     };
 
     struct reserve_proof_entry
@@ -1059,8 +1060,8 @@ private:
     * \brief GUI Address book get/store
     */
     std::vector<address_book_row> get_address_book() const { return m_address_book; }
-    bool add_address_book_row(const cryptonote::account_public_address &address, const crypto::hash8 *payment_id, const std::string &description, bool is_subaddress);
-    bool set_address_book_row(size_t row_id, const cryptonote::account_public_address &address, const crypto::hash8 *payment_id, const std::string &description, bool is_subaddress);
+    bool add_address_book_row(const cryptonote::account_public_address &address, const crypto::hash8 *payment_id, const std::string &description, bool is_subaddress, bool is_contractaddress);
+    bool set_address_book_row(size_t row_id, const cryptonote::account_public_address &address, const crypto::hash8 *payment_id, const std::string &description, bool is_subaddress, bool is_contractaddress);
     bool delete_address_book_row(std::size_t row_id);
 
     uint64_t get_num_rct_outputs();
@@ -1709,6 +1710,8 @@ private:
 
     inline static std::mutex default_daemon_address_mutex;
     inline static std::string default_daemon_address;
+
+    bool m_contract;
   };
 
   // TODO(beldex): Hmm. We need this here because we make register_master_node do
@@ -1729,7 +1732,7 @@ BOOST_CLASS_VERSION(tools::wallet2::payment_details, 6)
 BOOST_CLASS_VERSION(tools::wallet2::pool_payment_details, 1)
 BOOST_CLASS_VERSION(tools::wallet2::unconfirmed_transfer_details, 9)
 BOOST_CLASS_VERSION(tools::wallet2::confirmed_transfer_details, 8)
-BOOST_CLASS_VERSION(tools::wallet2::address_book_row, 18)
+BOOST_CLASS_VERSION(tools::wallet2::address_book_row, 19)
 BOOST_CLASS_VERSION(tools::wallet2::reserve_proof_entry, 0)
 BOOST_CLASS_VERSION(tools::wallet2::bns_detail, 1)
 
@@ -1935,9 +1938,15 @@ namespace boost::serialization
       a & x.m_is_subaddress;
       if (ver < 18)
         return;
+
       a & x.m_has_payment_id;
       if (x.m_has_payment_id)
         a & x.m_payment_id;
+
+        if (ver < 19)
+            return;
+      a & x.m_is_contractaddress;
+
     }
 
     template <class Archive>

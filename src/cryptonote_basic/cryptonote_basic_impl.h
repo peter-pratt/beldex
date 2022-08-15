@@ -95,6 +95,7 @@ namespace cryptonote {
     bool is_subaddress;
     bool has_payment_id;
     crypto::hash8 payment_id;
+    bool is_contractaddress;
 
     std::string as_str(network_type nettype) const;
 
@@ -117,6 +118,7 @@ namespace cryptonote {
   std::string get_account_address_as_str(
       network_type nettype
     , bool subaddress
+    , bool contractaddress
     , const account_public_address& adr
     );
 
@@ -131,7 +133,7 @@ namespace cryptonote {
     if (has_payment_id)
       return get_account_integrated_address_as_str(nettype, address, payment_id);
     else
-      return get_account_address_as_str(nettype, is_subaddress, address);
+      return get_account_address_as_str(nettype, is_subaddress, is_contractaddress, address);
   }
 
   bool get_account_address_from_str(

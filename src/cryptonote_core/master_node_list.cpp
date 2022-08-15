@@ -1155,7 +1155,7 @@ namespace master_nodes
       {
         LOG_PRINT_L1("TX: Already hit the max number of contributions: "
                      << MAX_NUMBER_OF_CONTRIBUTORS
-                     << " for contributor: " << cryptonote::get_account_address_as_str(nettype, false, stake.address)
+                     << " for contributor: " << cryptonote::get_account_address_as_str(nettype, false, false, stake.address)
                      << " on height: " << block_height << " for tx: " << cryptonote::get_transaction_hash(tx));
         return false;
       }

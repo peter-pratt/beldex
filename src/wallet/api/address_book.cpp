@@ -58,7 +58,7 @@ bool AddressBookImpl::addRow(const std::string &dst_addr, const std::string &des
     return false;
   }
 
-  bool r =  m_wallet->m_wallet->add_address_book_row(info.address, info.has_payment_id ? &info.payment_id : NULL,description,info.is_subaddress);
+  bool r =  m_wallet->m_wallet->add_address_book_row(info.address, info.has_payment_id ? &info.payment_id : NULL,description,info.is_subaddress,info.is_contractaddress);
   if (r)
     refresh();
   else
@@ -82,7 +82,7 @@ void AddressBookImpl::refresh()
     if (row->m_has_payment_id)
       address = cryptonote::get_account_integrated_address_as_str(m_wallet->m_wallet->nettype(), row->m_address, row->m_payment_id);
     else
-      address = get_account_address_as_str(m_wallet->m_wallet->nettype(), row->m_is_subaddress, row->m_address);
+      address = get_account_address_as_str(m_wallet->m_wallet->nettype(), row->m_is_subaddress, row->m_is_contractaddress, row->m_address);
     AddressBookRow* abr = new AddressBookRow(i, address, row->m_description);
     m_rows.push_back(abr);
   }

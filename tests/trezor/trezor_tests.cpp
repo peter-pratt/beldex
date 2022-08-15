@@ -1233,7 +1233,7 @@ void gen_trezor_base::mine_and_test(std::vector<test_event_entry>& events)
   cryptonote::core * core = daemon()->core();
   const uint64_t height_before_mining = daemon()->get_height();
 
-  const auto miner_address = cryptonote::get_account_address_as_str(FAKECHAIN, false, get_address(m_miner_account));
+  const auto miner_address = cryptonote::get_account_address_as_str(FAKECHAIN, false, false, get_address(m_miner_account));
   daemon()->mine_blocks(1, miner_address);
 
   const uint64_t cur_height = daemon()->get_height();
@@ -1866,7 +1866,7 @@ bool wallet_api_tests::generate(std::vector<test_event_entry>& events)
   CHECK_AND_ASSERT_THROW_MES(w->status() == Monero::PendingTransaction::Status_Ok, "Status nok, " << w->errorString());
 
   auto addr = get_address(m_eve_account);
-  auto recepient_address = cryptonote::get_account_address_as_str(m_network_type, false, addr);
+  auto recepient_address = cryptonote::get_account_address_as_str(m_network_type, false, false, addr);
   Monero::PendingTransaction * transaction = w->createTransaction(recepient_address,
                                                                   "",
                                                                   MK_COINS(10),

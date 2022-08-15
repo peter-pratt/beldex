@@ -229,6 +229,7 @@ namespace config
   inline constexpr uint64_t CRYPTONOTE_PUBLIC_ADDRESS_BASE58_PREFIX = 0xd1;
   inline constexpr uint64_t CRYPTONOTE_PUBLIC_INTEGRATED_ADDRESS_BASE58_PREFIX = 19;
   inline constexpr uint64_t CRYPTONOTE_PUBLIC_SUBADDRESS_BASE58_PREFIX = 42;
+  inline constexpr uint64_t CRYPTONOTE_CONTRACT_ADDRESS_BASE58_PREFIX = 0x1c4c56;
   inline constexpr uint16_t P2P_DEFAULT_PORT = 19090;
   inline constexpr uint16_t RPC_DEFAULT_PORT = 19091;
   inline constexpr uint16_t ZMQ_RPC_DEFAULT_PORT = 19092;
@@ -266,6 +267,7 @@ namespace config
   inline constexpr std::string_view HASH_KEY_CLSAG_AGG_0 = "CLSAG_agg_0"sv;
   inline constexpr std::string_view HASH_KEY_CLSAG_AGG_1 = "CLSAG_agg_1"sv;
 
+
   namespace testnet
   {
     inline constexpr uint64_t HEIGHT_ESTIMATE_HEIGHT = 1000;
@@ -273,6 +275,7 @@ namespace config
     inline constexpr uint64_t CRYPTONOTE_PUBLIC_ADDRESS_BASE58_PREFIX = 53;
     inline constexpr uint64_t CRYPTONOTE_PUBLIC_INTEGRATED_ADDRESS_BASE58_PREFIX = 54;
     inline constexpr uint64_t CRYPTONOTE_PUBLIC_SUBADDRESS_BASE58_PREFIX = 63;
+    inline constexpr uint64_t CRYPTONOTE_CONTRACT_ADDRESS_BASE58_PREFIX = 0x1c4c56;
     inline constexpr uint16_t P2P_DEFAULT_PORT = 29090;
     inline constexpr uint16_t RPC_DEFAULT_PORT = 29091;
     inline constexpr uint16_t ZMQ_RPC_DEFAULT_PORT = 29092;
@@ -301,6 +304,7 @@ namespace config
     inline constexpr uint64_t CRYPTONOTE_PUBLIC_ADDRESS_BASE58_PREFIX = 24; // ~ dV1 .. dV3
     inline constexpr uint64_t CRYPTONOTE_PUBLIC_INTEGRATED_ADDRESS_BASE58_PREFIX = 25; // ~ dVA .. dVC
     inline constexpr uint64_t CRYPTONOTE_PUBLIC_SUBADDRESS_BASE58_PREFIX = 36; // ~dVa .. dVc
+    inline constexpr uint64_t CRYPTONOTE_CONTRACT_ADDRESS_BASE58_PREFIX = 0x1c4c56;
     inline constexpr uint16_t P2P_DEFAULT_PORT = 39090;
     inline constexpr uint16_t RPC_DEFAULT_PORT = 39091;
     inline constexpr uint16_t ZMQ_RPC_DEFAULT_PORT = 39092;
@@ -380,6 +384,7 @@ namespace cryptonote
     uint64_t CRYPTONOTE_PUBLIC_ADDRESS_BASE58_PREFIX;
     uint64_t CRYPTONOTE_PUBLIC_INTEGRATED_ADDRESS_BASE58_PREFIX;
     uint64_t CRYPTONOTE_PUBLIC_SUBADDRESS_BASE58_PREFIX;
+    uint64_t CRYPTONOTE_CONTRACT_ADDRESS_BASE58_PREFIX;
     uint16_t P2P_DEFAULT_PORT;
     uint16_t RPC_DEFAULT_PORT;
     uint16_t ZMQ_RPC_DEFAULT_PORT;
@@ -407,6 +412,7 @@ namespace cryptonote
     ::config::CRYPTONOTE_PUBLIC_ADDRESS_BASE58_PREFIX,
     ::config::CRYPTONOTE_PUBLIC_INTEGRATED_ADDRESS_BASE58_PREFIX,
     ::config::CRYPTONOTE_PUBLIC_SUBADDRESS_BASE58_PREFIX,
+    ::config::CRYPTONOTE_CONTRACT_ADDRESS_BASE58_PREFIX,
     ::config::P2P_DEFAULT_PORT,
     ::config::RPC_DEFAULT_PORT,
     ::config::ZMQ_RPC_DEFAULT_PORT,
@@ -429,6 +435,7 @@ namespace cryptonote
     ::config::testnet::CRYPTONOTE_PUBLIC_ADDRESS_BASE58_PREFIX,
     ::config::testnet::CRYPTONOTE_PUBLIC_INTEGRATED_ADDRESS_BASE58_PREFIX,
     ::config::testnet::CRYPTONOTE_PUBLIC_SUBADDRESS_BASE58_PREFIX,
+    ::config::testnet::CRYPTONOTE_CONTRACT_ADDRESS_BASE58_PREFIX,
     ::config::testnet::P2P_DEFAULT_PORT,
     ::config::testnet::RPC_DEFAULT_PORT,
     ::config::testnet::ZMQ_RPC_DEFAULT_PORT,
@@ -451,6 +458,7 @@ namespace cryptonote
     ::config::devnet::CRYPTONOTE_PUBLIC_ADDRESS_BASE58_PREFIX,
     ::config::devnet::CRYPTONOTE_PUBLIC_INTEGRATED_ADDRESS_BASE58_PREFIX,
     ::config::devnet::CRYPTONOTE_PUBLIC_SUBADDRESS_BASE58_PREFIX,
+    ::config::devnet::CRYPTONOTE_CONTRACT_ADDRESS_BASE58_PREFIX,
     ::config::devnet::P2P_DEFAULT_PORT,
     ::config::devnet::RPC_DEFAULT_PORT,
     ::config::devnet::ZMQ_RPC_DEFAULT_PORT,
@@ -473,6 +481,7 @@ namespace cryptonote
     ::config::CRYPTONOTE_PUBLIC_ADDRESS_BASE58_PREFIX,
     ::config::CRYPTONOTE_PUBLIC_INTEGRATED_ADDRESS_BASE58_PREFIX,
     ::config::CRYPTONOTE_PUBLIC_SUBADDRESS_BASE58_PREFIX,
+    ::config::CRYPTONOTE_CONTRACT_ADDRESS_BASE58_PREFIX,
     ::config::P2P_DEFAULT_PORT,
     ::config::RPC_DEFAULT_PORT,
     ::config::ZMQ_RPC_DEFAULT_PORT,

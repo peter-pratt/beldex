@@ -169,11 +169,12 @@ namespace cryptonote
     uint64_t amount;                    //money
     account_public_address addr;        //destination address
     bool is_subaddress;
+    bool is_contractaddress;
     bool is_integrated;
 
-    tx_destination_entry() : amount(0), addr{}, is_subaddress(false), is_integrated(false) { }
-    tx_destination_entry(uint64_t a, const account_public_address &ad, bool is_subaddress) : amount(a), addr(ad), is_subaddress(is_subaddress), is_integrated(false) { }
-    tx_destination_entry(const std::string &o, uint64_t a, const account_public_address &ad, bool is_subaddress) : original(o), amount(a), addr(ad), is_subaddress(is_subaddress), is_integrated(false) { }
+    tx_destination_entry() : amount(0), addr{}, is_subaddress(false), is_integrated(false), is_contractaddress(false) { }
+    tx_destination_entry(uint64_t a, const account_public_address &ad, bool is_subaddress) : amount(a), addr(ad), is_subaddress(is_subaddress), is_integrated(false), is_contractaddress(false) { }
+    tx_destination_entry(const std::string &o, uint64_t a, const account_public_address &ad, bool is_subaddress) : original(o), amount(a), addr(ad), is_subaddress(is_subaddress), is_integrated(false), is_contractaddress(false) { }
 
     bool operator==(const tx_destination_entry& other) const
     {
@@ -192,7 +193,7 @@ namespace cryptonote
         return get_account_integrated_address_as_str(nettype, addr, reinterpret_cast<const crypto::hash8 &>(payment_id));
       }
 
-      return get_account_address_as_str(nettype, is_subaddress, addr);
+      return get_account_address_as_str(nettype, is_subaddress,is_contractaddress, addr);
     }
 
     BEGIN_SERIALIZE_OBJECT()
@@ -201,6 +202,7 @@ namespace cryptonote
       FIELD(addr)
       FIELD(is_subaddress)
       FIELD(is_integrated)
+      FIELD(is_contractaddress)
     END_SERIALIZE()
   };
 
@@ -298,6 +300,7 @@ namespace boost
       }
       a & x.original;
       a & x.is_integrated;
+      a & x.is_contractaddress;
     }
   }
 }
