@@ -2179,7 +2179,9 @@ bool core::handle_uptime_proof_v12(const NOTIFY_UPTIME_PROOF_V12::request &proof
   //-----------------------------------------------------------------------------------------------
   bool core::add_new_block(const block& b, block_verification_context& bvc, checkpoint_t const *checkpoint)
   {
-    bool result = m_blockchain_storage.add_new_block(b, bvc, checkpoint);
+    const auto& my_mn_keys = get_master_keys();
+    bool evm_check_enabled = master_node() && is_master_node(my_mn_keys.pub, /*require_active=*/true);
+    bool result = m_blockchain_storage.add_new_block(b, bvc, checkpoint,evm_check_enabled);
     if (result)
       relay_master_node_votes(); // NOTE: nop if synchronising due to not accepting votes whilst syncing
     return result;

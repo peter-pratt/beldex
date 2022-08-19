@@ -298,7 +298,7 @@ private:
     static bool verify_password(const fs::path& keys_file_name, const epee::wipeable_string& password, bool no_spend_key, hw::device &hwdev, uint64_t kdf_rounds);
     static bool query_device(hw::device::device_type& device_type, const fs::path& keys_file_name, const epee::wipeable_string& password, uint64_t kdf_rounds = 1);
 
-    wallet2(cryptonote::network_type nettype = cryptonote::MAINNET, uint64_t kdf_rounds = 1, bool unattended = false, bool contract = false);
+    wallet2(cryptonote::network_type nettype = cryptonote::MAINNET, uint64_t kdf_rounds = 1, bool unattended = false);
     ~wallet2();
 
     struct tx_scan_info_t
@@ -1357,8 +1357,8 @@ private:
 
 
     std::vector<wallet2::pending_tx> contract_create_tx(const std::string contractname,const std::string contractsource,  const uint64_t& depositamount, std::string *reason, uint32_t priority = 0, uint32_t account_index = 0, std::set<uint32_t> subaddr_indices = {});
-    std::vector<wallet2::pending_tx> contract_call_method_tx(const std::string contractname,const std::string contract_method,  const std::string method_args, const uint64_t& depositamount, std::string *reason, uint32_t priority = 0, uint32_t account_index = 0, std::set<uint32_t> subaddr_indices = {});
-    std::vector<wallet2::pending_tx> contract_terminate_tx(const std::string contractname,  const std::string method_args, std::string *reason, uint32_t priority = 0, uint32_t account_index = 0, std::set<uint32_t> subaddr_indices = {});
+    std::vector<wallet2::pending_tx> contract_call_method_tx(const std::string contractname,const std::string contract_method,  const std::string method_args,const cryptonote::account_public_address &address, const uint64_t& depositamount, std::string *reason, uint32_t priority = 0, uint32_t account_index = 0, std::set<uint32_t> subaddr_indices = {});
+    std::vector<wallet2::pending_tx> contract_terminate_tx(const std::string contractname, const cryptonote::account_public_address &contractaddress, const cryptonote::account_public_address &receiptaddress,  const std::string method_args, std::string *reason, uint32_t priority = 0, uint32_t account_index = 0, std::set<uint32_t> subaddr_indices = {});
 
 
 
@@ -1581,6 +1581,7 @@ private:
     bool should_expand(const cryptonote::subaddress_index &index) const;
 
     cryptonote::account_base m_account;
+    std::vector<std::unique_ptr<cryptonote::account_base>> m_contract_accounts;
     fs::path m_wallet_file;
     fs::path m_keys_file;
     fs::path m_mms_file;
@@ -1711,7 +1712,7 @@ private:
     inline static std::mutex default_daemon_address_mutex;
     inline static std::string default_daemon_address;
 
-    bool m_contract;
+
   };
 
   // TODO(beldex): Hmm. We need this here because we make register_master_node do
@@ -1943,8 +1944,8 @@ namespace boost::serialization
       if (x.m_has_payment_id)
         a & x.m_payment_id;
 
-        if (ver < 19)
-            return;
+      if (ver < 19)
+          return;
       a & x.m_is_contractaddress;
 
     }

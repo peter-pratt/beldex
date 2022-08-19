@@ -462,7 +462,7 @@ bool Blockchain::init(BlockchainDB* db, sqlite3 *bns_db, const network_type nett
     block_verification_context bvc{};
     generate_genesis_block(bl, m_nettype);
     db_wtxn_guard wtxn_guard(m_db);
-    add_new_block(bl, bvc, nullptr /*checkpoint*/);
+    add_new_block(bl, bvc, nullptr /*checkpoint*/,false);
     CHECK_AND_ASSERT_MES(!bvc.m_verifivation_failed, false, "Failed to add genesis block to blockchain");
   }
   // TODO: if blockchain load successful, verify blockchain against both
@@ -777,7 +777,7 @@ bool Blockchain::reset_and_set_genesis_block(const block& b)
 
   db_wtxn_guard wtxn_guard(m_db);
   block_verification_context bvc{};
-  add_new_block(b, bvc, nullptr /*checkpoint*/);
+  add_new_block(b, bvc, nullptr /*checkpoint*/,false);
   if (!update_next_cumulative_weight_limit())
     return false;
   return bvc.m_added_to_main_chain && !bvc.m_verifivation_failed;
@@ -3228,8 +3228,10 @@ bool Blockchain::expand_transaction_2(transaction &tx, const crypto::hash &tx_pr
 //        check_tx_input() rather than here, and use this function simply
 //        to iterate the inputs as necessary (splitting the task
 //        using threads, etc.)
-bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, uint64_t* pmax_used_block_height, std::unordered_set<crypto::key_image>* key_image_conflicts)
+bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, uint64_t* pmax_used_block_height, std::unordered_set<crypto::key_image>* key_image_conflicts, bool evm_check_enabled)
 {
+    //const auto& my_mn_keys = m_core.get_master_keys();
+    //bool evm_check_enabled = m_core.master_node() && m_core.is_master_node(my_mn_keys.pub, /*require_active=*/true);
   PERF_TIMER(check_tx_inputs);
   LOG_PRINT_L3("Blockchain::" << __func__);
   uint64_t max_used_block_height = 0;
@@ -3256,7 +3258,7 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
 
   if (tx.is_transfer())
   {
-    if (tx.type != txtype::beldex_name_system && tx.type != txtype::contract  && hf_version >= HF_VERSION_MIN_2_OUTPUTS && tx.vout.size() < 2)
+    if (tx.type != txtype::beldex_name_system && hf_version >= HF_VERSION_MIN_2_OUTPUTS && tx.vout.size() < 2)
     {
       MERROR_VER("Tx " << get_transaction_hash(tx) << " has fewer than two outputs, which is not allowed as of hardfork " << +HF_VERSION_MIN_2_OUTPUTS);
       tvc.m_too_few_outputs = true;
@@ -3268,6 +3270,7 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
     std::vector<std::vector<rct::ctkey>> pubkeys(tx.vin.size());
     size_t sig_index = 0;
     const crypto::key_image *last_key_image = NULL;
+
     for (size_t sig_index = 0; sig_index < tx.vin.size(); sig_index++)
     {
       const auto& txin = tx.vin[sig_index];
@@ -3325,7 +3328,27 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
             MERROR_VER("  *pmax_used_block_height: " << *pmax_used_block_height);
           }
 
+
           return false;
+        }
+        if(!pmax_used_block_height){
+            //called from Blockchain::handle_block_to_main_chain()
+            LOG_PRINT_L0("check_tx_inputs in handle_block_to_main_chain");
+            for (size_t key_offset_index = 0; key_offset_index < in_to_key.key_offsets.size() ; key_offset_index++)
+            {
+                const auto& txout_index = in_to_key.key_offsets[key_offset_index];
+                tx_out_index out_tx_info = m_db->get_output_tx_and_index_from_global(txout_index);
+                cryptonote::transaction out_tx = m_db->get_tx(out_tx_info.first);
+                if(tx.type==txtype::contract){
+                    LOG_PRINT_L0("This VIN offset is from a Contract TX:" << out_tx.hash << " Ask EVM for confirmation for this TX:" << tx.hash );
+                    if(evm_check_enabled){
+                        LOG_PRINT_L0("THis is a MN so this node needs to check");
+                    }else{
+                        LOG_PRINT_L0("THis is not a MN so this node cant check EVM for hash, and this can be removed in production");
+                    }
+
+                }
+            }
         }
       }
 
@@ -3648,6 +3671,7 @@ if (tx.version >= cryptonote::txversion::v2_ringct)
 
   return true;
 }
+
 
 //------------------------------------------------------------------
 void Blockchain::check_ring_signature(const crypto::hash &tx_prefix_hash, const crypto::key_image &key_image, const std::vector<rct::ctkey> &pubkeys, const std::vector<crypto::signature>& sig, uint64_t &result) const
@@ -4187,7 +4211,7 @@ bool Blockchain::basic_block_checks(cryptonote::block const &blk, bool alt_block
 //      Needs to validate the block and acquire each transaction from the
 //      transaction mem_pool, then pass the block and transactions to
 //      m_db->add_block()
-bool Blockchain::handle_block_to_main_chain(const block& bl, const crypto::hash& id, block_verification_context& bvc, checkpoint_t const *checkpoint, bool notify)
+bool Blockchain::handle_block_to_main_chain(const block& bl, const crypto::hash& id, block_verification_context& bvc, checkpoint_t const *checkpoint, bool notify, bool evm_check_enabled)
 {
   LOG_PRINT_L3("Blockchain::" << __func__);
 
@@ -4321,7 +4345,7 @@ bool Blockchain::handle_block_to_main_chain(const block& bl, const crypto::hash&
     {
       // validate that transaction inputs and the keys spending them are correct.
       tx_verification_context tvc{};
-      if(!check_tx_inputs(tx, tvc))
+      if(!check_tx_inputs(tx, tvc,nullptr,nullptr, evm_check_enabled))
       {
         MGINFO_RED("Block with id: " << id  << " has at least one transaction (id: " << tx_id << ") with wrong inputs.");
 
@@ -4634,7 +4658,7 @@ bool Blockchain::update_next_cumulative_weight_limit(uint64_t *long_term_effecti
   return true;
 }
 //------------------------------------------------------------------
-bool Blockchain::add_new_block(const block& bl, block_verification_context& bvc, checkpoint_t const *checkpoint)
+bool Blockchain::add_new_block(const block& bl, block_verification_context& bvc, checkpoint_t const *checkpoint, bool evm_check_enabled)
 {
 
   LOG_PRINT_L3("Blockchain::" << __func__);
@@ -4699,7 +4723,7 @@ bool Blockchain::add_new_block(const block& bl, block_verification_context& bvc,
   rtxn_guard.stop();
   if(bl.prev_id == get_tail_id()) //check that block refers to chain tail
   {
-    result = handle_block_to_main_chain(bl, id, bvc, checkpoint);
+    result = handle_block_to_main_chain(bl, id, bvc, checkpoint,evm_check_enabled);
   }
   else
   {

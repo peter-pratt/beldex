@@ -179,9 +179,9 @@ namespace
   const char* USAGE_GET_TX_KEY("get_tx_key <txid>");
   const char* USAGE_SET_TX_KEY("set_tx_key <txid> <tx_key>");
   const char* USAGE_CHECK_TX_KEY("check_tx_key <txid> <txkey> <address>");
-  const char* USAGE_CONTRACT_CREATE("contract_create <contractname> <contract sourcecode> <deposit amount>");
-  const char* USAGE_CONTRACT_METHOD("contract_method <contractname> <contract method> <method_arguments> <deposit amount (can be 0)>");
-  const char* USAGE_CONTRACT_TERMINATE("contract_terminate <contractname> <terminate_arguments>");
+  const char* USAGE_CONTRACT_CREATE("contract_create <contractname> <contractaddress> <contract sourcecode> <deposit amount>");
+  const char* USAGE_CONTRACT_METHOD("contract_method <contractname> <contractaddress> <contract method> <method_arguments> <deposit amount (can be 0)>");
+  const char* USAGE_CONTRACT_TERMINATE("contract_terminate <contractname> <contractaddress> <receiptaddress> <terminate_arguments>");
   const char* USAGE_GET_TX_PROOF("get_tx_proof <txid> <address> [<message>]");
   const char* USAGE_CHECK_TX_PROOF("check_tx_proof <txid> <address> <signature_file> [<message>]");
   const char* USAGE_GET_SPEND_PROOF("get_spend_proof <txid> [<message>]");
@@ -4377,6 +4377,7 @@ std::optional<epee::wipeable_string> simple_wallet::new_wallet(const boost::prog
   {
     if (spendkey)
     {
+
       m_wallet->generate(m_wallet_file, std::move(rc.second).password(), address, *spendkey, viewkey, create_address_file);
     }
     else
@@ -8287,10 +8288,14 @@ bool simple_wallet::contract_create(std::vector<std::string> args)
 
     std::string const &contractname  = args[0];
     std::string const &contractsource = args[1];
+    std::string const &depositamount_str = args[2];
+
+    cryptonote::address_parse_info info;
+
+
     uint64_t deposit_amount;
-    if(!tools::parse_int(args[2], deposit_amount))
-    {
-        fail_msg_writer() << tr("failed to parse deposit amount: ") + std::string{args[2]};
+    if (!cryptonote::parse_amount( deposit_amount, depositamount_str)) {
+        fail_msg_writer() << tr("failed to parse deposit_amount");
         return false;
     }
 
@@ -8313,7 +8318,7 @@ bool simple_wallet::contract_create(std::vector<std::string> args)
         if (ptx_vector.empty())
         {
             tools::fail_msg_writer() << reason;
-            return true;
+            return false;
         }
 
         std::vector<cryptonote::address_parse_info> dsts;
@@ -8359,21 +8364,33 @@ bool simple_wallet::contract_method(std::vector<std::string> args)
     if (!parse_subaddr_indices_and_priority(*m_wallet, args, subaddr_indices, priority, m_current_subaddress_account)) return false;
 
 
-    if (args.size() != 4)
+    if (args.size() != 5)
     {
         PRINT_USAGE(USAGE_CONTRACT_METHOD);
         return true;
     }
 
     std::string const &contractname  = args[0];
-    std::string const &contractmethod = args[1];
-    std::string const &contractmethod_args = args[2];
-    uint64_t deposit_amount;
-    if(!tools::parse_int(args[3], deposit_amount))
+    std::string const &contractaddress= args[1];
+
+    cryptonote::address_parse_info info;
+    if (!cryptonote::get_account_address_from_str_or_url(info, m_wallet->nettype(), contractaddress, oa_prompter))
     {
-        fail_msg_writer() << tr("failed to parse deposit amount: ") + std::string{args[3]};
+        fail_msg_writer() << tr("failed to parse address");
+        PRINT_USAGE(USAGE_CONTRACT_METHOD);
+        return true;
+    }
+
+    std::string const &contractmethod = args[2];
+    std::string const &contractmethod_args = args[3];
+    std::string const &depositamount_str = args[4];
+    uint64_t deposit_amount;
+    if (!cryptonote::parse_amount( deposit_amount, depositamount_str)) {
+        fail_msg_writer() << tr("failed to parse deposit_amount");
         return false;
     }
+
+
 
 
 
@@ -8386,6 +8403,7 @@ bool simple_wallet::contract_method(std::vector<std::string> args)
         ptx_vector = m_wallet->contract_call_method_tx(contractname,
                                                   contractmethod,
                                                   contractmethod_args,
+                                                  info.address,
                                                   deposit_amount,
                                                   &reason,
                                                   priority,
@@ -8441,14 +8459,32 @@ bool simple_wallet::contract_terminate(std::vector<std::string> args)
     if (!parse_subaddr_indices_and_priority(*m_wallet, args, subaddr_indices, priority, m_current_subaddress_account)) return false;
 
 
-    if (args.size() != 2)
+    if (args.size() != 3)
     {
         PRINT_USAGE(USAGE_CONTRACT_TERMINATE);
         return true;
     }
 
     std::string const &contractname  = args[0];
-    std::string const &contractmethod_args = args[1];
+    std::string const &contractaddress= args[1];
+    std::string const &receiptaddress= args[2];
+
+    cryptonote::address_parse_info info_contract;
+    if (!cryptonote::get_account_address_from_str_or_url(info_contract, m_wallet->nettype(), contractaddress, oa_prompter))
+    {
+        fail_msg_writer() << tr("failed to parse contract address");
+        PRINT_USAGE(USAGE_CONTRACT_TERMINATE);
+        return false;
+    }
+
+    cryptonote::address_parse_info info_receiptaddress;
+    if (!cryptonote::get_account_address_from_str_or_url(info_receiptaddress, m_wallet->nettype(), receiptaddress, oa_prompter))
+    {
+        fail_msg_writer() << tr("failed to parse receipt address");
+        PRINT_USAGE(USAGE_CONTRACT_TERMINATE);
+        return false;
+    }
+    std::string const &contractmethod_args = args[3];
 
 
 
@@ -8460,6 +8496,8 @@ bool simple_wallet::contract_terminate(std::vector<std::string> args)
     try
     {
         ptx_vector = m_wallet->contract_terminate_tx(contractname,
+                                                     info_contract.address,
+                                                     info_receiptaddress.address,
                                                        contractmethod_args,
                                                        &reason,
                                                        priority,

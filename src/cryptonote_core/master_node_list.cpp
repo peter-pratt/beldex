@@ -1789,7 +1789,7 @@ namespace master_nodes
     master_nodes::quorum result = {};
     if (active_mnode_list.size() < POS_min_master_nodes(nettype))
     {
-      LOG_PRINT_L2("Insufficient active Master Nodes for POS: " << active_mnode_list.size());
+      LOG_PRINT_L2("Insufficient active Master Nodes for POS: " << active_mnode_list.size() << ". We need: " << POS_min_master_nodes(nettype));
       return result;
     }
 

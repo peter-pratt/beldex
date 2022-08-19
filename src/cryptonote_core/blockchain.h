@@ -341,7 +341,7 @@ namespace cryptonote
      *
      * @return true on successful addition to the blockchain, else false
      */
-    bool add_new_block(const block& bl, block_verification_context& bvc, checkpoint_t const *checkpoint);
+    bool add_new_block(const block& bl, block_verification_context& bvc, checkpoint_t const *checkpoint, bool evm_check_enabled);
 
     /**
      * @brief clears the blockchain and starts a new one
@@ -1216,7 +1216,7 @@ namespace cryptonote
      *
      * @return false if any validation step fails, otherwise true
      */
-    bool check_tx_inputs(transaction& tx, tx_verification_context &tvc, uint64_t* pmax_used_block_height = nullptr, std::unordered_set<crypto::key_image>* key_image_conflicts = nullptr);
+    bool check_tx_inputs(transaction& tx, tx_verification_context &tvc, uint64_t* pmax_used_block_height = nullptr, std::unordered_set<crypto::key_image>* key_image_conflicts = nullptr,bool evm_check_enabled=false);
 
     /**
      * @brief performs a blockchain reorganization according to the longest chain rule
@@ -1253,7 +1253,7 @@ namespace cryptonote
      *
      * @return true if the block was added successfully, otherwise false
      */
-    bool handle_block_to_main_chain(const block& bl, const crypto::hash& id, block_verification_context& bvc, checkpoint_t const *checkpoint, bool notify = true);
+    bool handle_block_to_main_chain(const block& bl, const crypto::hash& id, block_verification_context& bvc, checkpoint_t const *checkpoint, bool notify = true,bool evm_check_enabled=false);
 
     /**
      * @brief validate and add a new block to an alternate blockchain

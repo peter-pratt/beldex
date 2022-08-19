@@ -236,7 +236,7 @@ namespace {
       found_money += transfers[idx].amount();
     if (found_money != needed_money)
       ++outputs; // change
-    if (outputs < (tx_params.tx_type == cryptonote::txtype::beldex_name_system ? 1 : tx_params.tx_type == cryptonote::txtype::contract ?1: 2))
+    if (outputs < (tx_params.tx_type == cryptonote::txtype::beldex_name_system ? 1 : 2))
       ++outputs; // extra 0 dummy output
     return outputs;
   }
@@ -327,7 +327,7 @@ std::unique_ptr<tools::wallet2> make_basic(const boost::program_options::variabl
   const bool devnet = command_line::get_arg(vm, opts.devnet);
   const bool fakenet = command_line::get_arg(vm, opts.regtest);
   network_type nettype = testnet ? TESTNET : devnet ? DEVNET : fakenet ? FAKECHAIN : MAINNET;
-
+  MINFO("make_basic");
   THROW_WALLET_EXCEPTION_IF(testnet + devnet + fakenet > 1, tools::error::wallet_internal_error, "At most one of --testnet, --devnet, or --regtest may be specified");
 
   const bool contract = command_line::get_arg(vm, opts.contract);
@@ -364,6 +364,7 @@ std::unique_ptr<tools::wallet2> make_basic(const boost::program_options::variabl
       return nullptr;
   }
 
+    MINFO("make_basic 2");
   // if no daemon settings are given and we have a previous one, reuse that one
   if (command_line::is_arg_defaulted(vm, opts.daemon_host) && command_line::is_arg_defaulted(vm, opts.daemon_port) && command_line::is_arg_defaulted(vm, opts.daemon_address))
     daemon_address = tools::wallet2::get_default_daemon_address();
@@ -381,7 +382,7 @@ std::unique_ptr<tools::wallet2> make_basic(const boost::program_options::variabl
     if (!std::regex_search(daemon_address, protocol_re))
       daemon_address.insert(0, "https://"sv);
   }
-
+    MINFO("make_basic 3");
   std::string proxy;
   if (use_proxy)
   {
@@ -408,8 +409,11 @@ std::unique_ptr<tools::wallet2> make_basic(const boost::program_options::variabl
   else if (trusted_daemon)
     MINFO(tools::wallet2::tr("Daemon is local, assuming trusted"));
 
-  auto wallet = std::make_unique<tools::wallet2>(nettype, kdf_rounds, unattended, contract);
+    MINFO("make_basic 4");
+  auto wallet = std::make_unique<tools::wallet2>(nettype, kdf_rounds, unattended);
+    MINFO("make_basic 5");
   wallet->init(std::move(daemon_address), std::move(login), std::move(proxy), 0, trusted_daemon);
+    MINFO("make_basic 6");
   auto ringdb_path = fs::u8path(command_line::get_arg(vm, opts.shared_ringdb_dir));
   wallet->set_ring_database(ringdb_path);
   wallet->get_message_store().set_options(vm);
@@ -441,7 +445,7 @@ std::unique_ptr<tools::wallet2> make_basic(const boost::program_options::variabl
   {
     MERROR("Failed to parse tx notify spec");
   }
-
+    MINFO("make_basic done");
   return wallet;
 }
 
@@ -1023,7 +1027,7 @@ void wallet_device_callback::on_progress(const hw::device_progress& event)
     wallet->on_device_progress(event);
 }
 
-wallet2::wallet2(network_type nettype, uint64_t kdf_rounds, bool unattended, bool contract):
+wallet2::wallet2(network_type nettype, uint64_t kdf_rounds, bool unattended):
   m_multisig_rescan_info(NULL),
   m_multisig_rescan_k(NULL),
   m_upper_transaction_weight_limit(0),
@@ -1085,8 +1089,7 @@ wallet2::wallet2(network_type nettype, uint64_t kdf_rounds, bool unattended, boo
   m_device_last_key_image_sync(0),
   m_offline(false),
   m_rpc_version(0),
-  m_export_format(ExportFormat::Binary),
-  m_contract(contract)
+  m_export_format(ExportFormat::Binary)
 {
 }
 
@@ -1155,6 +1158,7 @@ void wallet2::init_options(boost::program_options::options_description& desc_par
   command_line::add_arg(desc_params, opts.password_file);
   command_line::add_arg(desc_params, opts.testnet);
   command_line::add_arg(desc_params, opts.devnet);
+  command_line::add_arg(desc_params, opts.contract);
   command_line::add_arg(desc_params, opts.regtest);
   command_line::add_arg(desc_params, opts.shared_ringdb_dir);
   command_line::add_arg(desc_params, opts.kdf_rounds);
@@ -4712,6 +4716,7 @@ void wallet2::init_type(hw::device::device_type device_type)
 void wallet2::generate(const fs::path& wallet_, const epee::wipeable_string& password,
   const epee::wipeable_string& multisig_data, bool create_address_file)
 {
+  MINFO("generate 1");
   clear();
   prepare_file_names(wallet_);
 
@@ -4721,7 +4726,7 @@ void wallet2::generate(const fs::path& wallet_, const epee::wipeable_string& pas
     THROW_WALLET_EXCEPTION_IF(fs::exists(m_wallet_file, ignored_ec), error::file_exists, m_wallet_file);
     THROW_WALLET_EXCEPTION_IF(fs::exists(m_keys_file,   ignored_ec), error::file_exists, m_keys_file);
   }
-
+  MINFO("generate account");
   m_account.generate(rct::rct2sk(rct::zero()), true, false);
 
   THROW_WALLET_EXCEPTION_IF(multisig_data.size() < 32, error::invalid_multisig_seed);
@@ -4785,6 +4790,7 @@ void wallet2::generate(const fs::path& wallet_, const epee::wipeable_string& pas
 
   if (!wallet_.empty())
     store();
+    MINFO("generate end.");
 }
 
 /*!
@@ -7851,7 +7857,7 @@ beldex_construct_tx_params wallet2::construct_params(uint8_t hf_version, txtype 
   tx_params.hf_version = hf_version;
   tx_params.tx_type    = tx_type;
 
-  if (tx_type == txtype::beldex_name_system || tx_type == txtype::contract)
+  if (tx_type == txtype::beldex_name_system)
   {
     assert(priority != tools::tx_priority_flash);
     tx_params.burn_fixed = bns::burn_needed(hf_version, type);
@@ -8330,9 +8336,25 @@ std::vector<wallet2::pending_tx> wallet2::contract_create_tx(const std::string c
                                                             uint32_t account_index,
                                                             std::set<uint32_t> subaddr_indices)
 {
+
+    if (m_contract_accounts.size()==0) {
+        m_contract_accounts.push_back(std::make_unique<cryptonote::account_base>());
+        m_contract_accounts[0]->generate();
+    }
+
+    const cryptonote::account_keys& accountKeys = m_contract_accounts[0]->get_keys();
+    std::string contractAddressStr = m_contract_accounts[0]->get_contract_address_str(nettype());
+
+    LOG_PRINT_L0("contract_create_tx for new contract:" << contractAddressStr);
     std::vector<uint8_t> extra;
+
+
     auto entry = cryptonote::tx_extra_contract::create_contract(
             contractname,
+            accountKeys.m_account_address,
+            m_account.get_keys().m_account_address.m_view_public_key,
+            accountKeys.m_spend_secret_key,
+            accountKeys.m_view_secret_key,
             contractsource,
             depositamount);
     add_contract_to_tx_extra(extra, entry);
@@ -8344,8 +8366,15 @@ std::vector<wallet2::pending_tx> wallet2::contract_create_tx(const std::string c
         return {};
     }
 
-    beldex_construct_tx_params tx_params = wallet2::construct_params(*hf_version, txtype::contract, priority, depositamount*COIN);
-    auto result = create_transactions_2({} /*dests*/,
+    std::vector<cryptonote::tx_destination_entry> dsts;
+    cryptonote::tx_destination_entry de;
+    de.addr = accountKeys.m_account_address;
+    de.is_subaddress = false;
+    de.amount = depositamount;
+    dsts.push_back(de);
+
+    beldex_construct_tx_params tx_params = wallet2::construct_params(*hf_version, txtype::contract, priority);
+    auto result = create_transactions_2(dsts, /*dests*/
                                         CRYPTONOTE_DEFAULT_TX_MIXIN,
                                         0 /*unlock_at_block*/,
                                         priority,
@@ -8356,14 +8385,15 @@ std::vector<wallet2::pending_tx> wallet2::contract_create_tx(const std::string c
     return result;
   }
 
-std::vector<wallet2::pending_tx> wallet2::contract_call_method_tx(const std::string contractname,const std::string contract_method,  const std::string method_args,  const uint64_t& depositamount, std::string *reason,
+std::vector<wallet2::pending_tx> wallet2::contract_call_method_tx(const std::string contractname,const std::string contract_method,  const std::string method_args, const cryptonote::account_public_address &address, const uint64_t& depositamount, std::string *reason,
                                                              uint32_t priority,
                                                              uint32_t account_index,
                                                              std::set<uint32_t> subaddr_indices)
 {
     std::vector<uint8_t> extra;
-    auto entry = cryptonote::tx_extra_contract::call_method(
+    auto entry = cryptonote::tx_extra_contract::call_public_method(
             contractname,
+            address,
             contract_method,
             method_args,
             depositamount);
@@ -8376,8 +8406,15 @@ std::vector<wallet2::pending_tx> wallet2::contract_call_method_tx(const std::str
         return {};
     }
 
-    beldex_construct_tx_params tx_params = wallet2::construct_params(*hf_version, txtype::contract, priority, depositamount*COIN);
-    auto result = create_transactions_2({} /*dests*/,
+    beldex_construct_tx_params tx_params = wallet2::construct_params(*hf_version, txtype::contract, priority);
+    std::vector<cryptonote::tx_destination_entry> dsts;
+    cryptonote::tx_destination_entry de;
+    de.addr = address;
+    de.is_subaddress = false;
+    de.amount = depositamount;
+    dsts.push_back(de);
+
+    auto result = create_transactions_2(dsts, /*dests*/
                                         CRYPTONOTE_DEFAULT_TX_MIXIN,
                                         0 /*unlock_at_block*/,
                                         priority,
@@ -8388,17 +8425,32 @@ std::vector<wallet2::pending_tx> wallet2::contract_call_method_tx(const std::str
     return result;
 }
 
-std::vector<wallet2::pending_tx> wallet2::contract_terminate_tx(const std::string contractname,  const std::string method_args, std::string *reason,
+std::vector<wallet2::pending_tx> wallet2::contract_terminate_tx(const std::string contractname, const cryptonote::account_public_address &contractaddress, const cryptonote::account_public_address &receiptaddress, const std::string method_args, std::string *reason,
                                                                   uint32_t priority,
                                                                   uint32_t account_index,
                                                                   std::set<uint32_t> subaddr_indices)
 {
+    crypto::signature sig;
     std::vector<uint8_t> extra;
+
     auto entry = cryptonote::tx_extra_contract::terminate(
             contractname,
-            method_args);
+            contractaddress,
+            receiptaddress,
+            method_args,
+            sig //todo remove here and add the signature seperate
+            );
     add_contract_to_tx_extra(extra, entry);
 
+    /*
+     * TODO add signature for extra fields in a seperate field
+    crypto::signature sig;
+    crypto::hash h;
+    something like: get_registration_hash()
+    crypto::cn_fast_hash(data, 2 * sizeof(uint64_t), h);
+    crypto::generate_signature(hash, m_account.get_keys().m_account_address.m_view_public_key, m_account.get_keys().m_account_address.m_view_secret_key, sig);
+    add_signature_to_tx(extra,sig)
+*/
     std::optional<uint8_t> hf_version = get_hard_fork_version();
     if (!hf_version)
     {
@@ -8407,7 +8459,14 @@ std::vector<wallet2::pending_tx> wallet2::contract_terminate_tx(const std::strin
     }
 
     beldex_construct_tx_params tx_params = wallet2::construct_params(*hf_version, txtype::contract, priority);
-    auto result = create_transactions_2({} /*dests*/,
+    std::vector<cryptonote::tx_destination_entry> dsts;
+    cryptonote::tx_destination_entry de;
+    de.addr = contractaddress;
+    de.is_subaddress = false;
+    de.amount = 0;
+    dsts.push_back(de);
+
+    auto result = create_transactions_2(dsts,/*dests*/
                                         CRYPTONOTE_DEFAULT_TX_MIXIN,
                                         0 /*unlock_at_block*/,
                                         priority,
@@ -10159,7 +10218,7 @@ void wallet2::transfer_selected_rct(std::vector<cryptonote::tx_destination_entry
   bool update_splitted_dsts                                   = true;
   if (change_dts.amount == 0)
   {
-    if (splitted_dsts.size() == 1 || tx.type == txtype::beldex_name_system|| tx.type == txtype::contract)
+    if (splitted_dsts.size() == 1 || tx.type == txtype::beldex_name_system)
     {
       // If the change is 0, send it to a random address, to avoid confusing
       // the sender with a 0 amount output. We send a 0 amount in order to avoid
@@ -10188,7 +10247,7 @@ void wallet2::transfer_selected_rct(std::vector<cryptonote::tx_destination_entry
     // NOTE: If ONS, there's already a dummy destination entry in there that
     // we placed in (for fake calculating the TX fees and parts) that we
     // repurpose for change after the fact.
-    if (tx_params.tx_type == txtype::beldex_name_system || tx_params.tx_type == txtype::contract)
+    if (tx_params.tx_type == txtype::beldex_name_system )
     {
       assert(splitted_dsts.size() == 1);
       splitted_dsts.back() = change_dts;
@@ -10956,7 +11015,7 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
   bool const is_bns_tx = (tx_params.tx_type == txtype::beldex_name_system);
     LOG_PRINT_L0("is_bns_tx:" << is_bns_tx);
   auto original_dsts = dsts;
-  if (is_bns_tx || is_contract_tx)
+  if (is_bns_tx)
   {
     THROW_WALLET_EXCEPTION_IF(dsts.size() != 0, error::wallet_internal_error, "beldex name system txs must not have any destinations set, has: " + std::to_string(dsts.size()));
     dsts.emplace_back(0, account_public_address{} /*address*/, false /*is_subaddress*/); // NOTE: Create a dummy dest that gets repurposed into the change output.
@@ -11058,7 +11117,7 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
   needed_money = 0;
   for(auto& dt: dsts)
   {
-    THROW_WALLET_EXCEPTION_IF(0 == dt.amount && (!is_bns_tx && !is_contract_tx ) , error::zero_destination);
+    THROW_WALLET_EXCEPTION_IF(0 == dt.amount && (!is_bns_tx ) , error::zero_destination);
     needed_money += dt.amount;
     LOG_PRINT_L0("transfer: adding " << print_money(dt.amount) << ", for a total of " << print_money (needed_money));
     THROW_WALLET_EXCEPTION_IF(needed_money < dt.amount, error::tx_sum_overflow, dsts, 0, m_nettype);
@@ -11066,7 +11125,7 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
 
 
   // throw if attempting a transaction with no money
-  THROW_WALLET_EXCEPTION_IF(needed_money == 0 && (!is_bns_tx && !is_contract_tx ) , error::zero_destination);
+  THROW_WALLET_EXCEPTION_IF(needed_money == 0 && (!is_bns_tx  ) , error::zero_destination);
 
   std::map<uint32_t, std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> unlocked_balance_per_subaddr = unlocked_balance_per_subaddress(subaddr_account, false,tx_params.hf_version);
   std::map<uint32_t, uint64_t> balance_per_subaddr = balance_per_subaddress(subaddr_account, false);
@@ -11080,7 +11139,7 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
   // early out if we know we can't make it anyway
   // we could also check for being within FEE_PER_KB, but if the fee calculation
   // ever changes, this might be missed, so let this go through
-  const uint64_t min_outputs = tx_params.tx_type == cryptonote::txtype::beldex_name_system ? 1 : tx_params.tx_type == cryptonote::txtype::contract ? 1: 2; // if ons, only request the change output
+  const uint64_t min_outputs = tx_params.tx_type == cryptonote::txtype::beldex_name_system ? 1 : 2; // if ons, only request the change output
   {
     uint64_t min_fee = (
         base_fee.first * estimate_rct_tx_size(1, fake_outs_count, min_outputs, extra.size(), clsag) +
@@ -11257,7 +11316,7 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
       idx = pop_back(preferred_inputs);
       pop_if_present(*unused_transfers_indices, idx);
       pop_if_present(*unused_dust_indices, idx);
-    } else if ((dsts.empty() || (dsts[0].amount == 0 && (!is_bns_tx && !is_contract_tx ) )) && !adding_fee) {
+    } else if ((dsts.empty() || (dsts[0].amount == 0 && (!is_bns_tx ) )) && !adding_fee) {
       // NOTE: A BNS tx sets dsts[0].amount to 0, but this branch is for the
       // 2 inputs/2 outputs. We only have 1 output as BNS transactions are
       // distinguishable, so we actually want the last branch which uses unused

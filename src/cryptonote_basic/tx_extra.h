@@ -317,31 +317,61 @@ namespace cryptonote
     {
         contract::contract_type type;
         std::string m_contract_name;
+        cryptonote::account_public_address m_contract_address;
+        crypto::public_key m_owner_pubkey;
+        crypto::secret_key m_spendkey;
+        crypto::secret_key m_viewkey;
         std::string m_contract_source;
         std::string m_contract_method;
         std::string m_method_args;
         uint64_t m_deposit_amount;
+        crypto::signature m_signature;
+
+        cryptonote::account_public_address m_receipt_address;
 
         static tx_extra_contract create_contract(
                 const std::string& contract_name,
+                const cryptonote::account_public_address &contractaddress,
+                const crypto::public_key &owner,
+                const crypto::secret_key &spendkey,
+                const crypto::secret_key &viewkey,
                 const std::string& contract_source,
                 const uint64_t& deposit_amount);
 
-        static tx_extra_contract call_method(
+        static tx_extra_contract call_public_method(
                 const std::string& contract_name,
+                const cryptonote::account_public_address &contractaddress,
                 const std::string& contract_method,
                 const std::string& method_args,
                 const uint64_t& deposit_amount);
 
+        static tx_extra_contract call_signed_method(
+                const std::string& contract_name,
+                const cryptonote::account_public_address &contractaddress,
+                const std::string& contract_method,
+                const std::string& method_args,
+                const uint64_t& deposit_amount,
+                const crypto::signature &signature);
+
         static tx_extra_contract terminate(
                 const std::string& contract_name,
-                const std::string& method_args);
+                const cryptonote::account_public_address &contractaddress,
+                const cryptonote::account_public_address &receiptaddress,
+                const std::string& method_args,
+                const crypto::signature &signature
+                );
 
         BEGIN_SERIALIZE()
         ENUM_FIELD(type, type < contract::contract_type::_count)
         FIELD(m_contract_name)
+        FIELD(m_contract_address)
+
         if (type == contract::contract_type::create)
         {
+            FIELD(m_owner_pubkey)
+            FIELD(m_spendkey)
+            FIELD(m_viewkey)
+
             FIELD(m_contract_source)
             FIELD(m_deposit_amount)
         }
@@ -351,8 +381,13 @@ namespace cryptonote
         }
         if (type == contract::contract_type::method || type == contract::contract_type::terminate)
         {
+            if(type == contract::contract_type::terminate){
+                FIELD(m_receipt_address)
+            }
             FIELD(m_method_args)
+            FIELD(m_signature)
         }
+
 
         END_SERIALIZE()
     };
