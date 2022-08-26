@@ -179,7 +179,7 @@ namespace
   const char* USAGE_GET_TX_KEY("get_tx_key <txid>");
   const char* USAGE_SET_TX_KEY("set_tx_key <txid> <tx_key>");
   const char* USAGE_CHECK_TX_KEY("check_tx_key <txid> <txkey> <address>");
-  const char* USAGE_CONTRACT_CREATE("contract_create <contractname> <contractaddress> <contract sourcecode> <deposit amount>");
+  const char* USAGE_CONTRACT_CREATE("contract_create <contractname> <contract sourcecode> <deposit amount>");
   const char* USAGE_CONTRACT_METHOD("contract_method <contractname> <contractaddress> <contract method> <method_arguments> <deposit amount (can be 0)>");
   const char* USAGE_CONTRACT_TERMINATE("contract_terminate <contractname> <contractaddress> <receiptaddress> <terminate_arguments>");
   const char* USAGE_GET_TX_PROOF("get_tx_proof <txid> <address> [<message>]");

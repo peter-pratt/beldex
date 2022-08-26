@@ -739,9 +739,26 @@ namespace cryptonote { namespace rpc {
       void operator()(const tx_extra_master_node_winner& x) { entry.mn_winner = tools::type_to_hex(x.m_master_node_key); }
       void operator()(const tx_extra_master_node_pubkey& x) { entry.mn_pubkey = tools::type_to_hex(x.m_master_node_key); }
       void operator()(const tx_extra_security_signature& x) {  entry.security_sig = tools::type_to_hex(x.m_security_signature); }
-      void operator()(const tx_extra_contract& x) {  entry.contract_name = x.m_contract_name;
-          entry.contract_source = x.m_contract_source;
-          entry.contract_deposit_amount = x.m_deposit_amount;
+      void operator()(const tx_extra_contract& x) {
+          LOG_PRINT_L0("BEGIN tx_extra_contract in extra_extractor:" );
+          entry.contract_type = x.m_type;
+          entry.contract_version = x.m_version;
+          if (entry.contract_type==contract::contract_type::create) {
+              entry.contract_name = x.m_contract_name;
+              entry.contract_source = x.m_contract_source;
+              entry.contract_deposit_amount = x.m_deposit_amount;
+              entry.contract_address = x.m_contract_address;
+          }
+          else if (entry.contract_type==contract::contract_type::public_method) {
+              entry.contract_method = x.m_contract_method;
+          }
+          else if (entry.contract_type==contract::contract_type::signed_method) {
+              entry.contract_method = x.m_contract_method;
+          }
+          else if (entry.contract_type==contract::contract_type::terminate) {
+             //
+          }
+          LOG_PRINT_L0("END tx_extra_contract in extra_extractor:" );
            }
 
 

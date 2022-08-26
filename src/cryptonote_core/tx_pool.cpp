@@ -174,7 +174,7 @@ namespace cryptonote
         tx_extra_tx_key_image_unlock pool_unlock;
         if (!cryptonote::get_field_from_tx_extra(pool_tx.extra, pool_unlock))
         {
-          LOG_PRINT_L1("Could not get key image unlock from tx: " << get_transaction_hash(tx) << ", possibly corrupt tx in the pool");
+          LOG_PRINT_L1("Could not get key image unlock from tx: " << get_transaction_hash(pool_tx) << ", possibly corrupt tx in the pool");
           return true;
         }
 
@@ -191,7 +191,7 @@ namespace cryptonote
         tx_extra_contract data;
         if (!cryptonote::get_field_from_tx_extra(tx.extra, data))
         {
-            MERROR("Could not get acquire name master from tx: " << get_transaction_hash(tx) << ", tx to add is possibly invalid, rejecting");
+            MERROR("Could not get acquire contract data from tx extra : " << get_transaction_hash(tx) << ", tx to add is possibly invalid, rejecting");
             return true;
         }
 
@@ -205,11 +205,11 @@ namespace cryptonote
             tx_extra_contract pool_data;
             if (!cryptonote::get_field_from_tx_extra(pool_tx.extra, pool_data))
             {
-                LOG_PRINT_L1("Could not get acquire name master from tx: " << get_transaction_hash(tx) << ", possibly corrupt tx in the pool");
+                LOG_PRINT_L1("Could not get acquire contract data from tx: " << get_transaction_hash(pool_tx) << ", possibly corrupt tx in the pool");
                 return true;
             }
 
-            if (data.m_contract_name == pool_data.m_contract_name && data.type == pool_data.type)
+            if (data.m_contract_name == pool_data.m_contract_name && data.m_type == pool_data.m_type)
             {
                 LOG_PRINT_L1("New TX: " << get_transaction_hash(tx) << ", has TX: " << get_transaction_hash(pool_tx) << " from the pool that is requesting the same Contract entry already.");
                 return true;
@@ -235,7 +235,7 @@ namespace cryptonote
         tx_extra_beldex_name_system pool_data;
         if (!cryptonote::get_field_from_tx_extra(pool_tx.extra, pool_data))
         {
-          LOG_PRINT_L1("Could not get acquire name master from tx: " << get_transaction_hash(tx) << ", possibly corrupt tx in the pool");
+          LOG_PRINT_L1("Could not get acquire name master from tx: " << get_transaction_hash(pool_tx) << ", possibly corrupt BNS tx in the pool");
           return true;
         }
 

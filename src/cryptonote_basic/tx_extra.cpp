@@ -12,7 +12,7 @@ tx_extra_contract tx_extra_contract::create_contract(
                 const uint64_t& deposit_amount)
 {
     tx_extra_contract result{};
-    result.type = contract::contract_type::create;
+    result.m_type = contract::contract_type::create;
     result.m_contract_name = contract_name;
     result.m_contract_address = contractaddress;
     result.m_owner_pubkey = owner;
@@ -31,7 +31,7 @@ tx_extra_contract tx_extra_contract::call_public_method(
         const uint64_t& deposit_amount)
 {
     tx_extra_contract result{};
-    result.type = contract::contract_type::method;
+    result.m_type = contract::contract_type::public_method;
     result.m_contract_name = contract_name;
     result.m_contract_address = contractaddress;
     result.m_contract_method= contract_method;
@@ -49,7 +49,7 @@ tx_extra_contract tx_extra_contract::call_public_method(
             const crypto::signature &signature)
     {
         tx_extra_contract result{};
-        result.type = contract::contract_type::method;
+        result.m_type = contract::contract_type::signed_method;
         result.m_contract_name = contract_name;
         result.m_contract_address = contractaddress;
         result.m_contract_method= contract_method;
@@ -68,7 +68,7 @@ tx_extra_contract tx_extra_contract::call_public_method(
             )
     {
         tx_extra_contract result{};
-        result.type = contract::contract_type::terminate;
+        result.m_type = contract::contract_type::terminate;
         result.m_contract_name = contract_name;
         result.m_contract_address = contractaddress;
         result.m_receipt_address = receiptaddress;

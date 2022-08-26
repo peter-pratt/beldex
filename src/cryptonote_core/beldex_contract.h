@@ -12,7 +12,8 @@
 namespace contract {
     enum struct contract_type : uint16_t {
         create = 0,
-        method,
+        public_method,
+        signed_method,
         terminate,
         _count
     };

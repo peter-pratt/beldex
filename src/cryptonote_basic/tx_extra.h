@@ -315,7 +315,8 @@ namespace cryptonote
 
     struct tx_extra_contract
     {
-        contract::contract_type type;
+        contract::contract_type m_type;
+        uint8_t m_version=3;
         std::string m_contract_name;
         cryptonote::account_public_address m_contract_address;
         crypto::public_key m_owner_pubkey;
@@ -362,28 +363,35 @@ namespace cryptonote
                 );
 
         BEGIN_SERIALIZE()
-        ENUM_FIELD(type, type < contract::contract_type::_count)
+        ENUM_FIELD(m_type, m_type < contract::contract_type::_count)
+        FIELD(m_version)
         FIELD(m_contract_name)
         FIELD(m_contract_address)
 
-        if (type == contract::contract_type::create)
+        if (m_type == contract::contract_type::create)
         {
             FIELD(m_owner_pubkey)
             FIELD(m_spendkey)
             FIELD(m_viewkey)
-
             FIELD(m_contract_source)
             FIELD(m_deposit_amount)
         }
-        else if (type == contract::contract_type::method)
+        else if (m_type == contract::contract_type::public_method)
         {
             FIELD(m_contract_method)
+            FIELD(m_method_args)
+            FIELD(m_deposit_amount)
         }
-        if (type == contract::contract_type::method || type == contract::contract_type::terminate)
+        else if (m_type == contract::contract_type::signed_method)
         {
-            if(type == contract::contract_type::terminate){
-                FIELD(m_receipt_address)
-            }
+            FIELD(m_contract_method)
+            FIELD(m_method_args)
+            FIELD(m_deposit_amount)
+            FIELD(m_signature)
+        }
+        else if (m_type == contract::contract_type::terminate)
+        {
+            FIELD(m_receipt_address)
             FIELD(m_method_args)
             FIELD(m_signature)
         }
