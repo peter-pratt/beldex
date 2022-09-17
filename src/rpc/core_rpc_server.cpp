@@ -3493,7 +3493,7 @@ namespace cryptonote { namespace rpc {
     else
       throw rpc_error{ERROR_WRONG_PARAM, "Unknown status type"};
     if (!success)
-      throw rpc_error{ERROR_WRONG_PARAM, "Pubkey not found"};
+      throw rpc_error{ERROR_WRONG_PARAM, "Pubkey not found in get_master_node_list():" };
 
     res.status = STATUS_OK;
     return res;

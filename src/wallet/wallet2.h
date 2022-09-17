@@ -626,6 +626,13 @@ private:
     cryptonote::account_base& get_account(){return m_account;}
     const cryptonote::account_base& get_account()const{return m_account;}
 
+    std::shared_ptr<cryptonote::account_base> get_contract_account(const int contract_index) {
+        if  (m_contract_accounts.size()>contract_index) {
+            return m_contract_accounts[contract_index];
+        }
+        return NULL;
+    }
+
     void encrypt_keys(const crypto::chacha_key &key);
     void encrypt_keys(const epee::wipeable_string &password);
     void decrypt_keys(const crypto::chacha_key &key);
@@ -1581,7 +1588,7 @@ private:
     bool should_expand(const cryptonote::subaddress_index &index) const;
 
     cryptonote::account_base m_account;
-    std::vector<std::unique_ptr<cryptonote::account_base>> m_contract_accounts;
+    std::vector<std::shared_ptr<cryptonote::account_base>> m_contract_accounts;
     fs::path m_wallet_file;
     fs::path m_keys_file;
     fs::path m_mms_file;

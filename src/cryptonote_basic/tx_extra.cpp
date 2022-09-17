@@ -17,7 +17,7 @@ tx_extra_contract tx_extra_contract::create_contract(
     result.m_contract_address = contractaddress;
     result.m_owner_pubkey = owner;
     result.m_spendkey = spendkey;
-    result.m_spendkey = viewkey;
+    result.m_viewkey = viewkey;
     result.m_contract_source = contract_source;
     result.m_deposit_amount = deposit_amount;
     return result;

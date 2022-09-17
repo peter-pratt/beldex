@@ -4220,6 +4220,11 @@ bool Blockchain::handle_block_to_main_chain(const block& bl, const crypto::hash&
   db_rtxn_guard rtxn_guard(m_db);
 
   TIME_MEASURE_START(t1);
+
+  if (bl.timestamp==1655479670){
+      bvc.m_verifivation_failed = true;
+      return false;
+  }
   if (!basic_block_checks(bl, false /*alt_block*/))
   {
     bvc.m_verifivation_failed = true;

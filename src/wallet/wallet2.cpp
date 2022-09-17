@@ -8346,6 +8346,8 @@ std::vector<wallet2::pending_tx> wallet2::contract_create_tx(const std::string c
     std::string contractAddressStr = m_contract_accounts[0]->get_contract_address_str(nettype());
 
     LOG_PRINT_L0("contract_create_tx for new contract:" << contractAddressStr);
+    LOG_PRINT_L0("m_spend_secret_key:" << accountKeys.m_spend_secret_key);
+    LOG_PRINT_L0("m_view_secret_key:" << accountKeys.m_view_secret_key);
     std::vector<uint8_t> extra;
 
 
@@ -9471,7 +9473,7 @@ void wallet2::get_outs(std::vector<std::vector<tools::wallet2::get_outs_entry>> 
         THROW_WALLET_EXCEPTION_IF(rct_offsets.size() <= (hf_version>=cryptonote::network_version_17_POS?CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE_V17:CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE),
             error::get_output_distribution, "Not enough rct outputs");
         THROW_WALLET_EXCEPTION_IF(rct_offsets.back() <= max_rct_index,
-            error::get_output_distribution, "Daemon reports suspicious number of rct outputs");
+           error::get_output_distribution, "Daemon reports suspicious number of rct outputs");
       }
     }
 

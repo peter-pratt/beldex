@@ -127,7 +127,7 @@ namespace master_nodes
 
 
 
-    if (hf_version > cryptonote::network_version_12_security_signature) {
+    if (hf_version > cryptonote::network_version_12_security_signature && m_core.get_nettype()!=cryptonote::TESTNET) {
 
         if (!ss_reachable)
         {
@@ -155,7 +155,6 @@ namespace master_nodes
             }
         }
 
-
         if (!info.is_decommissioned()) {
             if (check_checkpoint_obligation &&
                 !checkpoint_participation.check_participation(CHECKPOINT_MAX_MISSABLE_VOTES)) {
@@ -177,6 +176,7 @@ namespace master_nodes
                 result.timesync_status = false;
             }
         }
+
     }
 
 

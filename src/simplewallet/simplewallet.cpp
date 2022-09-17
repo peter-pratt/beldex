@@ -8326,11 +8326,25 @@ bool simple_wallet::contract_create(std::vector<std::string> args)
         info.address                        = m_wallet->get_subaddress({m_current_subaddress_account, 0});
         info.is_subaddress                  = m_current_subaddress_account != 0;
         dsts.push_back(info);
+        unsigned int contractIndex = 0;
+        const cryptonote::account_keys& accountKeys = m_wallet->get_contract_account(contractIndex)->get_keys();
+        std::string contractAddressStr =m_wallet->get_contract_account(contractIndex)->get_contract_address_str(m_wallet->nettype());
 
         std::cout << std::endl << tr("Creating Contract") << std::endl << std::endl;
+        std::cout << boost::format(tr("Contract Local Index:         %s")) % contractIndex << std::endl;
+        std::cout << boost::format(tr("Contract Address:         %s")) % contractAddressStr << std::endl;
         std::cout << boost::format(tr("Contract Name:         %s")) % contractname << std::endl;
         std::cout << boost::format(tr("Contract Source:         %s")) % contractsource << std::endl;
         std::cout << boost::format(tr("Depositamount:        %s")) % deposit_amount << std::endl;
+        std::cout << tr("Contract Spend Key:        ");
+        print_secret_key(accountKeys.m_spend_secret_key );
+        std::cout << std::endl;
+        std::cout << tr("Contract View Key:         ");
+        print_secret_key(accountKeys.m_view_secret_key);
+        std::cout << std::endl;
+
+
+
 
 
 
@@ -8459,7 +8473,7 @@ bool simple_wallet::contract_terminate(std::vector<std::string> args)
     if (!parse_subaddr_indices_and_priority(*m_wallet, args, subaddr_indices, priority, m_current_subaddress_account)) return false;
 
 
-    if (args.size() != 3)
+    if (args.size() != 4)
     {
         PRINT_USAGE(USAGE_CONTRACT_TERMINATE);
         return true;
