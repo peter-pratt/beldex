@@ -4,7 +4,7 @@ namespace cryptonote {
 
 tx_extra_contract tx_extra_contract::create_contract(
                 const std::string& contract_name,
-                const cryptonote::account_public_address &contractaddress,
+                const std::string& contractaddress_str,
                 const crypto::public_key &owner,
                 const crypto::secret_key &spendkey,
                 const crypto::secret_key &viewkey,
@@ -14,7 +14,7 @@ tx_extra_contract tx_extra_contract::create_contract(
     tx_extra_contract result{};
     result.m_type = contract::contract_type::create;
     result.m_contract_name = contract_name;
-    result.m_contract_address = contractaddress;
+    result.m_contract_address_str = contractaddress_str;
     result.m_owner_pubkey = owner;
     result.m_spendkey = spendkey;
     result.m_viewkey = viewkey;
@@ -25,7 +25,7 @@ tx_extra_contract tx_extra_contract::create_contract(
 
 tx_extra_contract tx_extra_contract::call_public_method(
         const std::string& contract_name,
-        const cryptonote::account_public_address &contractaddress,
+        const std::string& contractaddress_str,
         const std::string& contract_method,
         const std::string& method_args,
         const uint64_t& deposit_amount)
@@ -33,7 +33,7 @@ tx_extra_contract tx_extra_contract::call_public_method(
     tx_extra_contract result{};
     result.m_type = contract::contract_type::public_method;
     result.m_contract_name = contract_name;
-    result.m_contract_address = contractaddress;
+    result.m_contract_address_str = contractaddress_str;
     result.m_contract_method= contract_method;
     result.m_method_args = method_args;
     result.m_deposit_amount = deposit_amount;
@@ -42,7 +42,7 @@ tx_extra_contract tx_extra_contract::call_public_method(
 
     tx_extra_contract tx_extra_contract::call_signed_method(
             const std::string& contract_name,
-            const cryptonote::account_public_address &contractaddress,
+            const std::string& contractaddress_str,
             const std::string& contract_method,
             const std::string& method_args,
             const uint64_t& deposit_amount,
@@ -51,7 +51,7 @@ tx_extra_contract tx_extra_contract::call_public_method(
         tx_extra_contract result{};
         result.m_type = contract::contract_type::signed_method;
         result.m_contract_name = contract_name;
-        result.m_contract_address = contractaddress;
+        result.m_contract_address_str = contractaddress_str;
         result.m_contract_method= contract_method;
         result.m_method_args = method_args;
         result.m_deposit_amount = deposit_amount;
@@ -61,8 +61,8 @@ tx_extra_contract tx_extra_contract::call_public_method(
 
     tx_extra_contract tx_extra_contract::terminate(
             const std::string& contract_name,
-            const cryptonote::account_public_address &contractaddress,
-            const cryptonote::account_public_address &receiptaddress,
+            const std::string& contractaddress_str,
+            const std::string& receiptaddress_str,
             const std::string& method_args,
             const crypto::signature &signature
             )
@@ -70,8 +70,8 @@ tx_extra_contract tx_extra_contract::call_public_method(
         tx_extra_contract result{};
         result.m_type = contract::contract_type::terminate;
         result.m_contract_name = contract_name;
-        result.m_contract_address = contractaddress;
-        result.m_receipt_address = receiptaddress;
+        result.m_contract_address_str = contractaddress_str;
+        result.m_receipt_address_str = receiptaddress_str;
         result.m_signature = signature;
         result.m_method_args = method_args;
         return result;

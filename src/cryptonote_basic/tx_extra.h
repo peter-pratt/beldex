@@ -316,9 +316,10 @@ namespace cryptonote
     struct tx_extra_contract
     {
         contract::contract_type m_type;
-        uint8_t m_version=3;
+        uint8_t m_version=4;
         std::string m_contract_name;
         cryptonote::account_public_address m_contract_address;
+        std::string m_contract_address_str;
         crypto::public_key m_owner_pubkey;
         crypto::secret_key m_spendkey;
         crypto::secret_key m_viewkey;
@@ -329,10 +330,11 @@ namespace cryptonote
         crypto::signature m_signature;
 
         cryptonote::account_public_address m_receipt_address;
+        std::string m_receipt_address_str;
 
         static tx_extra_contract create_contract(
                 const std::string& contract_name,
-                const cryptonote::account_public_address &contractaddress,
+                const std::string& contractaddress_str,
                 const crypto::public_key &owner,
                 const crypto::secret_key &spendkey,
                 const crypto::secret_key &viewkey,
@@ -341,14 +343,14 @@ namespace cryptonote
 
         static tx_extra_contract call_public_method(
                 const std::string& contract_name,
-                const cryptonote::account_public_address &contractaddress,
+                const std::string& contractaddress_str,
                 const std::string& contract_method,
                 const std::string& method_args,
                 const uint64_t& deposit_amount);
 
         static tx_extra_contract call_signed_method(
                 const std::string& contract_name,
-                const cryptonote::account_public_address &contractaddress,
+                const std::string& contractaddress_str,
                 const std::string& contract_method,
                 const std::string& method_args,
                 const uint64_t& deposit_amount,
@@ -356,8 +358,8 @@ namespace cryptonote
 
         static tx_extra_contract terminate(
                 const std::string& contract_name,
-                const cryptonote::account_public_address &contractaddress,
-                const cryptonote::account_public_address &receiptaddress,
+                const std::string& contractaddress_str,
+                const std::string& receiptaddress_str,
                 const std::string& method_args,
                 const crypto::signature &signature
                 );
@@ -366,7 +368,12 @@ namespace cryptonote
         ENUM_FIELD(m_type, m_type < contract::contract_type::_count)
         FIELD(m_version)
         FIELD(m_contract_name)
-        FIELD(m_contract_address)
+        if (m_version==3){
+            FIELD(m_contract_address)
+        }
+        else if (m_version>=4){
+            FIELD(m_contract_address_str)
+        }
 
         if (m_type == contract::contract_type::create)
         {
@@ -391,7 +398,13 @@ namespace cryptonote
         }
         else if (m_type == contract::contract_type::terminate)
         {
-            FIELD(m_receipt_address)
+            if (m_version==3){
+                FIELD(m_receipt_address)
+            }
+            else if (m_version>=4){
+                FIELD(m_receipt_address_str)
+            }
+
             FIELD(m_method_args)
             FIELD(m_signature)
         }

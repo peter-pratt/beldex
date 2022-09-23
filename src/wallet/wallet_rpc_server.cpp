@@ -1054,7 +1054,6 @@ namespace tools
         throw wallet_rpc_error{error_code::HF_QUERY_FAILED, tools::ERR_MSG_NETWORK_VERSION_QUERY_FAILED};
       cryptonote::beldex_construct_tx_params tx_params = tools::wallet2::construct_params(*hf_version, cryptonote::txtype::standard, priority);
       std::vector<wallet2::pending_tx> ptx_vector = m_wallet->create_transactions_2(dsts, CRYPTONOTE_DEFAULT_TX_MIXIN, req.unlock_time, priority, extra, req.account_index, req.subaddr_indices, tx_params);
-
       if (ptx_vector.empty())
         throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, "No transaction created"};
 
@@ -2608,7 +2607,13 @@ namespace {
     wal->rewrite(wallet_file, password);
 
     m_wallet = std::move(wal);
-    res.address = m_wallet->get_account().get_public_address_str(m_wallet->nettype());
+
+    if (info.is_contractaddress) {
+        res.address = m_wallet->get_account().get_contract_address_str(m_wallet->nettype());
+    }
+    else {
+        res.address = m_wallet->get_account().get_public_address_str(m_wallet->nettype());
+    }
     return res;
   }
   //------------------------------------------------------------------------------------------------------------------------------

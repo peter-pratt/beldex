@@ -272,6 +272,7 @@ namespace cryptonote
     std::unique_lock lock{m_transactions_lock};
 
     PERF_TIMER(add_tx);
+    MINFO("tx_memory_pool::add_tx  relayed:" << opts.relayed );
     if (tx.version == txversion::v0)
     {
       // v0 never accepted
@@ -376,7 +377,7 @@ namespace cryptonote
       tvc.m_double_spend = true;
       return false;
     }
-
+    MINFO("add_tx before check_tx_outputs");
     if (!m_blockchain.check_tx_outputs(tx, tvc))
     {
       LOG_PRINT_L1("Transaction with id= "<< id << " has at least one invalid output");
@@ -384,6 +385,7 @@ namespace cryptonote
       tvc.m_invalid_output = true;
       return false;
     }
+      MINFO("after before check_tx_outputs");
 
     // assume failure during verification steps until success is certain
     tvc.m_verifivation_failed = true;
@@ -908,7 +910,7 @@ namespace cryptonote
     auto locks = tools::unique_locks(m_transactions_lock, m_blockchain);
 
     auto sorted_it = find_tx_in_sorted_container(id);
-
+    MINFO("take_tx: " << id << " relayed:"<< relayed);
     try
     {
       LockedTXN lock(m_blockchain);

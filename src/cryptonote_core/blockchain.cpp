@@ -3233,7 +3233,8 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
     //const auto& my_mn_keys = m_core.get_master_keys();
     //bool evm_check_enabled = m_core.master_node() && m_core.is_master_node(my_mn_keys.pub, /*require_active=*/true);
   PERF_TIMER(check_tx_inputs);
-  LOG_PRINT_L3("Blockchain::" << __func__);
+  LOG_PRINT_L1("Blockchain::" << __func__ << ":" <<evm_check_enabled );
+
   uint64_t max_used_block_height = 0;
   if (!pmax_used_block_height)
     pmax_used_block_height = &max_used_block_height;
@@ -3258,6 +3259,7 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
 
   if (tx.is_transfer())
   {
+    LOG_PRINT_L1("Blockchain::" << __func__ << ":is_transfer" );
     if (tx.type != txtype::beldex_name_system && hf_version >= HF_VERSION_MIN_2_OUTPUTS && tx.vout.size() < 2)
     {
       MERROR_VER("Tx " << get_transaction_hash(tx) << " has fewer than two outputs, which is not allowed as of hardfork " << +HF_VERSION_MIN_2_OUTPUTS);
@@ -3274,7 +3276,7 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
     for (size_t sig_index = 0; sig_index < tx.vin.size(); sig_index++)
     {
       const auto& txin = tx.vin[sig_index];
-
+        LOG_PRINT_L1("Blockchain::" << __func__ << ":sig_index:"<<sig_index );
       //
       // Monero Checks
       //
@@ -3282,6 +3284,7 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
       CHECK_AND_ASSERT_MES(std::holds_alternative<txin_to_key>(txin), false, "wrong type id in tx input at Blockchain::check_tx_inputs");
       const txin_to_key& in_to_key = var::get<txin_to_key>(txin);
       {
+          LOG_PRINT_L1("Blockchain::" << __func__ << ":txin_to_key:"<<sig_index );
         // make sure tx output has key offset(s) (is signed to be used)
         CHECK_AND_ASSERT_MES(in_to_key.key_offsets.size(), false, "empty in_to_key.key_offsets in transaction with id " << get_transaction_hash(tx));
 
@@ -3333,22 +3336,25 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
         }
         if(!pmax_used_block_height){
             //called from Blockchain::handle_block_to_main_chain()
-            LOG_PRINT_L0("check_tx_inputs in handle_block_to_main_chain");
+            LOG_PRINT_L0("EVM: check_tx_inputs in handle_block_to_main_chain");
             for (size_t key_offset_index = 0; key_offset_index < in_to_key.key_offsets.size() ; key_offset_index++)
             {
                 const auto& txout_index = in_to_key.key_offsets[key_offset_index];
                 tx_out_index out_tx_info = m_db->get_output_tx_and_index_from_global(txout_index);
                 cryptonote::transaction out_tx = m_db->get_tx(out_tx_info.first);
-                if(tx.type==txtype::contract){
+                if(out_tx.type==txtype::contract){
                     LOG_PRINT_L0("This VIN offset is from a Contract TX:" << out_tx.hash << " Ask EVM for confirmation for this TX:" << tx.hash );
                     if(evm_check_enabled){
-                        LOG_PRINT_L0("THis is a MN so this node needs to check");
+                        LOG_PRINT_L0("THis is a MN so this node needs to check at the EVM");
                     }else{
                         LOG_PRINT_L0("THis is not a MN so this node cant check EVM for hash, and this can be removed in production");
                     }
 
                 }
             }
+        }
+        else{
+            LOG_PRINT_L1("Blockchain::" << __func__ << ":skipp EVM check");
         }
       }
 
@@ -3384,7 +3390,7 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
       CHECK_AND_ASSERT_MES((*pmax_used_block_height + spendable_age) <= m_db->height(),
           false, "Transaction spends at least one output which is too young");
     }
-if (tx.version >= cryptonote::txversion::v2_ringct)
+    if (tx.version >= cryptonote::txversion::v2_ringct)
 	{
     if (!expand_transaction_2(tx, tx_prefix_hash, pubkeys))
     {

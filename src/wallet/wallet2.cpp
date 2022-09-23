@@ -8336,14 +8336,12 @@ std::vector<wallet2::pending_tx> wallet2::contract_create_tx(const std::string c
                                                             uint32_t account_index,
                                                             std::set<uint32_t> subaddr_indices)
 {
+    uint8_t contract_index = m_contract_accounts.size();
+    m_contract_accounts.push_back(std::make_unique<cryptonote::account_base>());
+    m_contract_accounts[contract_index]->generate();
 
-    if (m_contract_accounts.size()==0) {
-        m_contract_accounts.push_back(std::make_unique<cryptonote::account_base>());
-        m_contract_accounts[0]->generate();
-    }
-
-    const cryptonote::account_keys& accountKeys = m_contract_accounts[0]->get_keys();
-    std::string contractAddressStr = m_contract_accounts[0]->get_contract_address_str(nettype());
+    const cryptonote::account_keys& accountKeys = m_contract_accounts[contract_index]->get_keys();
+    std::string contractAddressStr = m_contract_accounts[contract_index]->get_contract_address_str(nettype());
 
     LOG_PRINT_L0("contract_create_tx for new contract:" << contractAddressStr);
     LOG_PRINT_L0("m_spend_secret_key:" << accountKeys.m_spend_secret_key);
@@ -8353,7 +8351,7 @@ std::vector<wallet2::pending_tx> wallet2::contract_create_tx(const std::string c
 
     auto entry = cryptonote::tx_extra_contract::create_contract(
             contractname,
-            accountKeys.m_account_address,
+            contractAddressStr,
             m_account.get_keys().m_account_address.m_view_public_key,
             accountKeys.m_spend_secret_key,
             accountKeys.m_view_secret_key,
@@ -8387,19 +8385,23 @@ std::vector<wallet2::pending_tx> wallet2::contract_create_tx(const std::string c
     return result;
   }
 
-std::vector<wallet2::pending_tx> wallet2::contract_call_method_tx(const std::string contractname,const std::string contract_method,  const std::string method_args, const cryptonote::account_public_address &address, const uint64_t& depositamount, std::string *reason,
+std::vector<wallet2::pending_tx> wallet2::contract_call_method_tx(const std::string contractname,const std::string contract_method,  const std::string method_args, const cryptonote::account_public_address &contractaddress, const uint64_t& depositamount, std::string *reason,
                                                              uint32_t priority,
                                                              uint32_t account_index,
                                                              std::set<uint32_t> subaddr_indices)
 {
     std::vector<uint8_t> extra;
+
+    std::string contractaddress_str = cryptonote::get_account_address_as_str(cryptonote::MAINNET, false,true,contractaddress);
+
     auto entry = cryptonote::tx_extra_contract::call_public_method(
             contractname,
-            address,
+            contractaddress_str,
             contract_method,
             method_args,
             depositamount);
     add_contract_to_tx_extra(extra, entry);
+
 
     std::optional<uint8_t> hf_version = get_hard_fork_version();
     if (!hf_version)
@@ -8411,7 +8413,7 @@ std::vector<wallet2::pending_tx> wallet2::contract_call_method_tx(const std::str
     beldex_construct_tx_params tx_params = wallet2::construct_params(*hf_version, txtype::contract, priority);
     std::vector<cryptonote::tx_destination_entry> dsts;
     cryptonote::tx_destination_entry de;
-    de.addr = address;
+    de.addr = contractaddress;
     de.is_subaddress = false;
     de.amount = depositamount;
     dsts.push_back(de);
@@ -8427,18 +8429,18 @@ std::vector<wallet2::pending_tx> wallet2::contract_call_method_tx(const std::str
     return result;
 }
 
-std::vector<wallet2::pending_tx> wallet2::contract_terminate_tx(const std::string contractname, const cryptonote::account_public_address &contractaddress, const cryptonote::account_public_address &receiptaddress, const std::string method_args, std::string *reason,
+std::vector<wallet2::pending_tx> wallet2::contract_terminate_tx(const std::string contractname, const std::string contract_address_str, const cryptonote::account_public_address &receiptaddress,  const std::string method_args, std::string *reason,
                                                                   uint32_t priority,
                                                                   uint32_t account_index,
                                                                   std::set<uint32_t> subaddr_indices)
 {
     crypto::signature sig;
     std::vector<uint8_t> extra;
-
+    std::string receipt_address_str = cryptonote::get_account_address_as_str(cryptonote::MAINNET, false,true,receiptaddress);
     auto entry = cryptonote::tx_extra_contract::terminate(
             contractname,
-            contractaddress,
-            receiptaddress,
+            contract_address_str,
+            receipt_address_str,
             method_args,
             sig //todo remove here and add the signature seperate
             );
@@ -8463,7 +8465,7 @@ std::vector<wallet2::pending_tx> wallet2::contract_terminate_tx(const std::strin
     beldex_construct_tx_params tx_params = wallet2::construct_params(*hf_version, txtype::contract, priority);
     std::vector<cryptonote::tx_destination_entry> dsts;
     cryptonote::tx_destination_entry de;
-    de.addr = contractaddress;
+    de.addr = receiptaddress;
     de.is_subaddress = false;
     de.amount = 0;
     dsts.push_back(de);

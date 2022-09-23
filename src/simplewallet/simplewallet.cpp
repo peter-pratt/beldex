@@ -3723,6 +3723,9 @@ bool simple_wallet::init(const boost::program_options::variables_map& vm)
           fail_msg_writer() << tr("failed to parse address");
           return false;
       }
+
+
+
       if (info.is_subaddress)
       {
         fail_msg_writer() << tr("This address is a subaddress which cannot be used here.");
@@ -8417,7 +8420,7 @@ bool simple_wallet::contract_method(std::vector<std::string> args)
         ptx_vector = m_wallet->contract_call_method_tx(contractname,
                                                   contractmethod,
                                                   contractmethod_args,
-                                                  info.address,
+                                                       info.address,
                                                   deposit_amount,
                                                   &reason,
                                                   priority,
@@ -8510,7 +8513,7 @@ bool simple_wallet::contract_terminate(std::vector<std::string> args)
     try
     {
         ptx_vector = m_wallet->contract_terminate_tx(contractname,
-                                                     info_contract.address,
+                                                     contractaddress,
                                                      info_receiptaddress.address,
                                                        contractmethod_args,
                                                        &reason,
