@@ -633,6 +633,10 @@ private:
         return NULL;
     }
 
+    uint8_t get_contract_accounts_size() {
+        return m_contract_accounts.size();
+    }
+
     void encrypt_keys(const crypto::chacha_key &key);
     void encrypt_keys(const epee::wipeable_string &password);
     void decrypt_keys(const crypto::chacha_key &key);

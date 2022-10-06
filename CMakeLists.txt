@@ -51,7 +51,7 @@ message(STATUS "CMake version ${CMAKE_VERSION}")
 set(CMAKE_OSX_DEPLOYMENT_TARGET 10.12 CACHE STRING "macOS deployment target (Apple clang only)")
 
 project(beldex
-    VERSION 4.1.6
+    VERSION 4.1.7
     LANGUAGES CXX C)
 set(BELDEX_RELEASE_CODENAME "EVM_POC")
 

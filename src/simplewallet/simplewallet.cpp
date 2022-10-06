@@ -8329,7 +8329,10 @@ bool simple_wallet::contract_create(std::vector<std::string> args)
         info.address                        = m_wallet->get_subaddress({m_current_subaddress_account, 0});
         info.is_subaddress                  = m_current_subaddress_account != 0;
         dsts.push_back(info);
-        unsigned int contractIndex = 0;
+        uint8_t contractIndex = m_wallet->get_contract_accounts_size(); // for POC just get latest generated contract account
+        if (contractIndex>0){
+            contractIndex--;
+        }
         const cryptonote::account_keys& accountKeys = m_wallet->get_contract_account(contractIndex)->get_keys();
         std::string contractAddressStr =m_wallet->get_contract_account(contractIndex)->get_contract_address_str(m_wallet->nettype());
 

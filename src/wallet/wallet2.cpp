@@ -8343,6 +8343,7 @@ std::vector<wallet2::pending_tx> wallet2::contract_create_tx(const std::string c
     const cryptonote::account_keys& accountKeys = m_contract_accounts[contract_index]->get_keys();
     std::string contractAddressStr = m_contract_accounts[contract_index]->get_contract_address_str(nettype());
 
+    LOG_PRINT_L0("contract_create_tx index new contract:" << contract_index);
     LOG_PRINT_L0("contract_create_tx for new contract:" << contractAddressStr);
     LOG_PRINT_L0("m_spend_secret_key:" << accountKeys.m_spend_secret_key);
     LOG_PRINT_L0("m_view_secret_key:" << accountKeys.m_view_secret_key);
