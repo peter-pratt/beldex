@@ -8569,7 +8569,7 @@ wallet2::request_stake_unlock_result wallet2::can_request_stake_unlock(const cry
   result.ptx.tx.type    = cryptonote::txtype::key_image_unlock;
 
   std::string const mn_key_as_str = tools::type_to_hex(mn_key);
-  {
+  { 
     const auto [success, response] = get_master_nodes({{mn_key_as_str}});
     if (!success)
     {
@@ -8586,6 +8586,7 @@ wallet2::request_stake_unlock_result wallet2::can_request_stake_unlock(const cry
     cryptonote::account_public_address const primary_address = get_address();
     std::vector<rpc::master_node_contribution> const *contributions = nullptr;
     rpc::GET_MASTER_NODES::response::entry const &node_info = response[0];
+    rpc::master_node_contributor const *p_contributor =  nullptr;
     for (auto const &contributor : node_info.contributors)
     {
       address_parse_info address_info = {};
@@ -8595,6 +8596,7 @@ wallet2::request_stake_unlock_result wallet2::can_request_stake_unlock(const cry
         continue;
 
       contributions = &contributor.locked_contributions;
+      p_contributor = &contributor;
       break;
     }
 
@@ -8604,12 +8606,16 @@ wallet2::request_stake_unlock_result wallet2::can_request_stake_unlock(const cry
       return result;
     }
 
-    if (contributions->empty())
+    std::string error_msg;
+    uint64_t cur_height = get_daemon_blockchain_height(error_msg);
+    
+    if(((p_contributor->amount) < 2500 * COIN ) && ((cur_height - node_info.registration_height) <  30 * 2880))
     {
-      result.msg = tr("Unexpected 0 contributions in master node for this wallet ") + mn_key_as_str;
+      result.msg = tr("you can't give the unlock command! you have to wait upto ") + std::to_string(node_info.registration_height + 30 * 2880 - cur_height) + " Blocks or "+ std::to_string((node_info.registration_height + 30 * 2880 - cur_height)/2880) + " days approx";
+      result.success = false;
       return result;
     }
-
+  
     cryptonote::tx_extra_tx_key_image_unlock unlock = {};
     {
       uint64_t curr_height = 0;
