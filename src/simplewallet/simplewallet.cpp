@@ -597,7 +597,7 @@ namespace
   bool long_payment_id_failure(bool ret)
   {
     fail_msg_writer() << tr("Error: Long payment IDs are obsolete.");
-    fail_msg_writer() << tr("Long payment IDs were not encrypted on the blockchain and would harm your privacy.");
+    fail_msg_writer() << tr("Long payment IDs were not encrypted on the blockchain and would harm your confidentiality.");
     fail_msg_writer() << tr("If the party you're sending to still requires a long payment ID, please notify them.");
     return ret;
   }
@@ -2101,13 +2101,13 @@ bool simple_wallet::welcome(const std::vector<std::string> &args)
   message_writer() << tr("Unlike Bitcoin, your Beldex transactions and balance stay private and are not visible to the world by default.");
   message_writer() << tr("However, you have the option of making those available to select parties if you choose to.");
   message_writer() << "";
-  message_writer() << tr("Beldex protects your privacy on the blockchain, and while Beldex strives to improve all the time,");
-  message_writer() << tr("no privacy technology can be 100% perfect, Monero and consequently Beldex included.");
+  message_writer() << tr("Beldex protects your confidentiality on the blockchain, and while Beldex strives to improve all the time,");
+  message_writer() << tr("no confidential computing technology can be 100% perfect, Monero and consequently Beldex included.");
   message_writer() << tr("Beldex cannot protect you from malware, and it may not be as effective as we hope against powerful adversaries.");
   message_writer() << tr("Flaws in Beldex may be discovered in the future, and attacks may be developed to peek under some");
-  message_writer() << tr("of the layers of privacy Beldex provides. Be safe and practice defense in depth.");
+  message_writer() << tr("of the layers of confidentiality Beldex provides. Be safe and practice defense in depth.");
   message_writer() << "";
-  message_writer() << tr("Welcome to Beldex and financial privacy. For more information, see https://beldex.io");
+  message_writer() << tr("Welcome to Beldex and financial confidentiality. For more information, see https://beldex.io");
   return true;
 }
 
@@ -4011,7 +4011,7 @@ bool simple_wallet::init(const boost::program_options::variables_map& vm)
   if (!m_wallet->is_trusted_daemon())
   {
     message_writer(epee::console_color_yellow, true) << fmt::format(tr("Warning: using an untrusted daemon at {}"), m_wallet->get_daemon_address());
-    message_writer(epee::console_color_yellow, true) << tr("Using a third party daemon can be detrimental to your security and privacy");
+    message_writer(epee::console_color_yellow, true) << tr("Using a third party daemon can be detrimental to your security and confidentiality");
     bool ssl = false;
     if (m_wallet->check_connection(nullptr, &ssl) && !ssl)
       message_writer(epee::console_color_yellow, true) << tr("Using your own without SSL exposes your RPC traffic to monitoring");
@@ -4028,7 +4028,7 @@ bool simple_wallet::init(const boost::program_options::variables_map& vm)
   }
 
   if (m_wallet->get_ring_database().empty())
-    fail_msg_writer() << tr("Failed to initialize ring database: privacy enhancing features will be inactive");
+    fail_msg_writer() << tr("Failed to initialize ring database: confidential enhancing features will be inactive");
 
   m_wallet->callback(this);
 
@@ -5680,7 +5680,7 @@ bool simple_wallet::confirm_and_send_tx(std::vector<cryptonote::address_parse_in
         for (uint32_t i : subaddr_indices)
           prompt << boost::format(tr("Spending from address index %d\n")) % i;
         if (subaddr_indices.size() > 1)
-          prompt << tr("WARNING: Outputs of multiple addresses are being used together, which might potentially compromise your privacy.\n");
+          prompt << tr("WARNING: Outputs of multiple addresses are being used together, which might potentially compromise your confidentiality.\n");
       }
       prompt << boost::format(tr("Sending %s.  ")) % print_money(total_sent);
       if (ptx_vector.size() > 1)
@@ -5721,7 +5721,7 @@ bool simple_wallet::confirm_and_send_tx(std::vector<cryptonote::address_parse_in
       }
       if (m_wallet->confirm_non_default_ring_size() && !default_ring_size)
       {
-        prompt << tr("WARNING: this is a non default ring size, which may harm your privacy. Default is recommended.");
+        prompt << tr("WARNING: this is a non default ring size, which may harm your confidentiality. Default is recommended.");
       }
       prompt << "\n\n" << tr("Is this okay?");
 
@@ -7613,7 +7613,7 @@ bool simple_wallet::sweep_main_internal(sweep_type_t sweep_type, std::vector<too
     for (uint32_t i : subaddr_indices)
       prompt << fmt::format(tr("Spending from address index {}\n"), i); 
     if (subaddr_indices.size() > 1)
-      prompt << tr("WARNING: Outputs of multiple addresses are being used together, which might potentially compromise your privacy.\n");
+      prompt << tr("WARNING: Outputs of multiple addresses are being used together, which might potentially compromise your confidentiality.\n");
   }
 
   if (!process_ring_members(ptx_vector, prompt, m_wallet->print_ring_members()))
@@ -10628,7 +10628,7 @@ int main(int argc, char* argv[])
   auto [vm, should_terminate] = wallet_args::main(
    argc, argv,
    "beldex-wallet-cli [--wallet-file=<filename>|--generate-new-wallet=<filename>] [<COMMAND>]",
-    sw::tr("This is the command line Beldex wallet. It needs to connect to a Beldex\ndaemon to work correctly.\n\nWARNING: Do not reuse your Beldex keys on a contentious fork, doing so will harm your privacy.\n Only consider reusing your key on a contentious fork if the fork has key reuse mitigations built in."),
+    sw::tr("This is the command line Beldex wallet. It needs to connect to a Beldex\ndaemon to work correctly.\n\nWARNING: Do not reuse your Beldex keys on a contentious fork, doing so will harm your confidentiality.\n Only consider reusing your key on a contentious fork if the fork has key reuse mitigations built in."),
     desc_params,
     hidden_params,
     positional_options,

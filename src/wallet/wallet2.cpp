@@ -2445,13 +2445,13 @@ void wallet2::process_new_transaction(const crypto::hash &txid, const cryptonote
         if (ignore)
         {
           LOG_PRINT_L2("Found unencrypted payment ID in tx " << txid << " (ignored)");
-          MWARNING("Found OBSOLETE AND IGNORED unencrypted payment ID: these are bad for privacy, use subaddresses instead");
+          MWARNING("Found OBSOLETE AND IGNORED unencrypted payment ID: these are bad for confidentiality, use subaddresses instead");
           payment_id = crypto::null_hash;
         }
         else
         {
           LOG_PRINT_L2("Found unencrypted payment ID: " << payment_id);
-          MWARNING("Found unencrypted payment ID: these are bad for privacy, consider using subaddresses instead");
+          MWARNING("Found unencrypted payment ID: these are bad for confidentiality, consider using subaddresses instead");
         }
       }
     }
