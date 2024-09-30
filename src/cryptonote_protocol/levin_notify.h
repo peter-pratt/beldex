@@ -68,7 +68,7 @@ namespace levin
 
   using connections = epee::levin::async_protocol_handler_config<detail::p2p_context>;
 
-  //! Provides tx notification privacy
+  //! Provides tx notification confidentiality
   class notify
   {
     std::shared_ptr<detail::zone> zone_;

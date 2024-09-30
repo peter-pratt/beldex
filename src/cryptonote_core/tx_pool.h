@@ -435,7 +435,7 @@ namespace cryptonote
      * @param tx_infos return-by-reference the transactions' information
      * @param key_image_infos return-by-reference the spent key images' information
      * @param post_process optional function to call to do any extra tx_info processing from the transaction
-     * @param include_sensitive_data include unrelayed txes and fields that are sensitive to the node privacy
+     * @param include_sensitive_data include unrelayed txes and fields that are sensitive to the node confidentiality
      *
      * @return true
      */
