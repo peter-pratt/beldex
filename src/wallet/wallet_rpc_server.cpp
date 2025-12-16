@@ -239,8 +239,6 @@ namespace tools
                   {});
       }
 
-      nlohmann::json id = var::get<std::string>(epee_id);
-
       std::string method;
       if(!ps.get_value("method", method, nullptr))
       {
