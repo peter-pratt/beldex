@@ -29,6 +29,7 @@
 #include "common/command_line.h"
 #include "common/varint.h"
 #include "common/median.h"
+#include "common/fs.h"
 #include "cryptonote_core/cryptonote_core.h"
 #include "blockchain_objects.h"
 #include "blockchain_db/blockchain_db.h"
@@ -131,7 +132,7 @@ int main(int argc, char* argv[])
   }
   LOG_PRINT_L0("database: LMDB");
 
-  const fs::path filename = fs::u8path(command_line::get_arg(vm, cryptonote::arg_data_dir)) / db->get_db_name();
+  const fs::path filename = tools::utf8_path(command_line::get_arg(vm, cryptonote::arg_data_dir)) / db->get_db_name();
   LOG_PRINT_L0("Loading blockchain from folder " << filename << " ...");
 
   try

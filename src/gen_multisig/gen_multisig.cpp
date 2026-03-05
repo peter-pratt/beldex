@@ -44,6 +44,7 @@
 #include "common/command_line.h"
 #include "common/util.h"
 #include "common/scoped_message_writer.h"
+#include "common/fs.h"
 #include "wallet/wallet_args.h"
 #include "wallet/wallet2.h"
 
@@ -78,7 +79,7 @@ namespace
 
 static bool generate_multisig(uint32_t threshold, uint32_t total, const fs::path& basename, network_type nettype, bool create_address_file)
 {
-  tools::msg_writer() << fmt::format(genms::tr("Generating {:d} {:d}/{:d} multisig wallets"), total, threshold, total);
+  tools::msg_writer() << fmt::format(fmt::runtime(genms::tr("Generating {:d} {:d}/{:d} multisig wallets")), total, threshold, total);
 
   const auto pwd_container = tools::password_container::prompt(true, "Enter password for new multisig wallets");
 
@@ -227,13 +228,13 @@ int main(int argc, char* argv[])
   }
   if (threshold <= 1 || threshold > total)
   {
-    tools::fail_msg_writer() << fmt::format(genms::tr("Error: expected N > 1 and N <= M, but got N=={:d} and M=={:d}"), threshold, total);
+    tools::fail_msg_writer() << fmt::format(fmt::runtime(genms::tr("Error: expected N > 1 and N <= M, but got N=={:d} and M=={:d}")), threshold, total);
     return 1;
   }
   fs::path basename;
   if (!(*vm)["filename-base"].defaulted() && !command_line::get_arg(*vm, arg_filename_base).empty())
   {
-    basename = fs::u8path(command_line::get_arg(*vm, arg_filename_base));
+    basename = tools::utf8_path(command_line::get_arg(*vm, arg_filename_base));
   }
   else
   {

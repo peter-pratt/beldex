@@ -31,6 +31,7 @@
 #endif
 
 #include "common/command_line.h"
+#include "common/fs.h"
 #include "serialization/crypto.h"
 #include "cryptonote_core/cryptonote_core.h"
 #include "blockchain_objects.h"
@@ -164,7 +165,7 @@ int main(int argc, char* argv[])
   bool opt_verbose = command_line::get_arg(vm, arg_verbose);
   bool opt_dry_run = command_line::get_arg(vm, arg_dry_run);
 
-  const auto input = fs::u8path(command_line::get_arg(vm, arg_input));
+  const auto input = tools::utf8_path(command_line::get_arg(vm, arg_input));
 
   LOG_PRINT_L0("Initializing source blockchain (BlockchainDB)");
   blockchain_objects_t blockchain_objects = {};
@@ -176,7 +177,7 @@ int main(int argc, char* argv[])
     throw std::runtime_error("Failed to initialize a database");
   }
 
-  const fs::path filename = fs::u8path(command_line::get_arg(vm, cryptonote::arg_data_dir)) / db->get_db_name();
+  const fs::path filename = tools::utf8_path(command_line::get_arg(vm, cryptonote::arg_data_dir)) / db->get_db_name();
   LOG_PRINT_L0("Loading blockchain from folder " << filename << " ...");
 
   try

@@ -116,7 +116,7 @@ int generate(bool ed25519, std::list<std::string_view> args) {
     if (pubkey_pos != std::string::npos)
         overwrite = true;
 
-    if (!overwrite && fs::exists(fs::u8path(filename)))
+    if (!overwrite && fs::exists(tools::utf8_path(filename)))
         return error(2, filename + " to generate already exists, pass `--overwrite' if you want to overwrite it");
 
     std::array<unsigned char, crypto_sign_PUBLICKEYBYTES> pubkey;
@@ -138,7 +138,7 @@ int generate(bool ed25519, std::list<std::string_view> args) {
 
     if (pubkey_pos != std::string::npos)
         filename.replace(pubkey_pos, 6, oxenc::to_hex(pubkey.begin(), pubkey.end()));
-    fs::ofstream out{fs::u8path(filename), std::ios::trunc | std::ios::binary};
+    fs::ofstream out{tools::utf8_path(filename), std::ios::trunc | std::ios::binary};
     if (!out.good())
         return error(2, "Failed to open output file '" + filename + "': " + std::strerror(errno));
     if (ed25519)
@@ -189,10 +189,10 @@ int show(std::list<std::string_view> args) {
     else if (args.size() > 1)
         return error(2, "unknown arguments to 'show'");
 
-    fs::path filename = fs::u8path(args.front());
+    fs::path filename = tools::utf8_path(args.front());
     fs::ifstream in{filename, std::ios::binary};
     if (!in.good())
-        return error(2, "Unable to open '" + filename.u8string() + "': " + std::strerror(errno));
+        return error(2, "Unable to open '" + tools::path_to_str(filename) + "': " + std::strerror(errno));
 
     in.seekg(0, std::ios::end);
     auto size = in.tellg();
@@ -214,12 +214,12 @@ int show(std::list<std::string_view> args) {
     std::array<unsigned char, crypto_sign_SECRETKEYBYTES> seckey;
     in.read(reinterpret_cast<char*>(seckey.data()), size >= 64 ? 64 : 32);
     if (!in.good())
-        return error(2, "Failed to read from " + filename.u8string() + ": " + std::strerror(errno));
+        return error(2, "Failed to read from " + tools::path_to_str(filename) + ": " + std::strerror(errno));
 
     if (legacy) {
         pubkey = pubkey_from_privkey(seckey);
 
-        std::cout << filename.u8string() << " (legacy MN keypair)" << "\n==========" <<
+        std::cout << tools::path_to_str(filename) << " (legacy MN keypair)" << "\n==========" <<
             "\nPrivate key: " << oxenc::to_hex(seckey.begin(), seckey.begin() + 32) <<
             "\nPublic key:  " << oxenc::to_hex(pubkey.begin(), pubkey.end()) << "\n\n";
         return 0;
@@ -227,7 +227,7 @@ int show(std::list<std::string_view> args) {
 
     std::array<unsigned char, crypto_hash_sha512_BYTES> privkey_signhash;
     crypto_hash_sha512(privkey_signhash.data(), seckey.data(), 32);
-    privkey_signhash[0] &= 248;
+    privkey_signhash[0] &= 248; 
     privkey_signhash[31] &= 63;
     privkey_signhash[31] |= 64;
 
@@ -317,7 +317,7 @@ int restore(bool ed25519, std::list<std::string_view> args) {
     if (pubkey_pos != std::string::npos)
         filename.replace(pubkey_pos, 6, oxenc::to_hex(pubkey.begin(), pubkey.end()));
 
-    auto filepath = fs::u8path(filename);
+    auto filepath = tools::utf8_path(filename);
     if (!overwrite && fs::exists(filepath))
         return error(2, filename + " to generate already exists, pass `--overwrite' if you want to overwrite it");
 

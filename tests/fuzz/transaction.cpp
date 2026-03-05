@@ -30,6 +30,7 @@
 #include "cryptonote_basic/cryptonote_basic.h"
 #include "cryptonote_basic/cryptonote_format_utils.h"
 #include "common/file.h"
+#include "common/fs.h"
 #include "fuzzer.h"
 
 class TransactionFuzzer: public Fuzzer
@@ -44,7 +45,7 @@ int TransactionFuzzer::run(const std::string &filename)
 {
   std::string s;
 
-  if (!tools::slurp_file(fs::u8path(filename), s))
+  if (!tools::slurp_file(tools::utf8_path(filename), s))
   {
     std::cout << "Error: failed to load file " << filename << std::endl;
     return 1;

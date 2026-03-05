@@ -48,7 +48,7 @@ Notify::Notify(std::string_view spec)
 
   auto pieces = tools::split_any(spec, " \t", true);
   CHECK_AND_ASSERT_THROW_MES(pieces.size() > 0, "Failed to parse spec");
-  filename = fs::u8path(pieces[0]);
+  filename = tools::utf8_path(pieces[0]);
   CHECK_AND_ASSERT_THROW_MES(fs::exists(filename), "File not found: " << filename);
   args.reserve(pieces.size());
   for (const auto& piece : pieces)

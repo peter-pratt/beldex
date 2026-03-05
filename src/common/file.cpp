@@ -277,17 +277,17 @@ namespace tools {
     return get_special_folder_path(CSIDL_COMMON_APPDATA, true);
 #else
     char* home = std::getenv("HOME");
-    return home && std::strlen(home) ? fs::u8path(home) : fs::current_path();
+    return home && std::strlen(home) ? tools::utf8_path(home) : fs::current_path();
 #endif
   }
 
   fs::path get_default_data_dir()
   {
-    return get_default_parent_dir() / fs::u8path(cryptonote::DATA_DIRNAME);
+    return get_default_parent_dir() / tools::utf8_path(cryptonote::DATA_DIRNAME);
   }
   fs::path get_depreciated_default_data_dir()
   {
-    return get_default_parent_dir() / fs::u8path(cryptonote::DATA_DIRNAME);
+    return get_default_parent_dir() / tools::utf8_path(cryptonote::DATA_DIRNAME);
   }
 
   void set_strict_default_file_permissions(bool strict)

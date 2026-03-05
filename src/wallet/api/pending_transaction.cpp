@@ -85,14 +85,14 @@ bool PendingTransactionImpl::commit(std::string_view filename_, bool overwrite, 
 
     LOG_PRINT_L3("m_pending_tx size: " << m_pending_tx.size());
 
-    auto filename = fs::u8path(filename_);
+    auto filename = tools::utf8_path(filename_);
 
     auto w = m_wallet.wallet();
     try {
       // Save tx to file
       if (!filename.empty()) {
         if (std::error_code ec_ignore; fs::exists(filename, ec_ignore) && !overwrite){
-          m_status = {Status_Error, tr("Attempting to save transaction to file, but specified file(s) exist. Exiting to not risk overwriting. File:") + filename.u8string()};
+          m_status = {Status_Error, tr("Attempting to save transaction to file, but specified file(s) exist. Exiting to not risk overwriting. File:") + tools::path_to_str(filename)};
           LOG_ERROR(m_status.second);
           return false;
         }

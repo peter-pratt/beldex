@@ -55,6 +55,7 @@ extern "C" {
 #include "common/command_line.h"
 #include "common/hex.h"
 #include "common/base58.h"
+#include "common/fs.h" 
 #include "epee/warnings.h"
 #include "crypto/crypto.h"
 #include "cryptonote_config.h"
@@ -119,16 +120,16 @@ namespace cryptonote
   const command_line::arg_descriptor<std::string, false, true, 2> arg_data_dir = {
     "data-dir"
   , "Specify data directory"
-  , tools::get_default_data_dir().u8string()
+  , tools::path_to_str(tools::get_default_data_dir())
   , {{ &arg_testnet_on, &arg_devnet_on }}
-  , [](std::array<bool, 2> testnet_devnet, bool defaulted, std::string val)->std::string {
-      if (testnet_devnet[0])
-        return (fs::u8path(val) / "testnet").u8string();
-      else if (testnet_devnet[1])
-        return (fs::u8path(val) / "devnet").u8string();
-      return val;
+  , [](std::array<bool, 2> testnet_devnet, bool defaulted, std::string val) -> std::string {
+        if (testnet_devnet[0])
+            return tools::path_to_str(tools::utf8_path(val) / "testnet"); 
+        else if (testnet_devnet[1])
+            return tools::path_to_str(tools::utf8_path(val) / "devnet");  
+        return val;
     }
-  };
+};
   const command_line::arg_descriptor<bool> arg_offline = {
     "offline"
   , "Do not listen for peers, nor connect to any"
@@ -369,7 +370,7 @@ namespace cryptonote
     }
     m_check_uptime_proof_interval.interval(get_net_config().UPTIME_PROOF_CHECK_INTERVAL);
 
-    m_config_folder = fs::u8path(command_line::get_arg(vm, arg_data_dir));
+    m_config_folder = tools::utf8_path(command_line::get_arg(vm, arg_data_dir));
 
     test_drop_download_height(command_line::get_arg(vm, arg_test_drop_download_height));
     m_pad_transactions = get_arg(vm, arg_pad_transactions);
@@ -632,7 +633,7 @@ namespace cryptonote
     // make sure the data directory exists, and try to lock it
     if (std::error_code ec; !fs::is_directory(folder, ec) && !fs::create_directories(folder, ec) && ec)
     {
-      MFATAL("Failed to create directory " + folder.u8string() + (ec ? ": " + ec.message() : ""s));
+      MFATAL("Failed to create directory " + tools::path_to_str(folder) + (ec ? ": " + ec.message() : ""s));
       return false;
     }
 
@@ -816,7 +817,7 @@ namespace cryptonote
     m_blockchain_storage.hook_blockchain_detached([this] (const auto& info) { m_quorum_cop.blockchain_detached(info.height, info.by_pop_blocks); });
 
     // Checkpoints
-    m_checkpoints_path = m_config_folder / fs::u8path(JSON_HASH_FILE_NAME);
+    m_checkpoints_path = m_config_folder / tools::utf8_path(JSON_HASH_FILE_NAME);
 
     sqlite3 *bns_db = bns::init_beldex_name_system(bns_db_file_path, db->is_read_only());
     if (!bns_db) return false;
@@ -882,9 +883,9 @@ namespace cryptonote
       bool r = tools::slurp_file(keypath, keystr);
       memcpy(&unwrap(unwrap(privkey)), keystr.data(), sizeof(privkey));
       memwipe(&keystr[0], keystr.size());
-      CHECK_AND_ASSERT_MES(r, false, "failed to load master node key from " + keypath.u8string());
+      CHECK_AND_ASSERT_MES(r, false, "failed to load master node key from " + tools::path_to_str(keypath));
       CHECK_AND_ASSERT_MES(keystr.size() == sizeof(privkey), false,
-          "master node key file " + keypath.u8string() + " has an invalid size");
+          "master node key file " + tools::path_to_str(keypath) + " has an invalid size");
 
       r = get_pubkey(privkey, pubkey);
       CHECK_AND_ASSERT_MES(r, false, "failed to generate pubkey from secret key");
@@ -899,7 +900,7 @@ namespace cryptonote
       }
 
       bool r = tools::dump_file(keypath, tools::view_guts(privkey));
-      CHECK_AND_ASSERT_MES(r, false, "failed to save master node key to " + keypath.u8string());
+      CHECK_AND_ASSERT_MES(r, false, "failed to save master node key to " + tools::path_to_str(keypath));
 
       fs::permissions(keypath, fs::perms::owner_read, ec);
     }

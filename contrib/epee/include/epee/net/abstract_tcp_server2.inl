@@ -663,7 +663,7 @@ PRAGMA_WARNING_DISABLE_VS(4355)
         ms += cur;
     }
     m_timer.expires_after(ms);
-    m_timer.async_wait([=](const boost::system::error_code& ec)
+    m_timer.async_wait([=, this](const boost::system::error_code& ec)
     {
       if(ec == boost::asio::error::operation_aborted)
         return;
@@ -1505,7 +1505,7 @@ POP_WARNINGS
           }
       });
     //start async connect
-    sock_.async_connect(remote_endpoint, [=](const boost::system::error_code& ec_)
+    sock_.async_connect(remote_endpoint, [=, this](const boost::system::error_code& ec_)
       {
         t_connection_context conn_context{};
         boost::system::error_code ignored_ec;

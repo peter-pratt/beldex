@@ -204,7 +204,7 @@ protected:
     // remove each file the db created, making sure it starts with fname.
     for (auto& f : m_filenames)
     {
-      if (tools::starts_with(f.u8string(), m_prefix.u8string()))
+      if (tools::starts_with(tools::path_to_str(f), tools::path_to_str(m_prefix)))
       {
         fs::remove(f);
       }
@@ -220,7 +220,7 @@ protected:
 
   void set_prefix(const std::string& prefix)
   {
-    m_prefix = fs::u8path(prefix);
+    m_prefix = tools::utf8_path(prefix);
   }
 };
 

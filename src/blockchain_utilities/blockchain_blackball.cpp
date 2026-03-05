@@ -38,6 +38,7 @@
 #include "common/file.h"
 #include "common/signal_handler.h"
 #include "common/hex.h"
+#include "common/fs.h" 
 #include "serialization/crypto.h"
 #include "cryptonote_basic/cryptonote_boost_serialization.h"
 #include "cryptonote_core/cryptonote_core.h"
@@ -203,7 +204,7 @@ static int resize_env(const char *db_path)
   {
     try
     {
-      auto si = fs::space(fs::u8path(db_path));
+      auto si = fs::space(tools::utf8_path(db_path));
       if(si.available < needed)
       {
         MERROR("!! WARNING: Insufficient free space to extend database !!: " << (si.available / 1000000) << " MB available");
@@ -349,7 +350,7 @@ static bool for_all_transactions(const fs::path& filename, uint64_t& start_idx, 
   if (dbr) throw std::runtime_error("Failed to set max env dbs: " + std::string(mdb_strerror(dbr)));
   dbr = mdb_env_open(env, filename.string().c_str(), 0, 0664);
   if (dbr) throw std::runtime_error("Failed to open rings database file '"
-      + filename.u8string() + "': " + std::string(mdb_strerror(dbr)));
+      + tools::path_to_str(filename) + "': " + std::string(mdb_strerror(dbr)));
 
   dbr = mdb_txn_begin(env, NULL, MDB_RDONLY, &txn);
   if (dbr) throw std::runtime_error("Failed to create LMDB transaction: " + std::string(mdb_strerror(dbr)));
@@ -429,7 +430,7 @@ static bool for_all_transactions(const fs::path& filename, const uint64_t& start
   if (dbr) throw std::runtime_error("Failed to set max env dbs: " + std::string(mdb_strerror(dbr)));
   dbr = mdb_env_open(env, filename.string().c_str(), 0, 0664);
   if (dbr) throw std::runtime_error("Failed to open rings database file '"
-      + filename.u8string() + "': " + std::string(mdb_strerror(dbr)));
+      + tools::path_to_str(filename) + "': " + std::string(mdb_strerror(dbr)));
 
   dbr = mdb_txn_begin(env, NULL, MDB_RDONLY, &txn);
   if (dbr) throw std::runtime_error("Failed to create LMDB transaction: " + std::string(mdb_strerror(dbr)));
@@ -546,7 +547,7 @@ static uint64_t find_first_diverging_transaction(const fs::path& first_filename,
     const fs::path& actual_filename = i ? second_filename : first_filename;
     dbr = mdb_env_open(env[i], actual_filename.string().c_str(), 0, 0664);
     if (dbr) throw std::runtime_error("Failed to open rings database file '"
-        + actual_filename.u8string() + "': " + std::string(mdb_strerror(dbr)));
+        + tools::path_to_str(actual_filename) + "': " + std::string(mdb_strerror(dbr)));
 
     dbr = mdb_txn_begin(env[i], NULL, MDB_RDONLY, &txn[i]);
     if (dbr) throw std::runtime_error("Failed to create LMDB transaction: " + std::string(mdb_strerror(dbr)));
@@ -970,7 +971,7 @@ static void open_db(const fs::path& filename, MDB_env** env, MDB_txn** txn, MDB_
   MINFO("Opening beldex blockchain at " << filename);
   dbr = mdb_env_open(*env, filename.string().c_str(), flags, 0664);
   CHECK_AND_ASSERT_THROW_MES(!dbr, "Failed to open rings database file '"
-      + filename.u8string() + "': " + std::string(mdb_strerror(dbr)));
+      + tools::path_to_str(filename) + "': " + std::string(mdb_strerror(dbr)));
 
   dbr = mdb_txn_begin(*env, NULL, MDB_RDONLY, txn);
   CHECK_AND_ASSERT_THROW_MES(!dbr, "Failed to create LMDB transaction: " + std::string(mdb_strerror(dbr)));
@@ -1029,7 +1030,7 @@ static crypto::hash get_genesis_block_hash(const fs::path& filename)
   if (dbr) throw std::runtime_error("Failed to set max env dbs: " + std::string(mdb_strerror(dbr)));
   dbr = mdb_env_open(env, filename.string().c_str(), 0, 0664);
   if (dbr) throw std::runtime_error("Failed to open rings database file '"
-      + filename.u8string() + "': " + std::string(mdb_strerror(dbr)));
+      + tools::path_to_str(filename) + "': " + std::string(mdb_strerror(dbr)));
 
   dbr = mdb_txn_begin(env, NULL, MDB_RDONLY, &txn);
   if (dbr) throw std::runtime_error("Failed to create LMDB transaction: " + std::string(mdb_strerror(dbr)));
@@ -1188,8 +1189,8 @@ int main(int argc, char* argv[])
   po::options_description desc_cmd_only("Command line options", opt_size.first, opt_size.second);
   po::options_description desc_cmd_sett("Command line options and settings options", opt_size.first, opt_size.second);
   const command_line::arg_descriptor<std::string> arg_blackball_db_dir = {
-      "spent-output-db-dir", "Specify spent output database directory",
-      get_default_db_path().u8string(),
+    "spent-output-db-dir", "Specify spent output database directory",
+    tools::path_to_str(get_default_db_path()),
   };
   const command_line::arg_descriptor<std::string> arg_log_level  = {"log-level",  "0-4 or categories", ""};
   const command_line::arg_descriptor<bool> arg_rct_only  = {"rct-only", "Only work on ringCT outputs", false};
@@ -1251,7 +1252,7 @@ int main(int argc, char* argv[])
 
   LOG_PRINT_L0("Starting...");
 
-  fs::path output_file_path = fs::u8path(command_line::get_arg(vm, arg_blackball_db_dir));
+  fs::path output_file_path = tools::utf8_path(command_line::get_arg(vm, arg_blackball_db_dir));
   bool opt_rct_only = command_line::get_arg(vm, arg_rct_only);
   bool opt_check_subsets = command_line::get_arg(vm, arg_check_subsets);
   bool opt_verbose = command_line::get_arg(vm, arg_verbose);
@@ -1271,7 +1272,7 @@ int main(int argc, char* argv[])
 
   std::vector<fs::path> inputs;
   for (auto& in : command_line::get_arg(vm, arg_inputs))
-    inputs.push_back(fs::u8path(in));
+    inputs.push_back(tools::utf8_path(in));
   if (inputs.empty())
   {
     LOG_PRINT_L0("No inputs given");
@@ -1406,7 +1407,7 @@ int main(int argc, char* argv[])
 
   for (size_t n = 0; n < inputs.size(); ++n)
   {
-    const std::string canonical = fs::canonical(inputs[n]).u8string();
+    const std::string canonical = tools::path_to_str(fs::canonical(inputs[n]));
     uint64_t start_idx = get_processed_txidx(canonical);
     if (n > 0 && start_idx == 0)
     {

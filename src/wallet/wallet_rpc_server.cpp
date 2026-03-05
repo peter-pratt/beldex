@@ -43,6 +43,7 @@
 #include "common/command_line.h"
 #include "common/i18n.h"
 #include "common/signal_handler.h"
+#include "common/fs.h"
 #include "cryptonote_config.h"
 #include "cryptonote_basic/cryptonote_format_utils.h"
 #include "cryptonote_basic/account.h"
@@ -289,7 +290,7 @@ namespace tools
       } catch (const tools::error::not_enough_unlocked_money& e) {
         json_error = {error_code::NOT_ENOUGH_UNLOCKED_MONEY, e.what()};
       } catch (const tools::error::tx_not_possible& e) {
-        json_error = { error_code::TX_NOT_POSSIBLE, fmt::format(tr("Transaction not possible. Available only {}, transaction amount {} = {} + {} (fee)"),
+        json_error = { error_code::TX_NOT_POSSIBLE, fmt::format(fmt::runtime(tr("Transaction not possible. Available only {}, transaction amount {} = {} + {} (fee)")),
                 cryptonote::print_money(e.available()),
                 cryptonote::print_money(e.tx_amount() + e.fee()),
                 cryptonote::print_money(e.tx_amount()),
@@ -524,7 +525,7 @@ namespace tools
         MERROR(arg_wallet_dir.name << " and " << wallet_args::arg_wallet_file().name << " are incompatible, use only one of them");
         return false;
       }
-      m_wallet_dir = fs::u8path(command_line::get_arg(m_vm, arg_wallet_dir));
+      m_wallet_dir = tools::utf8_path(command_line::get_arg(m_vm, arg_wallet_dir));
       if (!m_wallet_dir.empty())
       {
         std::error_code ec;
@@ -775,7 +776,7 @@ namespace tools
       if (!req.tag.empty() && account_tags.first.count(req.tag) == 0)
         throw wallet_rpc_error{
           error_code::UNKNOWN_ERROR,
-          fmt::format(tr("Tag {} is unregistered."), req.tag)};
+          fmt::format(fmt::runtime(tr("Tag {} is unregistered.")), req.tag)};
       for (cryptonote::subaddress_index subaddr_index = {0,0};
           subaddr_index.major < m_wallet->get_num_subaddress_accounts();
           ++subaddr_index.major)
@@ -2504,7 +2505,7 @@ namespace {
 #endif
     if (ptr)
       throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "Invalid filename"};
-    fs::path wallet_file = req.filename.empty() ? fs::path{} : m_wallet_dir / fs::u8path(req.filename);
+    fs::path wallet_file = req.filename.empty() ? fs::path{} : m_wallet_dir / tools::utf8_path(req.filename);
     if (!req.hardware_wallet)
     {
       std::vector<std::string> languages;
@@ -2565,7 +2566,7 @@ namespace {
 
     close_wallet(req.autosave_current);
 
-    fs::path wallet_file = m_wallet_dir / fs::u8path(req.filename);
+    fs::path wallet_file = m_wallet_dir / tools::utf8_path(req.filename);
     auto vm2 = password_arg_hack(req.password, m_vm);
     std::unique_ptr<tools::wallet2> wal = tools::wallet2::make_from_file(vm2, true, wallet_file, nullptr).first;
     if (!wal)
@@ -2622,7 +2623,7 @@ namespace {
 
     GENERATE_FROM_KEYS::response res{};
 
-    auto wallet_file = get_wallet_path(m_wallet_dir, fs::u8path(req.filename));
+    auto wallet_file = get_wallet_path(m_wallet_dir, tools::utf8_path(req.filename));
 
     auto vm2 = password_arg_hack(req.password, m_vm);
     auto rc = tools::wallet2::make_new(vm2, true, nullptr);
@@ -2684,7 +2685,7 @@ namespace {
 
     RESTORE_DETERMINISTIC_WALLET::response res{};
 
-    auto wallet_file = get_wallet_path(m_wallet_dir, fs::u8path(req.filename));
+    auto wallet_file = get_wallet_path(m_wallet_dir, tools::utf8_path(req.filename));
 
     crypto::secret_key recovery_key;
     std::string old_language;

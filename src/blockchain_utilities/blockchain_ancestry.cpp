@@ -446,7 +446,7 @@ int main(int argc, char* argv[])
   }
   LOG_PRINT_L0("database: LMDB");
 
-  fs::path filename = fs::u8path(opt_data_dir) / db->get_db_name();
+  fs::path filename = tools::utf8_path(opt_data_dir) / db->get_db_name();
   LOG_PRINT_L0("Loading blockchain from folder " << filename << " ...");
 
   try
@@ -467,7 +467,7 @@ int main(int argc, char* argv[])
 
   ancestry_state_t state;
 
-  fs::path state_file_path = fs::u8path(opt_data_dir) / "ancestry-state.bin";
+  fs::path state_file_path = tools::utf8_path(opt_data_dir) / "ancestry-state.bin";
   LOG_PRINT_L0("Loading state data from " << state_file_path);
   fs::ifstream state_data_in;
   state_data_in.open(state_file_path, std::ios_base::binary | std::ios_base::in);

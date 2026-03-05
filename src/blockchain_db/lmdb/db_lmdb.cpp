@@ -44,6 +44,7 @@
 #include "common/pruning.h"
 #include "common/hex.h"
 #include "common/median.h"
+#include "common/fs.h"
 #include "cryptonote_basic/cryptonote_format_utils.h"
 #include "crypto/crypto.h"
 #include "ringct/rctOps.h"
@@ -1412,7 +1413,7 @@ void BlockchainLMDB::open(const fs::path& filename, cryptonote::network_type net
   else
   {
     if (std::error_code ec; !fs::create_directories(filename, ec))
-      throw0(DB_OPEN_FAILURE("Failed to create directory " + filename.u8string()));
+    throw0(DB_OPEN_FAILURE("Failed to create directory " + tools::path_to_str(filename)));
   }
 
   // check for existing LMDB files in base directory
@@ -1420,7 +1421,7 @@ void BlockchainLMDB::open(const fs::path& filename, cryptonote::network_type net
   if (fs::exists(old_files / BLOCKCHAINDATA_FILENAME)
       || fs::exists(old_files / BLOCKCHAINDATA_LOCK_FILENAME))
   {
-    LOG_PRINT_L0("Found existing LMDB files in " << old_files.u8string());
+    LOG_PRINT_L0("Found existing LMDB files in " << tools::path_to_str(old_files));
     LOG_PRINT_L0("Move " << BLOCKCHAINDATA_FILENAME << " and/or " << BLOCKCHAINDATA_LOCK_FILENAME << " to " << filename << ", or delete them, and then restart");
     throw DB_ERROR("Database could not be opened");
   }

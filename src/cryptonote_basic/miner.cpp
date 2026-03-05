@@ -187,7 +187,7 @@ namespace cryptonote
       MGINFO("Mining until height " << m_stop_height);
     
     for (int i = 0; i < m_threads_total; i++)
-      m_threads.emplace_back([=] { return worker_thread(i, slow_mining); });
+      m_threads.emplace_back([this, i, slow_mining] { return worker_thread(i, slow_mining); });
 
     MINFO("Mining has started with " << m_threads_total << " threads, good luck!" );
 

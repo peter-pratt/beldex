@@ -465,14 +465,15 @@ beldex::round (double x)
       else if (z < TWO_MANT_DIG)
         {
           /* Add 0.5 to the absolute value.  */
-          y = z += 0.5;
+          z = z + 0.5;
+          y = z;
           /* Round to the next integer (nearest or up or down, doesn't
              matter).  */
-          z += TWO_MANT_DIG;
-          z -= TWO_MANT_DIG;
+          z = z + TWO_MANT_DIG;
+          z = z - TWO_MANT_DIG;
           /* Enforce rounding down.  */
           if (z > y)
-            z -= 1.0;
+            z = z - 1.0;
         }
     }
   else if (z < 0.0)
@@ -484,14 +485,15 @@ beldex::round (double x)
       else if (z > -TWO_MANT_DIG)
         {
           /* Add 0.5 to the absolute value.  */
-          y = z -= 0.5;
+          z = z - 0.5;
+          y = z;
           /* Round to the next integer (nearest or up or down, doesn't
              matter).  */
-          z -= TWO_MANT_DIG;
-          z += TWO_MANT_DIG;
+          z = z - TWO_MANT_DIG;
+          z = z + TWO_MANT_DIG;
           /* Enforce rounding up.  */
           if (z < y)
-            z += 1.0;
+            z = z + 1.0;
         }
     }
   return z;

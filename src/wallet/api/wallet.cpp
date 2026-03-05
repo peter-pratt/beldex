@@ -505,7 +505,7 @@ EXPORT
 bool WalletImpl::create(std::string_view path_, const std::string &password, const std::string &language)
 {
 
-    auto path = fs::u8path(path_);
+    auto path = tools::utf8_path(path_);
     clearStatus();
     m_recoveringFromSeed = false;
     m_recoveringFromDevice = false;
@@ -544,7 +544,7 @@ bool WalletImpl::create(std::string_view path_, const std::string &password, con
 EXPORT
 bool WalletImpl::createWatchOnly(std::string_view path_, const std::string &password, const std::string &language) const
 {
-    auto path = fs::u8path(path_);
+    auto path = tools::utf8_path(path_);
     clearStatus();
     auto w = wallet();
     std::unique_ptr<tools::wallet2> view_wallet(new tools::wallet2(w->nettype()));
@@ -618,7 +618,7 @@ bool WalletImpl::recoverFromKeysWithPassword(std::string_view path_,
                                  const std::string &viewkey_string,
                                  const std::string &spendkey_string)
 {
-    auto path = fs::u8path(path_);
+    auto path = tools::utf8_path(path_);
     cryptonote::address_parse_info info;
     if(!get_account_address_from_str(info, m_wallet_ptr->nettype(), address_string))
     {
@@ -705,7 +705,7 @@ bool WalletImpl::recoverFromKeysWithPassword(std::string_view path_,
 EXPORT
 bool WalletImpl::recoverFromDevice(std::string_view path_, const std::string &password, const std::string &device_name)
 {
-    auto path = fs::u8path(path_);
+    auto path = tools::utf8_path(path_);
     clearStatus();
     m_recoveringFromSeed = false;
     m_recoveringFromDevice = true;
@@ -731,7 +731,7 @@ Wallet::Device WalletImpl::getDeviceType() const
 EXPORT
 bool WalletImpl::open(std::string_view path_, const std::string &password)
 {
-    auto path = fs::u8path(path_);
+    auto path = tools::utf8_path(path_);
     clearStatus();
     auto w = wallet();
     m_recoveringFromSeed = false;
@@ -760,7 +760,7 @@ bool WalletImpl::open(std::string_view path_, const std::string &password)
 EXPORT
 bool WalletImpl::recover(std::string_view path_, const std::string &password, const std::string &seed, const std::string &seed_offset/* = {}*/)
 {
-    auto path = fs::u8path(path_);
+    auto path = tools::utf8_path(path_);
     clearStatus();
     if (seed.empty()) {
         LOG_ERROR("Electrum seed is empty");
@@ -948,13 +948,13 @@ std::string WalletImpl::publicMultisigSignerKey() const
 EXPORT
 std::string WalletImpl::path() const
 {
-    return wallet()->path().u8string();
+    return tools::path_to_str(wallet()->path());
 }
 
 EXPORT
 bool WalletImpl::store(std::string_view path_)
 {
-    auto path = fs::u8path(path_);
+    auto path = tools::utf8_path(path_);
     clearStatus();
     try {
         if (path.empty()) {
@@ -974,13 +974,13 @@ bool WalletImpl::store(std::string_view path_)
 EXPORT
 std::string WalletImpl::filename() const
 {
-    return wallet()->get_wallet_file().u8string();
+    return tools::path_to_str(wallet()->get_wallet_file());
 }
 
 EXPORT
 std::string WalletImpl::keysFilename() const
 {
-    return wallet()->get_keys_file().u8string();
+    return tools::path_to_str(wallet()->get_keys_file());
 }
 
 EXPORT
@@ -1253,7 +1253,7 @@ int WalletImpl::autoRefreshInterval() const
 }
 
 UnsignedTransaction* WalletImpl::loadUnsignedTx(std::string_view unsigned_filename_) {
-  auto unsigned_filename = fs::u8path(unsigned_filename_);
+  auto unsigned_filename = tools::utf8_path(unsigned_filename_);
   clearStatus();
   UnsignedTransactionImpl* transaction = new UnsignedTransactionImpl(*this);
   if (!wallet()->load_unsigned_tx(unsigned_filename, transaction->m_unsigned_tx_set)){
@@ -1276,7 +1276,7 @@ UnsignedTransaction* WalletImpl::loadUnsignedTx(std::string_view unsigned_filena
 
 EXPORT
 bool WalletImpl::submitTransaction(std::string_view filename_) {
-  auto fileName = fs::u8path(filename_);
+  auto fileName = tools::utf8_path(filename_);
   clearStatus();
   std::unique_ptr<PendingTransactionImpl> transaction(new PendingTransactionImpl(*this));
 
@@ -1297,7 +1297,7 @@ bool WalletImpl::submitTransaction(std::string_view filename_) {
 EXPORT
 bool WalletImpl::exportKeyImages(std::string_view filename_)
 {
-  auto filename = fs::u8path(filename_);
+  auto filename = tools::utf8_path(filename_);
   auto w = wallet();
   if (w->watch_only())
   {
@@ -1309,7 +1309,7 @@ bool WalletImpl::exportKeyImages(std::string_view filename_)
   {
     if (!w->export_key_images_to_file(filename, false /* requested_ki_only */))
     {
-      setStatusError(tr("failed to save file ") + filename.u8string());
+      setStatusError(tr("failed to save file ") + tools::path_to_str(filename));
       return false;
     }
   }
@@ -1325,7 +1325,7 @@ bool WalletImpl::exportKeyImages(std::string_view filename_)
 EXPORT
 bool WalletImpl::importKeyImages(std::string_view filename_)
 {
-  auto filename = fs::u8path(filename_);
+  auto filename = tools::utf8_path(filename_);
   if (!trustedDaemon()) {
     setStatusError(tr("Key images can only be imported with a trusted daemon"));
     return false;

@@ -29,6 +29,7 @@
 
 #include <lmdb.h>
 #include "common/file.h"
+#include "common/fs.h"
 #include "epee/misc_log_ex.h"
 #include "wallet_errors.h"
 #include "ringdb.h"
@@ -221,7 +222,7 @@ ringdb::ringdb(fs::path fn_, const std::string &genesis) : filename_{std::move(f
   const fs::path actual_filename = get_rings_filename(filename_); 
   dbr = mdb_env_open(env, actual_filename.string().c_str(), 0, 0664);
   THROW_WALLET_EXCEPTION_IF(dbr, tools::error::wallet_internal_error, "Failed to open rings database file '"
-      + actual_filename.u8string() + "': " + std::string(mdb_strerror(dbr)));
+      + tools::path_to_str(actual_filename) + "': " + std::string(mdb_strerror(dbr)));
 
   dbr = mdb_txn_begin(env, NULL, 0, &txn);
   THROW_WALLET_EXCEPTION_IF(dbr, tools::error::wallet_internal_error, "Failed to create LMDB transaction: " + std::string(mdb_strerror(dbr)));

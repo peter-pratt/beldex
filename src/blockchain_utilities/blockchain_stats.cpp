@@ -33,6 +33,7 @@
 #include "common/command_line.h"
 #include "common/varint.h"
 #include "common/signal_handler.h"
+#include "common/fs.h"
 #include "cryptonote_basic/cryptonote_boost_serialization.h"
 #include "cryptonote_core/cryptonote_core.h"
 #include "blockchain_objects.h"
@@ -134,7 +135,7 @@ int main(int argc, char* argv[])
     throw std::runtime_error("Failed to initialize a database");
   }
 
-  const fs::path filename = fs::u8path(opt_data_dir) / db->get_db_name();
+  const fs::path filename = tools::utf8_path(opt_data_dir) / db->get_db_name();
   LOG_PRINT_L0("Loading blockchain from folder " << filename << " ...");
 
   try

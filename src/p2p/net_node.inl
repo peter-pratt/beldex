@@ -46,6 +46,7 @@
 #include "epee/time_helper.h"
 #include "common/file.h"
 #include "common/pruning.h"
+#include "common/fs.h"
 #include "net/error.h"
 #include "common/periodic_task.h"
 #include "epee/misc_log_ex.h"
@@ -640,7 +641,7 @@ namespace nodetool
 
     static_cast<std::array<unsigned char, 16>&>(m_network_id) = get_config(m_nettype).NETWORK_ID;
 
-    m_config_folder = fs::u8path(command_line::get_arg(vm, cryptonote::arg_data_dir));
+    m_config_folder = tools::utf8_path(command_line::get_arg(vm, cryptonote::arg_data_dir));
     network_zone& public_zone = m_network_zones.at(epee::net_utils::zone::public_);
 
     if (public_zone.m_port != std::to_string(cryptonote::get_config(m_nettype).P2P_DEFAULT_PORT))
@@ -2019,7 +2020,7 @@ namespace nodetool
       network_zone& zone = m_network_zones.at(address.get_zone());
       LOG_PRINT_CC_L0(ping_context,"try_ping connected send ping" );
       bool inv_call_res = epee::net_utils::async_invoke_remote_command2<COMMAND_PING::response>(ping_context.m_connection_id, COMMAND_PING::ID, req, zone.m_net_server.get_config_object(),
-        [=](int code, const COMMAND_PING::response& rsp, p2p_connection_context& context)
+        [=, this](int code, const COMMAND_PING::response& rsp, p2p_connection_context& context)
       {
         if(code <= 0)
         {

@@ -5,6 +5,7 @@
 #include "oxenmq/oxenmq.h"
 #include "oxenc/bt.h"
 #include <fmt/core.h>
+#include "common/fs.h"
 
 #undef BELDEX_DEFAULT_LOG_CATEGORY
 #define BELDEX_DEFAULT_LOG_CATEGORY "daemon.rpc"
@@ -135,10 +136,10 @@ omq_rpc::omq_rpc(cryptonote::core& core, core_rpc_server& rpc, const boost::prog
     // enough to support unix domain sockets, but for now the Windows default is just "don't listen"
 #ifndef _WIN32
     // Push default .beldex/beldexd.sock
-    locals.push_back("ipc://" + core.get_config_directory().u8string() + "/" + std::string{cryptonote::SOCKET_FILENAME});
+    locals.push_back("ipc://" + tools::path_to_str(core.get_config_directory()) + "/" + std::string{cryptonote::SOCKET_FILENAME});
     // Pushing old default beldexd.sock onto the list. A symlink from .beldex -> .beldex so the user should be able
     // to communicate via the old .beldex/beldexd.sock
-    locals.push_back("ipc://" + core.get_config_directory().u8string() + "/" + std::string{cryptonote::SOCKET_FILENAME});
+    locals.push_back("ipc://" + tools::path_to_str(core.get_config_directory()) + "/" + std::string{cryptonote::SOCKET_FILENAME});
 #endif
   } else if (locals.size() == 1 && locals[0] == "none") {
     locals.clear();

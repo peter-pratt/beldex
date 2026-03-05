@@ -158,21 +158,23 @@ namespace {
   std::string get_human_time_ago(std::chrono::duration<Rep, Period> ago_dur, bool abbreviate = false)
   {
     auto ago = std::chrono::duration_cast<std::chrono::seconds>(ago_dur);
-        if (ago == 0s)
+    if (ago == 0s)
       return "now";
     auto dt = ago > 0s ? ago : -ago;
     std::string s;
     if (dt < 90s)
       s = std::to_string(dt.count()) + (abbreviate ? "sec" : dt == 1s ? " second" : " seconds");
     else if (dt < 90min)
-      s = fmt::format(abbreviate ? "{:.1f}min" : "{:.1f} minutes", static_cast<float>(dt.count()) / 60.0f);
+      s = fmt::format(fmt::runtime(abbreviate ? "{:.1f}min" : "{:.1f} minutes"),
+          static_cast<float>(dt.count()) / 60.0f);
     else if (dt < 36h)
-      s = fmt::format(abbreviate ? "{:.1f}hr" : "{:.1f} hours", static_cast<float>(dt.count()) / 3600.0f);
+      s = fmt::format(fmt::runtime(abbreviate ? "{:.1f}hr" : "{:.1f} hours"),
+          static_cast<float>(dt.count()) / 3600.0f);
     else
       s = fmt::format("{:.1f} days", static_cast<float>(dt.count()) / 86400);
     if (abbreviate) {
-        if (ago < 0s)
-            s += " (in fut.)";
+      if (ago < 0s)
+        s += " (in fut.)";
     } else {
         s += ' ';
         s += (ago < 0s ? "in the future" : "ago");

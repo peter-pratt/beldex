@@ -42,6 +42,7 @@
 #include <boost/algorithm/string.hpp>
 #include "epee/string_tools.h"
 #include "epee/misc_log_ex.h"
+#include "common/fs.h"
 
 #ifndef USE_GHC_FILESYSTEM
 #include <filesystem>
@@ -81,7 +82,7 @@ std::string mlog_get_default_log_path(const char *default_filename)
   else
     default_log_file = default_filename;
 
-  return (fs::u8path(default_log_folder) / fs::u8path(default_log_file)).u8string();
+  return tools::path_to_str(tools::utf8_path(default_log_folder) / tools::utf8_path(default_log_file));
 }
 
 static void mlog_set_common_prefix()
@@ -173,11 +174,11 @@ void mlog_configure(const std::string &filename_base, bool console, const std::s
     if (max_log_files != 0)
     {
       std::vector<fs::path> found_files;
-      const auto filename_base_path = fs::u8path(filename_base);
+      const auto filename_base_path = tools::utf8_path(filename_base);
       const auto parent_path = filename_base_path.has_parent_path() ? filename_base_path.parent_path() : fs::path(".");
       for (const auto& p : fs::directory_iterator{parent_path})
       {
-        const std::string filename = p.path().u8string();
+        const std::string filename = tools::path_to_str(p.path());
         if (filename.size() >= filename_base.size() && std::memcmp(filename.data(), filename_base.data(), filename_base.size()) == 0)
           found_files.push_back(p.path());
       }

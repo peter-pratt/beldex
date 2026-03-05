@@ -44,6 +44,7 @@
 #include "cryptonote_core/cryptonote_core.h"
 #include "cryptonote_core/uptime_proof.h"
 #include "common/hex.h"
+#include "common/fs.h"
 
 #undef BELDEX_DEFAULT_LOG_CATEGORY
 #define BELDEX_DEFAULT_LOG_CATEGORY "bcutil"
@@ -650,9 +651,9 @@ int main(int argc, char* argv[])
   fs::path import_file_path;
 
   if (command_line::has_arg(vm, arg_input_file))
-    import_file_path = fs::u8path(command_line::get_arg(vm, arg_input_file));
+    import_file_path = tools::utf8_path(command_line::get_arg(vm, arg_input_file));
   else
-    import_file_path = fs::u8path(m_config_folder) / "export" / BLOCKCHAIN_RAW;
+    import_file_path = tools::utf8_path(m_config_folder) / "export" / BLOCKCHAIN_RAW;
 
   if (command_line::has_arg(vm, arg_count_blocks))
   {

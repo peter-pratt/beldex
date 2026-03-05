@@ -32,6 +32,7 @@
 #include "common/i18n.h"
 #include "common/util.h"
 #include "common/file.h"
+#include "common/fs.h" 
 #include "epee/misc_log_ex.h"
 #include "epee/string_tools.h"
 #include "version.h"
@@ -170,12 +171,12 @@ namespace wallet_args
 
       if(command_line::has_arg(vm, arg_config_file))
       {
-        fs::path config = fs::u8path(command_line::get_arg(vm, arg_config_file));
+        fs::path config = tools::utf8_path(command_line::get_arg(vm, arg_config_file));
         if (std::error_code ec; fs::exists(config, ec))
         {
           fs::ifstream cfg{config};
           if (!cfg.is_open())
-            throw std::runtime_error{"Unable to open config file: " + config.u8string()};
+            throw std::runtime_error{"Unable to open config file: " + tools::path_to_str(config)};
           po::store(po::parse_config_file<char>(cfg, desc_params), vm);
         }
         else
@@ -226,7 +227,7 @@ namespace wallet_args
     }
     MINFO(wallet_args::tr("Logging to: ") << log_path);
 
-    Print(print) << fmt::format(wallet_args::tr("Logging to {}\n"), log_path);
+    Print(print) << fmt::format(fmt::runtime(wallet_args::tr("Logging to {}\n")), log_path);
 
     const ssize_t lockable_memory = tools::get_lockable_memory();
     if (lockable_memory >= 0 && lockable_memory < 256 * 4096) // 256 pages -> at least 256 secret keys and other such small/medium objects
