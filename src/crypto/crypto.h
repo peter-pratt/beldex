@@ -52,7 +52,8 @@ namespace crypto {
   struct alignas(size_t) ec_point {
     char data[32];
     // Returns true if non-null, i.e. not 0.
-    operator bool() const { static constexpr char null[32] = {0}; return memcmp(data, null, sizeof(data)); }
+    // operator bool() const { static constexpr char null[32] = {0}; return memcmp(data, null, sizeof(data)); }
+    operator bool() const { static constexpr char null[32] = {0}; return memcmp(data, null, sizeof(data)) != 0; }
   };
 
   struct alignas(size_t) ec_scalar {
@@ -87,7 +88,8 @@ namespace crypto {
     ec_scalar c, r;
 
     // Returns true if non-null, i.e. not 0.
-    operator bool() const { static constexpr char null[64] = {0}; return memcmp(this, null, sizeof(null)); }
+    // operator bool() const { static constexpr char null[64] = {0}; return memcmp(this, null, sizeof(null)); }
+    operator bool() const { static constexpr char null[64] = {0}; return memcmp(this, null, sizeof(null)) != 0; }
   };
 
   // The sizes below are all provided by sodium.h, but we don't want to depend on it here; we check
@@ -96,7 +98,8 @@ namespace crypto {
     unsigned char data[32]; // 32 = crypto_sign_ed25519_PUBLICKEYBYTES
     static constexpr ed25519_public_key null() { return {0}; }
     /// Returns true if non-null
-    operator bool() const { return memcmp(data, null().data, sizeof(data)); }
+    // operator bool() const { return memcmp(data, null().data, sizeof(data)); }
+    operator bool() const { return memcmp(data, null().data, sizeof(data)) != 0; }
   };
 
   struct alignas(size_t) ed25519_secret_key_ {
@@ -109,14 +112,16 @@ namespace crypto {
     unsigned char data[64]; // 64 = crypto_sign_BYTES
     static constexpr ed25519_signature null() { return {0}; }
     // Returns true if non-null, i.e. not 0.
-    operator bool() const { auto z = null(); return memcmp(this, &z, sizeof(z)); }
+    // operator bool() const { auto z = null(); return memcmp(this, &z, sizeof(z)); }
+    operator bool() const { auto z = null(); return memcmp(this, &z, sizeof(z)) != 0; }
   };
 
   struct alignas(size_t) x25519_public_key {
     unsigned char data[32]; // crypto_scalarmult_curve25519_BYTES
     static constexpr x25519_public_key null() { return {0}; }
     /// Returns true if non-null
-    operator bool() const { return memcmp(data, null().data, sizeof(data)); }
+    // operator bool() const { return memcmp(data, null().data, sizeof(data)); }
+    operator bool() const { return memcmp(data, null().data, sizeof(data)) != 0; }
   };
 
   struct alignas(size_t) x25519_secret_key_ {

@@ -2309,17 +2309,28 @@ namespace master_nodes
     master_node_info const *info = nullptr;
     {
       auto oldest_waiting = std::make_tuple(std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint32_t>::max(), crypto::null_pkey);
+
+      // NOTE: master_nodes_infos is an unordered_map — iteration order is
+      // non-deterministic. We must sort by key first to guarantee the same
+      // winner is selected deterministically across all platforms and C++ versions.
+      std::vector<std::pair<crypto::public_key, const master_node_info*>> sorted_infos;
+      sorted_infos.reserve(master_nodes_infos.size());
       for (const auto &info_it : master_nodes_infos)
+        if (info_it.second->is_active())
+          sorted_infos.emplace_back(info_it.first, info_it.second.get());
+
+      std::sort(sorted_infos.begin(), sorted_infos.end(),
+        [](const auto &a, const auto &b) {
+          return memcmp(&a.first, &b.first, sizeof(crypto::public_key)) < 0;
+        });
+
+      for (const auto &[k, mninfo] : sorted_infos)
       {
-        const auto &mninfo = *info_it.second;
-        if (mninfo.is_active())
+        auto waiting_since = std::make_tuple(mninfo->last_reward_block_height, mninfo->last_reward_transaction_index, k);
+        if (waiting_since < oldest_waiting)
         {
-          auto waiting_since = std::make_tuple(mninfo.last_reward_block_height, mninfo.last_reward_transaction_index, info_it.first);
-          if (waiting_since < oldest_waiting)
-          {
-            oldest_waiting = waiting_since;
-            info           = &mninfo;
-          }
+          oldest_waiting = waiting_since;
+          info           = mninfo;
         }
       }
       key = std::get<2>(oldest_waiting);
@@ -2329,7 +2340,6 @@ namespace master_nodes
       return master_nodes::null_payout;
     return master_node_info_to_payout(key, *info);
   }
-
   template <typename T>
   static constexpr bool within_one(T a, T b) {
       return (a > b ? a - b : b - a) <= T{1};
@@ -2398,12 +2408,38 @@ namespace master_nodes
     // original amount, i.e. 50% of the original base reward goes to master
     // nodes not 50% of the reward after removing the governance component (the
     // adjusted base reward post hardfork 10).
-    payout const block_leader = m_state.get_block_leader();
+    // payout const block_leader = m_state.get_block_leader();
+
+    // Need state at height-1 (before this block was added):
+    payout block_leader = {};
+    if (m_state.height == height - 1)
+    {
+        // m_state is at previous block height — correct state to use directly
+        block_leader = m_state.get_block_leader();
+    }
+    else
+    {
+        // m_state has advanced past this block — look up state at height-2
+        auto it = m_transient.state_history.find(height - 2);
+        if (it != m_transient.state_history.end())
+            block_leader = it->get_block_leader();
+        else
+            block_leader = m_state.get_block_leader(); // fallback
+    }
+
+    MWARNING("DEBUG validate_miner_tx: height=" << height 
+             << " m_state.height=" << m_state.height
+             << " block_leader.key=" << tools::type_to_hex(block_leader.key));
     {
       auto const check_block_leader_pubkey = cryptonote::get_master_node_winner_from_tx_extra(miner_tx.extra);
-      if (block_leader.key != check_block_leader_pubkey)
+      MWARNING("DEBUG check_block_leader_pubkey=" << tools::type_to_hex(check_block_leader_pubkey));
+      // if (block_leader.key != check_block_leader_pubkey)
+      if (memcmp(&block_leader.key, &check_block_leader_pubkey, sizeof(crypto::public_key)) != 0)
       {
-        throw std::runtime_error{fmt::format("Master node reward winner is incorrect! Expected {}, block has {} " , block_leader.key , check_block_leader_pubkey)};
+        // throw std::runtime_error{fmt::format("Master node reward winner is incorrect! Expected {}, block has {} " , block_leader.key , check_block_leader_pubkey)};
+        throw std::runtime_error{fmt::format("Master node reward winner is incorrect! Expected {}, block has {}",
+            tools::type_to_hex(block_leader.key),
+            tools::type_to_hex(check_block_leader_pubkey))};
       }
     }
 
