@@ -65,7 +65,6 @@ target_link_libraries(common
     cncrypto
     oxenc::oxenc
     oxenmq::oxenmq
-    filesystem
     fmt::fmt
     nlohmann_json::nlohmann_json
     date::date

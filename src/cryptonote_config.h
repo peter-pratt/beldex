@@ -38,6 +38,7 @@
 #include <stdexcept>
 #include <chrono>
 #include <array>
+#include <filesystem>
 #include <ratio>
 #include <array>
 
@@ -167,20 +168,21 @@ namespace p2p {
 }  // namespace p2p
 
 // filename constants:
-inline constexpr auto DATA_DIRNAME =
+inline const std::filesystem::path DATA_DIRNAME {
 #ifdef _WIN32
-    "beldex"sv; // Buried in some windows filesystem maze location
+    u8"beldex" // Buried in some windows filesystem maze location
 #else
-    ".beldex"sv; // ~/.beldex
+    u8".beldex" // ~/.beldex
 #endif
+};
 
-inline constexpr auto CONF_FILENAME                 = "beldex.conf"sv;
-inline constexpr auto SOCKET_FILENAME               = "beldexd.sock"sv;
-inline constexpr auto LOG_FILENAME                  = "beldex.log"sv;
-inline constexpr auto POOLDATA_FILENAME             = "poolstate.bin"sv;
-inline constexpr auto BLOCKCHAINDATA_FILENAME       = "data.mdb"sv;
-inline constexpr auto BLOCKCHAINDATA_LOCK_FILENAME  = "lock.mdb"sv;
-inline constexpr auto P2P_NET_DATA_FILENAME         = "p2pstate.bin"sv;
+inline const std::filesystem::path CONF_FILENAME{u8"beldex.conf"};
+inline const std::filesystem::path SOCKET_FILENAME{u8"beldexd.sock"};
+inline const std::filesystem::path LOG_FILENAME{u8"beldex.log"};
+inline const std::filesystem::path POOLDATA_FILENAME{u8"poolstate.bin"};
+inline const std::filesystem::path BLOCKCHAINDATA_FILENAME{u8"data.mdb"};
+inline const std::filesystem::path BLOCKCHAINDATA_LOCK_FILENAME{u8"lock.mdb"};
+inline const std::filesystem::path P2P_NET_DATA_FILENAME{u8"p2pstate.bin"};
 
 inline constexpr uint64_t PRUNING_STRIPE_SIZE      = 4096;  // the smaller, the smoother the increase
 inline constexpr uint64_t PRUNING_LOG_STRIPES      = 3;     // the higher, the more space saved

@@ -489,7 +489,7 @@ namespace cryptonote::rpc {
         HttpRequest& req,
         const rpc_command& call)
   {
-    std::shared_ptr<call_data> data{new call_data{*this, m_server, res, std::string{req.getUrl()}, &call}};
+    auto data = std::make_shared<call_data>(*this, m_server, res, std::string{req.getUrl()}, &call);
     auto& request = data->request;
     request.body = std::monostate{};
     request.context.admin = !m_restricted;
@@ -519,7 +519,7 @@ namespace cryptonote::rpc {
 
   void http_server::handle_json_rpc_request(HttpResponse& res, HttpRequest& req)
   {
-    std::shared_ptr<call_data> data{new call_data{*this, m_server, res, std::string{req.getUrl()}}};
+    auto data = std::make_shared<call_data>(*this, m_server, res, std::string{req.getUrl()});
     data->jsonrpc = true;
     auto& request = data->request;
     request.context.admin = !m_restricted;

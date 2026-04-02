@@ -383,12 +383,12 @@ bool daemon::run(bool interactive)
   }
   catch (std::exception const& ex)
   {
-    MFATAL(ex.what());
+    MFATAL("An exception occurred: " << ex.what());
     return false;
   }
   catch (...)
   {
-    MFATAL("Unknown exception occured!");
+    MFATAL("Unknown exception occurred!");
     return false;
   }
 }

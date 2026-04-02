@@ -293,7 +293,6 @@ if(NOT MANUAL_SUBMODULES)
       check_submodule(external/Catch2)
     endif()
     check_submodule(external/uWebSockets uSockets)
-    check_submodule(external/ghc-filesystem)
   endif()
 endif()
 
@@ -343,8 +342,6 @@ endif()
 #   set(NETBSD TRUE)
 # elseif(CMAKE_SYSTEM_NAME MATCHES ".*BSDI.*")
 #   set(BSDI TRUE)
-
-include(cmake/check_for_std_filesystem.cmake)
 
 include_directories(external/rapidjson/include src external)
 

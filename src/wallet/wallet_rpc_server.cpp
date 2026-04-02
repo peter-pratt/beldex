@@ -94,7 +94,7 @@ namespace
       std::optional<epee::serialization::storage_entry> params,
       tools::wallet_rpc_server& server)>;
 
-  template <typename RPC, std::enable_if_t<std::is_base_of_v<RPC_COMMAND, RPC>, int> = 0>
+  template <std::derived_from<RPC_COMMAND> RPC>
   void register_rpc_command(std::unordered_map<std::string, rpc_func_data>& regs)
   {
     using Request = typename RPC::request;

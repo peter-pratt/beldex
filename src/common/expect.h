@@ -29,6 +29,7 @@
 #pragma once
 
 #include <cassert>
+#include <concepts>
 #include <system_error>
 #include <type_traits>
 #include <utility>
@@ -129,12 +130,6 @@ class expect
 {
     static_assert(std::is_nothrow_destructible<T>(), "T must have a nothrow destructor");
 
-    template<typename U>
-    static constexpr bool is_convertible() noexcept
-    {
-        return std::is_constructible<T, U>() &&
-            std::is_convertible<U, T>();
-    }
 
     // MEMBERS
     std::error_code code_;
@@ -197,7 +192,7 @@ public:
     }
 
     //! Copy conversion from `U` to `T`.
-    template<typename U, typename = std::enable_if_t<is_convertible<U const&>()>>
+    template<std::convertible_to<T> U>
     expect(expect<U> const& src) noexcept(std::is_nothrow_constructible<T, U const&>())
       : code_(src.error()), storage_()
     {
@@ -213,7 +208,7 @@ public:
     }
 
     //! Move conversion from `U` to `T`.
-    template<typename U, typename = std::enable_if_t<is_convertible<U>()>>
+    template<std::convertible_to<T> U>
     expect(expect<U>&& src) noexcept(std::is_nothrow_constructible<T, U>())
       : code_(src.error()), storage_()
     {
@@ -323,7 +318,7 @@ public:
         \note This function is `noexcept` when `U == T` is `noexcept`.
         \return False if `has_error()`, otherwise `value() == rhs`.
     */
-    template<typename U, typename = std::enable_if_t<!std::is_constructible_v<std::error_code, U>>>
+    template <typename U> requires(!std::is_constructible_v<std::error_code, U>) 
     bool equal(U const& rhs) const noexcept(noexcept(*std::declval<expect<T>>() == rhs))
     {
         return has_value() && get() == rhs;

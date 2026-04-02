@@ -52,8 +52,7 @@ namespace crypto {
   struct alignas(size_t) ec_point {
     char data[32];
     // Returns true if non-null, i.e. not 0.
-    // operator bool() const { static constexpr char null[32] = {0}; return memcmp(data, null, sizeof(data)); }
-    operator bool() const { static constexpr char null[32] = {0}; return memcmp(data, null, sizeof(data)) != 0; }
+    operator bool() const { static constexpr char null[32] = {0}; return memcmp(data, null, sizeof(data)); }
   };
 
   struct alignas(size_t) ec_scalar {
@@ -88,8 +87,7 @@ namespace crypto {
     ec_scalar c, r;
 
     // Returns true if non-null, i.e. not 0.
-    // operator bool() const { static constexpr char null[64] = {0}; return memcmp(this, null, sizeof(null)); }
-    operator bool() const { static constexpr char null[64] = {0}; return memcmp(this, null, sizeof(null)) != 0; }
+    operator bool() const { static constexpr char null[64] = {0}; return memcmp(this, null, sizeof(null)); }
   };
 
   // The sizes below are all provided by sodium.h, but we don't want to depend on it here; we check
@@ -98,8 +96,7 @@ namespace crypto {
     unsigned char data[32]; // 32 = crypto_sign_ed25519_PUBLICKEYBYTES
     static constexpr ed25519_public_key null() { return {0}; }
     /// Returns true if non-null
-    // operator bool() const { return memcmp(data, null().data, sizeof(data)); }
-    operator bool() const { return memcmp(data, null().data, sizeof(data)) != 0; }
+    operator bool() const { return memcmp(data, null().data, sizeof(data)); }
   };
 
   struct alignas(size_t) ed25519_secret_key_ {
@@ -112,16 +109,14 @@ namespace crypto {
     unsigned char data[64]; // 64 = crypto_sign_BYTES
     static constexpr ed25519_signature null() { return {0}; }
     // Returns true if non-null, i.e. not 0.
-    // operator bool() const { auto z = null(); return memcmp(this, &z, sizeof(z)); }
-    operator bool() const { auto z = null(); return memcmp(this, &z, sizeof(z)) != 0; }
+    operator bool() const { auto z = null(); return memcmp(this, &z, sizeof(z)); }
   };
 
   struct alignas(size_t) x25519_public_key {
     unsigned char data[32]; // crypto_scalarmult_curve25519_BYTES
     static constexpr x25519_public_key null() { return {0}; }
     /// Returns true if non-null
-    // operator bool() const { return memcmp(data, null().data, sizeof(data)); }
-    operator bool() const { return memcmp(data, null().data, sizeof(data)) != 0; }
+    operator bool() const { return memcmp(data, null().data, sizeof(data)); }
   };
 
   struct alignas(size_t) x25519_secret_key_ {
@@ -147,13 +142,17 @@ namespace crypto {
   inline void rand(size_t N, uint8_t *bytes) {
     generate_random_bytes_thread_safe(N, bytes);
   }
+  
+  template <typename T>
+  concept trivially_copyable = std::is_trivially_copyable_v<T>;
 
   /* Generate a value filled with random bytes.
    */
-  template<typename T>
-  typename std::enable_if<std::is_pod<T>::value, T>::type rand() {
-    typename std::remove_cv<T>::type res;
-    generate_random_bytes_thread_safe(sizeof(T), (uint8_t*)&res);
+  template <trivially_copyable T>
+  T rand() {
+    using Plain = std::remove_cvref_t<T>;
+    Plain res;
+    generate_random_bytes_thread_safe(sizeof(res), reinterpret_cast<uint8_t*>(&res));
     return res;
   }
 
@@ -161,25 +160,24 @@ namespace crypto {
    */
   struct random_device
   {
-    typedef uint64_t result_type;
+    using result_type = uint64_t;
     static constexpr result_type min() { return 0; }
-    static constexpr result_type max() { return result_type(-1); }
+    static constexpr result_type max() { return std::numeric_limits<result_type>::max(); }
     result_type operator()() const { return crypto::rand<result_type>(); }
   };
 
   /* Generate a random value between range_min and range_max
    */
-  template<typename T>
-  typename std::enable_if<std::is_integral<T>::value, T>::type rand_range(T range_min, T range_max) {
-    crypto::random_device rd;
-    std::uniform_int_distribution<T> dis(range_min, range_max);
-    return dis(rd);
+  template <std::integral T>
+  T rand_range(T range_min, T range_max) {
+    random_device rd;
+    return std::uniform_int_distribution<T>{range_min, range_max}(rd);
   }
 
   /* Generate a random index between 0 and sz-1
    */
-  template<typename T>
-  typename std::enable_if<std::is_unsigned<T>::value, T>::type rand_idx(T sz) {
+  template <std::integral T>
+  T rand_idx(T sz) {
     return crypto::rand_range<T>(0, sz-1);
   }
 

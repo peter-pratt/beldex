@@ -190,7 +190,7 @@ namespace nodetool
 
   std::optional<peerlist_storage> peerlist_storage::open(const fs::path& path)
   {
-    fs::ifstream src_file{path, std::ios::binary};
+    std::ifstream src_file{path, std::ios::binary};
     if(src_file.fail())
       return std::nullopt;
 
@@ -240,7 +240,7 @@ namespace nodetool
 
   bool peerlist_storage::store(const fs::path& path, const peerlist_types& other) const
   {
-    fs::ofstream dest_file{path, std::ios::binary | std::ios::trunc};
+    std::ofstream dest_file{path, std::ios::binary | std::ios::trunc};
     if(dest_file.fail())
       return false;
 

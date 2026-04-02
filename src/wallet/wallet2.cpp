@@ -154,10 +154,10 @@ namespace {
   // used to target a given block weight (additional outputs may be added on top to build fee)
   constexpr uint64_t tx_weight_target(uint64_t bytes) { return bytes*2/3; }
 
-  std::string get_default_ringdb_path()
+  fs::path get_default_ringdb_path()
   {
     // remove .beldex, replace with .shared-ringdb
-    return tools::path_to_str(tools::get_default_data_dir().replace_filename(".shared-ringdb"));
+    return tools::get_default_data_dir().replace_filename(fs::path{u8".shared-ringdb"});
   }
 
   std::string pack_multisignature_keys(const std::vector<crypto::public_key>& keys, const crypto::secret_key& signer_secret_key)
@@ -299,7 +299,7 @@ struct options {
 
   const command_line::arg_descriptor<std::string, false, true, 3> shared_ringdb_dir = {
     "shared-ringdb-dir", tools::wallet2::tr("Set shared ring database path"),
-    get_default_ringdb_path(),
+    tools::path_to_str(get_default_ringdb_path()),
     {{ &testnet, &devnet, &regtest }},
     [](std::array<bool, 3> test_dev_fake, bool defaulted, std::string val)->std::string {
       if (test_dev_fake[0])
@@ -3088,7 +3088,8 @@ void wallet2::cancel_long_poll()
   m_long_poll_client.cancel();
 }
 
-template <typename It, std::enable_if_t<std::is_same_v<crypto::hash, std::remove_const_t<typename It::value_type>>, int> = 0>
+template <typename It>
+requires std::is_same_v<crypto::hash, std::remove_cv_t<typename It::value_type>>
 static std::vector<std::string> hashes_to_hex(It begin, It end)
 {
   std::vector<std::string> hexes;
@@ -5964,7 +5965,7 @@ void wallet2::store_to(const fs::path &path, const epee::wipeable_string &passwo
     new_file += ".new";
 
     try {
-      fs::ofstream ostr{new_file, std::ios_base::binary | std::ios_base::trunc};
+      std::ofstream ostr{new_file, std::ios_base::binary | std::ios_base::trunc};
       serialization::binary_archiver oar{ostr};
       serialization::serialize(oar, *cache_file_data);
     } catch (const std::exception& e) {

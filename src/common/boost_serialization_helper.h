@@ -43,7 +43,7 @@ namespace tools
   bool serialize_obj_to_file(T& obj, const fs::path& file_path)
   {
     TRY_ENTRY();
-    fs::ofstream data_file{file_path, std::ios::binary | std::ios::trunc};
+    std::ofstream data_file{file_path, std::ios::binary | std::ios::trunc};
     if (data_file.fail())
       return false;
 
@@ -63,7 +63,7 @@ namespace tools
   {
     TRY_ENTRY();
 
-    fs::ifstream data_file{file_path, std::ios_base::binary};
+    std::ifstream data_file{file_path, std::ios_base::binary};
     if (data_file.fail())
       return false;
     try

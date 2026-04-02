@@ -137,13 +137,14 @@
  *       static constexpr bool binary_serializable = true;
  *     };
  *
- * Technique 2: explicitly specialize the serializable::binary_serializable<T> with a true value:
+ * Technique 2: explicitly specialize the serializable::binary_serializable<T> constexpr:
  *
  *     namespace x {
  *     struct MyType { ... };
  *     }
  *     BLOB_SERIALIZER(x::MyType);
- *     // equivalent to:  namespace serialization { template<> constexpr bool binary_serializable<x::MyType> = true; }
+ *     // equivalent to:
+ *     namespace serialization { template<> constexpr binary_serializable<x::MyType> = true; }
  *
  * Be very careful with binary serialization: there are myriad ways in which binary object dumps can
  * be non-portable.
@@ -160,18 +161,18 @@ namespace serialization {
 
 using namespace std::literals;
 
+template <class Archive>
+concept serializing = Archive::is_serializer;
+template <class Archive>
+concept deserializing = Archive::is_deserializer;
+
 /** serialization::binary_serializable<T>
  *
- * an specializable constexpr bool for indicating a byte-serializable type.  Default to false.
- */
-template <typename T, typename = void>
-constexpr bool binary_serializable = false;
-
-/** serialization::binary_serializable partial specialization for types with a
- * T::binary_serializable.
+ * a specializable constexpr for indicating a byte-serializable type.  You can specialize this *or*
+ * provide a `binary_serializable` constexpr static bool member.
  */
 template <typename T>
-constexpr bool binary_serializable<T, std::enable_if_t<T::binary_serializable>> = T::binary_serializable;
+constexpr bool binary_serializable = false;
 
 /// Macro to add a specialization.  Must be used out of the namespace.
 #define BLOB_SERIALIZER(T) namespace serialization { template <> inline constexpr bool binary_serializable<T> = true; }
@@ -180,20 +181,20 @@ constexpr bool binary_serializable<T, std::enable_if_t<T::binary_serializable>> 
 namespace detail {
 
 /// True if `void serialize_value(ar, t)` exists for non-const `ar` and `t`
-template <typename Archive, typename T, typename = void>
-constexpr bool has_free_serialize_value = false;
+template <typename T, typename Archive>
+concept free_serializable_value = requires(Archive& a, T v) { serialize_value(a, v); };
 
-template <typename Archive, typename T>
-constexpr bool has_free_serialize_value<Archive, T, std::enable_if_t<std::is_void_v<
-    decltype(serialize_value(std::declval<Archive&>(), std::declval<T&>()))>>> = true;
+/// Likewise, for `serialize_object(ar, t)`.
+template <typename T, typename Archive>
+concept free_serializable_object = requires(Archive& a, T v) { serialize_object(a, v); };
 
 /// True if `t.serialize_value(ar)` exists (and returns void) for non-const `ar` and `t`
-template <typename Archive, typename T, typename = void>
-constexpr bool has_memfn_serialize_value = false;
+template <typename T, typename Archive>
+concept memfn_serializable_value = requires(Archive& a, T v) { v.serialize_value(a); };
 
-template <typename Archive, typename T>
-constexpr bool has_memfn_serialize_value<Archive, T, std::enable_if_t<std::is_void_v<
-    decltype(std::declval<T>().serialize_value(std::declval<Archive&>()))>>> = true;
+/// Likewise, for `t.serialize_object(ar)`.
+template <typename T, typename Archive>
+concept memfn_serializable_object = requires(Archive& a, T v) { v.serialize_object(a); };
 
 }
 
@@ -201,14 +202,15 @@ constexpr bool has_memfn_serialize_value<Archive, T, std::enable_if_t<std::is_vo
 /// Serialization functions.  These are used to add/read a value to/from an ongoing serialization.
 
 // Integer serializer
-template <class Archive, typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+template <class Archive, std::integral T>
 void value(Archive& ar, T& v)
 {
   ar.serialize_int(v);
 }
 
 // Blob serialization
-template <class Archive, typename T, std::enable_if_t<binary_serializable<T>, int> = 0>
+template <class Archive, typename T>
+    requires T::binary_serializable || binary_serializable<T>
 void value(Archive& ar, T& v)
 {
   static_assert(std::has_unique_object_representations_v<T> || epee::is_byte_spannable<T>, "Type is not safe for binary serialization");
@@ -216,17 +218,33 @@ void value(Archive& ar, T& v)
 }
 
 // Serializes some non-integer, non-binary value, when a `serialize_value(ar, x)` exists.
-template <class Archive, typename T, std::enable_if_t<detail::has_free_serialize_value<Archive, T>, int> = 0>
+template <class Archive, detail::free_serializable_value<Archive> T>
 void value(Archive& ar, T& v)
 {
   serialize_value(ar, v);
 }
 
+// Serializes some non-integer, non-binary value, when a `serialize_object(ar, x)` exists.
+template <class Archive, detail::free_serializable_object<Archive> T>
+void value(Archive& ar, T& v)
+{
+  auto o = ar.begin_object();
+  serialize_object(ar, v);
+}
+
 // Serializes some non-integer, non-binary value, when a `x.serialize_value(ar)` exists.
-template <class Archive, typename T, std::enable_if_t<detail::has_memfn_serialize_value<Archive, T>, int> = 0>
+template <class Archive, detail::memfn_serializable_value<Archive> T>
 void value(Archive& ar, T& v)
 {
   v.serialize_value(ar);
+}
+
+// Serializes some non-integer, non-binary value, when a `x.serialize_object(ar)` exists.
+template <class Archive, detail::memfn_serializable_object<Archive> T>
+void value(Archive& ar, T& v)
+{
+  auto o = ar.begin_object();
+  v.serialize_object(ar);
 }
 
 // Helper bool used in the serialize() fallback to annotate what went wrong.  (Templatized so that
@@ -234,8 +252,7 @@ void value(Archive& ar, T& v)
 template <typename T>
 constexpr bool TYPE_IS_NOT_SERIALIZABLE = false;
 
-template <class Archive, typename T, std::enable_if_t<!std::is_integral_v<T> && !binary_serializable<T> &&
-  !detail::has_free_serialize_value<Archive, T> && !detail::has_memfn_serialize_value<Archive, T>, int> = 0>
+template <class Archive, typename T>
 void value(Archive& ar, T& v)
 {
   static_assert(!std::is_const_v<T> && TYPE_IS_NOT_SERIALIZABLE<T>,
@@ -245,7 +262,7 @@ void value(Archive& ar, T& v)
 // Serializes some value with a predicate that must be satisfied when deserializing.  If the
 // predicate fails the value serialization raises an exception.  The predicate is invoked (during
 // deserialization) with a reference to `v` (which has already been updated).
-template <class Archive, typename T, typename Predicate>
+template <class Archive, typename T, std::predicate<const T&> Predicate>
 void value(Archive& ar, T& v, Predicate test)
 {
   value(ar, v);
@@ -254,14 +271,15 @@ void value(Archive& ar, T& v, Predicate test)
 }
 
 /// Serializes an integer value using varint encoding.
-template <class Archive, typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+template <class Archive, std::integral T>
 void varint(Archive& ar, T& val)
 {
   ar.serialize_varint(val);
 }
 
 /// Serializes an enum value using varint encoding of the underlying integer value.
-template <class Archive, typename T, std::enable_if_t<std::is_enum_v<T>, int> = 0>
+template <class Archive, typename T>
+    requires std::is_enum_v<T>
 void varint(Archive& ar, T& val)
 {
   using UType = std::underlying_type_t<T>;
@@ -276,7 +294,8 @@ void varint(Archive& ar, T& val)
 }
 
 /// Serializes an integer or enum value using varint encoding with a Predicate (see value()).
-template <class Archive, typename T, typename Predicate, std::enable_if_t<std::is_integral_v<T> || std::is_enum_v<T>, int> = 0>
+template <class Archive, typename T, std::predicate<const T&> Predicate>
+    requires std::is_integral_v<T> || std::is_enum_v<T>
 void varint(Archive& ar, T& val, Predicate test)
 {
   varint(ar, val);
@@ -296,7 +315,7 @@ void field(Archive& ar, [[maybe_unused]] std::string_view name, T& val)
 }
 
 /// Adds a key-value pair with a predicate.
-template <class Archive, typename T, typename Predicate>
+template <class Archive, typename T, std::predicate<const T&> Predicate>
 void field(Archive& ar, [[maybe_unused]] std::string_view name, T& val, Predicate&& test)
 {
   if constexpr (Archive::is_serializer)
@@ -307,7 +326,8 @@ void field(Archive& ar, [[maybe_unused]] std::string_view name, T& val, Predicat
 
 /// Serializes a key-value pair where the value is an integer or an enum using varint encoding of
 /// the value.
-template <class Archive, typename T, std::enable_if_t<std::is_integral_v<T> || std::is_enum_v<T>, int> = 0>
+template <class Archive, typename T>
+    requires std::is_integral_v<T> || std::is_enum_v<T>
 void field_varint(Archive& ar, [[maybe_unused]] std::string_view name, T& val)
 {
   if constexpr (Archive::is_serializer)
@@ -318,7 +338,8 @@ void field_varint(Archive& ar, [[maybe_unused]] std::string_view name, T& val)
 
 /// Serializes using field_varint(ar,name,val) with an additional predicate that must be satisfied
 /// when deserializing.
-template <class Archive, typename T, typename Predicate, std::enable_if_t<std::is_integral_v<T> || std::is_enum_v<T>, int> = 0>
+template <class Archive, typename T, std::predicate<const T&> Predicate>
+    requires std::is_integral_v<T> || std::is_enum_v<T>
 void field_varint(Archive& ar, [[maybe_unused]] std::string_view name, T& val, Predicate&& test)
 {
   if constexpr (Archive::is_serializer)

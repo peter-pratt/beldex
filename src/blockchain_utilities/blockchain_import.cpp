@@ -242,7 +242,7 @@ int import_from_file(cryptonote::core& core, const fs::path& import_file_path, u
 
   std::cout << "\nPreparing to read blocks...\n\n";
 
-  fs::ifstream import_file{import_file_path, std::ios::binary};
+  std::ifstream import_file{import_file_path, std::ios::binary};
 
   if (import_file.fail())
   {

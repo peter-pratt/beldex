@@ -244,7 +244,8 @@ namespace cryptonote
   }
 
   // load
-  template <class Archive, std::enable_if_t<Archive::is_deserializer, int> = 0>
+  template <class Archive>
+  requires (Archive::is_deserializer)
   void serialize_value(Archive& ar, tx_extra_merge_mining_tag& mm)
   {
     // MM tag gets binary-serialized into a string, and then that string gets serialized (as a
@@ -257,7 +258,8 @@ namespace cryptonote
   }
 
   // store
-  template <class Archive, std::enable_if_t<Archive::is_serializer, int> = 0>
+  template <class Archive>
+  requires (Archive::is_serializer)
   void serialize_value(Archive& ar, tx_extra_merge_mining_tag& mm)
   {
     // As above: first we binary-serialize into a string, then we serialize the string.

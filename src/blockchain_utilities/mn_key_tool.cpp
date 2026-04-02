@@ -90,8 +90,8 @@ std::array<unsigned char, crypto_core_ed25519_BYTES> pubkey_from_privkey(ustring
     crypto_scalarmult_ed25519_base_noclamp(pubkey.data(), privkey.data());
     return pubkey;
 }
-template <size_t N, std::enable_if_t<(N >= 32), int> = 0>
-std::array<unsigned char, crypto_core_ed25519_BYTES> pubkey_from_privkey(const std::array<unsigned char, N>& privkey) {
+template <size_t N>
+requires(N >= 32) std::array<unsigned char, crypto_core_ed25519_BYTES> pubkey_from_privkey(const std::array<unsigned char, N>& privkey) {
     return pubkey_from_privkey(ustring_view{privkey.data(), 32});
 }
 
@@ -190,7 +190,7 @@ int show(std::list<std::string_view> args) {
         return error(2, "unknown arguments to 'show'");
 
     fs::path filename = tools::utf8_path(args.front());
-    fs::ifstream in{filename, std::ios::binary};
+    std::ifstream in{filename, std::ios::binary};
     if (!in.good())
         return error(2, "Unable to open '" + tools::path_to_str(filename) + "': " + std::strerror(errno));
 
@@ -239,7 +239,7 @@ int show(std::list<std::string_view> args) {
     if (0 != crypto_sign_ed25519_pk_to_curve25519(x_pubkey.data(), pubkey.data()))
         return error(14, "Unable to convert Ed25519 pubkey to X25519 pubkey; is this a really valid secret key?");
 
-    std::cout << filename << " (Ed25519 MN keypair)" << "\n==========" <<
+    std::cout << tools::path_to_str(filename) << " (Ed25519 MN keypair)" << "\n==========" <<
         "\nSecret key:      " << oxenc::to_hex(seckey.begin(), seckey.begin() + 32) <<
         "\nPublic key:      " << oxenc::to_hex(pubkey.begin(), pubkey.end()) <<
         "\nX25519 pubkey:   " << oxenc::to_hex(x_pubkey.begin(), x_pubkey.end()) <<
@@ -321,7 +321,7 @@ int restore(bool ed25519, std::list<std::string_view> args) {
     if (!overwrite && fs::exists(filepath))
         return error(2, filename + " to generate already exists, pass `--overwrite' if you want to overwrite it");
 
-    fs::ofstream out{filepath, std::ios::trunc | std::ios::binary};
+    std::ofstream out{filepath, std::ios::trunc | std::ios::binary};
     if (!out.good())
         return error(2, "Failed to open output file '" + filename + "': " + std::strerror(errno));
     if (ed25519)

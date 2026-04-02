@@ -225,7 +225,7 @@ int main(int argc, char const * argv[])
     {
       try
       {
-        fs::ifstream cfg{*load_config};
+        std::ifstream cfg{*load_config};
         if (!cfg.is_open())
           throw std::runtime_error{"Unable to open file"};
         po::store(po::parse_config_file<char>(

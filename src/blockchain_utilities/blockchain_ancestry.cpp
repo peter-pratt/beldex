@@ -469,7 +469,7 @@ int main(int argc, char* argv[])
 
   fs::path state_file_path = tools::utf8_path(opt_data_dir) / "ancestry-state.bin";
   LOG_PRINT_L0("Loading state data from " << state_file_path);
-  fs::ifstream state_data_in;
+  std::ifstream state_data_in;
   state_data_in.open(state_file_path, std::ios_base::binary | std::ios_base::in);
   if (!state_data_in.fail())
   {

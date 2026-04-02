@@ -30,9 +30,12 @@
 // Parts of this file are originally copyright (c) 2012-2013 The Cryptonote developers
 //
 #include "file.h"
+#include <fmt/std.h>
 #include "epee/misc_log_ex.h"
 #include <unistd.h>
 #include <cstdio>
+#include <string_view>
+#include "common/string_util.h"
 
 #ifdef WIN32
 #include "epee/string_tools.h"
@@ -276,18 +279,20 @@ namespace tools {
 #ifdef _WIN32
     return get_special_folder_path(CSIDL_COMMON_APPDATA, true);
 #else
-    char* home = std::getenv("HOME");
-    return home && std::strlen(home) ? tools::utf8_path(home) : fs::current_path();
+    auto home = std::getenv("HOME");
+    return home && std::strlen(home)
+                 ? fs::path{std::u8string_view{reinterpret_cast<const char8_t*>(home)}}
+                 : fs::current_path();
 #endif
   }
 
   fs::path get_default_data_dir()
   {
-    return get_default_parent_dir() / tools::utf8_path(cryptonote::DATA_DIRNAME);
+    return get_default_parent_dir() / cryptonote::DATA_DIRNAME;
   }
   fs::path get_depreciated_default_data_dir()
   {
-    return get_default_parent_dir() / tools::utf8_path(cryptonote::DATA_DIRNAME);
+    return get_default_parent_dir() / cryptonote::DATA_DIRNAME;
   }
 
   void set_strict_default_file_permissions(bool strict)

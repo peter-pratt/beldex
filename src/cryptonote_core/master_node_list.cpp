@@ -2310,9 +2310,6 @@ namespace master_nodes
     {
       auto oldest_waiting = std::make_tuple(std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint32_t>::max(), crypto::null_pkey);
 
-      // NOTE: master_nodes_infos is an unordered_map — iteration order is
-      // non-deterministic. We must sort by key first to guarantee the same
-      // winner is selected deterministically across all platforms and C++ versions.
       std::vector<std::pair<crypto::public_key, const master_node_info*>> sorted_infos;
       sorted_infos.reserve(master_nodes_infos.size());
       for (const auto &info_it : master_nodes_infos)
@@ -2408,38 +2405,12 @@ namespace master_nodes
     // original amount, i.e. 50% of the original base reward goes to master
     // nodes not 50% of the reward after removing the governance component (the
     // adjusted base reward post hardfork 10).
-    // payout const block_leader = m_state.get_block_leader();
-
-    // Need state at height-1 (before this block was added):
-    payout block_leader = {};
-    if (m_state.height == height - 1)
-    {
-        // m_state is at previous block height — correct state to use directly
-        block_leader = m_state.get_block_leader();
-    }
-    else
-    {
-        // m_state has advanced past this block — look up state at height-2
-        auto it = m_transient.state_history.find(height - 2);
-        if (it != m_transient.state_history.end())
-            block_leader = it->get_block_leader();
-        else
-            block_leader = m_state.get_block_leader(); // fallback
-    }
-
-    MWARNING("DEBUG validate_miner_tx: height=" << height 
-             << " m_state.height=" << m_state.height
-             << " block_leader.key=" << tools::type_to_hex(block_leader.key));
+    payout const block_leader = m_state.get_block_leader();
     {
       auto const check_block_leader_pubkey = cryptonote::get_master_node_winner_from_tx_extra(miner_tx.extra);
-      MWARNING("DEBUG check_block_leader_pubkey=" << tools::type_to_hex(check_block_leader_pubkey));
-      // if (block_leader.key != check_block_leader_pubkey)
-      if (memcmp(&block_leader.key, &check_block_leader_pubkey, sizeof(crypto::public_key)) != 0)
+      if (block_leader.key != check_block_leader_pubkey)
       {
-        // throw std::runtime_error{fmt::format("Master node reward winner is incorrect! Expected {}, block has {} " , block_leader.key , check_block_leader_pubkey)};
-        throw std::runtime_error{fmt::format("Master node reward winner is incorrect! Expected {}, block has {}",
-            tools::type_to_hex(block_leader.key),
-            tools::type_to_hex(check_block_leader_pubkey))};
+        throw std::runtime_error{fmt::format("Master node reward winner is incorrect! Expected {}, block has {} " , block_leader.key , check_block_leader_pubkey)};
       }
     }
 

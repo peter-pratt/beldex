@@ -477,7 +477,7 @@ mdb_threadinfo::~mdb_threadinfo()
     mdb_txn_abort(m_ti_rtxn);
 }
 
-mdb_txn_safe::mdb_txn_safe(const bool check) : m_txn(NULL), m_tinfo(NULL), m_check(check)
+mdb_txn_safe::mdb_txn_safe(const bool check) : m_tinfo(NULL), m_txn(NULL), m_check(check)
 {
   if (check)
   {
@@ -4666,7 +4666,6 @@ void BlockchainLMDB::fixup(cryptonote::network_type nettype)
   {
     uint64_t const BLOCKS_PER_BATCH     = 10000;
     uint64_t num_blocks                 = height() - 1;
-    uint64_t const blocks_in_last_batch = num_blocks % BLOCKS_PER_BATCH;
     uint64_t const num_batches          = (num_blocks + (BLOCKS_PER_BATCH - 1)) / BLOCKS_PER_BATCH;
 
     uint64_t curr_cumulative_diff = 1;
@@ -5324,11 +5323,10 @@ void BlockchainLMDB::migrate_0_1()
 void BlockchainLMDB::migrate_1_2()
 {
   LOG_PRINT_L3("BlockchainLMDB::" << __func__);
-  uint64_t i, z;
+  uint64_t i;
   int result;
   mdb_txn_safe txn(false);
   MDB_val k, v;
-  char *ptr;
 
   MGINFO_YELLOW("Migrating blockchain from DB version 1 to 2 - this may take a while:");
   MINFO("updating txs_pruned and txs_prunable tables...");

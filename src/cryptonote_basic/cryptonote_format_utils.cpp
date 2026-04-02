@@ -39,6 +39,8 @@
 #include "epee/string_tools.h"
 #include "common/i18n.h"
 #include "common/meta.h"
+#include "common/string_util.h"
+#include <fmt/format.h>
 #include "serialization/string.h"
 #include "serialization/binary_utils.h"
 #include "cryptonote_format_utils.h"
@@ -69,8 +71,8 @@ namespace cryptonote
   // a copy of rct::addKeys, since we can't link to libringct to avoid circular dependencies
   static void add_public_key(crypto::public_key &AB, const crypto::public_key &A, const crypto::public_key &B) {
       ge_p3 B2, A2;
-      CHECK_AND_ASSERT_THROW_MES_L1(ge_frombytes_vartime(&B2, &B) == 0, "ge_frombytes_vartime failed at "+boost::lexical_cast<std::string>(__LINE__));
-      CHECK_AND_ASSERT_THROW_MES_L1(ge_frombytes_vartime(&A2, &A) == 0, "ge_frombytes_vartime failed at "+boost::lexical_cast<std::string>(__LINE__));
+      CHECK_AND_ASSERT_THROW_MES_L1(ge_frombytes_vartime(&B2, &B) == 0, fmt::format("ge_frombytes_vartime failed at {}", __LINE__));
+      CHECK_AND_ASSERT_THROW_MES_L1(ge_frombytes_vartime(&A2, &A) == 0, fmt::format("ge_frombytes_vartime failed at {}", __LINE__));
       ge_cached tmp2;
       ge_p3_to_cached(&tmp2, &B2);
       ge_p1p1 tmp3;
@@ -92,9 +94,11 @@ namespace cryptonote
       ++nlr;
     nlr += 6;
     const size_t bp_size = 32 * ((plus ? 6 : 9) + 2 * nlr);
-    CHECK_AND_ASSERT_THROW_MES_L1(n_outputs <= TX_BULLETPROOF_MAX_OUTPUTS, "maximum number of outputs is " + std::to_string(TX_BULLETPROOF_MAX_OUTPUTS) + " per transaction");
-    CHECK_AND_ASSERT_THROW_MES_L1(bp_base * n_padded_outputs >= bp_size, "Invalid bulletproof clawback: bp_base " + std::to_string(bp_base) + ", n_padded_outputs "
-        + std::to_string(n_padded_outputs) + ", bp_size " + std::to_string(bp_size));
+    CHECK_AND_ASSERT_THROW_MES_L1(n_outputs <= TX_BULLETPROOF_MAX_OUTPUTS, fmt::format("maximum number of outputs is {} per transaction", TX_BULLETPROOF_MAX_OUTPUTS));
+    CHECK_AND_ASSERT_THROW_MES_L1(bp_base * n_padded_outputs >= bp_size, fmt::format("Invalid bulletproof clawback: bp_base {}, n_padded_outputs {}, bp_size {}",
+            bp_base,
+            n_padded_outputs,
+            bp_size));
     const uint64_t bp_clawback = (bp_base * n_padded_outputs - bp_size) * 4 / 5;
     return bp_clawback;
   }
@@ -512,7 +516,9 @@ namespace cryptonote
 
     // clawback
     uint64_t bp_clawback = get_transaction_weight_clawback(tx, n_padded_outputs);
-    CHECK_AND_ASSERT_THROW_MES_L1(bp_clawback <= std::numeric_limits<uint64_t>::max() - weight, "Weight overflow");
+    CHECK_AND_ASSERT_THROW_MES_L1(bp_clawback <= std::numeric_limits<uint64_t>::max() - weight,
+            fmt::format("Weight overflow {}",
+            bp_clawback));
     weight += bp_clawback;
 
     return weight;

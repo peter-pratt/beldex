@@ -75,14 +75,14 @@ public:
   }
 
   /// Serializes a signed integer (by reinterpreting it as unsigned on the wire)
-  template <class T, std::enable_if_t<std::is_integral_v<T> && std::is_signed_v<T>, int> = 0>
+  template <std::signed_integral T>
   void serialize_int(T &v)
   {
     serialize_int(reinterpret_cast<std::make_unsigned_t<T>&>(v));
   }
 
   /// Serializes an unsigned integer
-  template <class T, std::enable_if_t<std::is_integral_v<T> && std::is_unsigned_v<T>, int> = 0>
+  template <std::unsigned_integral T>
   void serialize_int(T &v)
   {
     stream_.read(reinterpret_cast<char*>(&v), sizeof(T));
@@ -185,13 +185,13 @@ public:
     enable_stream_exceptions();
   }
 
-  template <class T, std::enable_if_t<std::is_integral_v<T> && std::is_signed_v<T>, int> = 0>
+  template <std::signed_integral T>
   void serialize_int(T v)
   {
     serialize_int(static_cast<std::make_unsigned_t<T>>(v));
   }
 
-  template <class T, std::enable_if_t<std::is_integral_v<T> && std::is_unsigned_v<T>, int> = 0>
+  template <std::unsigned_integral T>
   void serialize_int(T v)
   {
     if constexpr (sizeof(T) > 1)
@@ -204,13 +204,13 @@ public:
     stream_.write(static_cast<const char*>(buf), len);
   }
 
-  template <class T, std::enable_if_t<std::is_integral_v<T> && std::is_signed_v<T>, int> = 0>
+  template <std::signed_integral T>
   void serialize_varint(T v)
   {
     serialize_varint(static_cast<std::make_unsigned_t<T>>(v));
   }
 
-  template <class T, std::enable_if_t<std::is_integral_v<T> && std::is_unsigned_v<T>, int> = 0>
+  template <std::unsigned_integral T>
   void serialize_varint(T v)
   {
     tools::write_varint(std::ostreambuf_iterator{stream_}, v);

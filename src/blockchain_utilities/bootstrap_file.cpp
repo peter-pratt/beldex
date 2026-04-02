@@ -326,7 +326,7 @@ bool BootstrapFile::store_blockchain_raw(Blockchain* _blockchain_storage, tx_mem
   return BootstrapFile::close();
 }
 
-uint64_t BootstrapFile::seek_to_first_chunk(fs::ifstream& import_file)
+uint64_t BootstrapFile::seek_to_first_chunk(std::ifstream& import_file)
 {
   uint32_t file_magic;
 
@@ -386,7 +386,7 @@ uint64_t BootstrapFile::seek_to_first_chunk(fs::ifstream& import_file)
   return full_header_size;
 }
 
-uint64_t BootstrapFile::count_bytes(fs::ifstream& import_file, uint64_t blocks, uint64_t& h, bool& quit)
+uint64_t BootstrapFile::count_bytes(std::ifstream& import_file, uint64_t blocks, uint64_t& h, bool& quit)
 {
   uint64_t bytes_read = 0;
   uint32_t chunk_size;
@@ -462,7 +462,7 @@ uint64_t BootstrapFile::count_blocks(const fs::path& import_file_path, std::stre
     MFATAL("bootstrap file not found: " << import_file_path);
     throw std::runtime_error("Aborting");
   }
-  fs::ifstream import_file{import_file_path, std::ios::binary};
+  std::ifstream import_file{import_file_path, std::ios::binary};
 
   uint64_t start_height = seek_height;
   uint64_t h = 0;

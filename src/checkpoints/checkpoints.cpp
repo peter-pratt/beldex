@@ -30,6 +30,7 @@
 // Parts of this file are originally copyright (c) 2012-2013 The Cryptonote developers
 
 #include "checkpoints.h"
+#include <fmt/std.h>
 
 #include "epee/string_tools.h"
 #include "epee/storages/portable_storage_template_helper.h" // epee json include
