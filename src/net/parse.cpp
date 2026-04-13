@@ -70,9 +70,9 @@ namespace net
 
         if (host_str.empty())
             return make_error_code(net::error::invalid_host);
-        if (tools::ends_with(host_str, ".onion"))
+        if (host_str.ends_with(".onion"))
             return tor_address::make(address, default_port);
-        if (tools::ends_with(host_str, ".i2p"))
+        if (host_str.ends_with(".i2p"))
             return i2p_address::make(address, default_port);
 
         boost::system::error_code ec;

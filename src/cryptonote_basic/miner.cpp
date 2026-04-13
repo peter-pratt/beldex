@@ -255,8 +255,8 @@ namespace cryptonote
   void miner::pause()
   {
     std::unique_lock lock{m_miners_count_mutex};
-    MDEBUG("miner::pause: " << m_pausers_count << " -> " << (m_pausers_count + 1));
-    ++m_pausers_count;
+    auto was = m_pausers_count++;
+    MDEBUG("miner::pause: " << was << " -> " << m_pausers_count.load());
     if(m_pausers_count == 1 && is_mining())
       MDEBUG("MINING PAUSED");
   }
@@ -264,8 +264,8 @@ namespace cryptonote
   void miner::resume()
   {
     std::unique_lock lock{m_miners_count_mutex};
-    MDEBUG("miner::resume: " << m_pausers_count << " -> " << (m_pausers_count - 1));
-    --m_pausers_count;
+    auto was = m_pausers_count--;
+    MDEBUG("miner::resume: " << was << " -> " << m_pausers_count.load());
     if(m_pausers_count < 0)
     {
       m_pausers_count = 0;

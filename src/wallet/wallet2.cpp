@@ -408,7 +408,7 @@ std::unique_ptr<tools::wallet2> make_basic(const boost::program_options::variabl
 
   // Deprecated --daemon-ssl option: prepend https:// if there is no protocol on the daemon address
   if (command_line::get_arg(vm, opts.daemon_ssl) == "enabled") {
-    THROW_WALLET_EXCEPTION_IF(tools::starts_with(daemon_address, "http://"), tools::error::wallet_internal_error,
+    THROW_WALLET_EXCEPTION_IF(daemon_address.starts_with("http://"), tools::error::wallet_internal_error,
         "Deprecated --daemon-ssl=enabled option conflicts with http://... daemon URL");
     if (!std::regex_search(daemon_address, protocol_re))
       daemon_address.insert(0, "https://"sv);
@@ -1257,7 +1257,7 @@ std::string wallet2::get_default_daemon_address() {
 bool wallet2::set_daemon(std::string daemon_address, std::optional<tools::login> daemon_login, std::string proxy, bool trusted_daemon)
 {
   // If we're given a raw address, prepend http, and (possibly) append the default port
-  if (!tools::starts_with(daemon_address, "http://") && !tools::starts_with(daemon_address, "https://"))
+  if (!daemon_address.starts_with("http://") && !daemon_address.starts_with("https://"))
   {
     if (auto pos = daemon_address.find(':'); pos == std::string::npos)
       daemon_address += ":" + std::to_string(cryptonote::get_config(m_nettype).RPC_DEFAULT_PORT);
@@ -5154,7 +5154,7 @@ std::string wallet2::exchange_multisig_keys(const epee::wipeable_string &passwor
   THROW_WALLET_EXCEPTION_IF(info.empty(),
     error::wallet_internal_error, "Empty multisig info");
 
-  if (!tools::starts_with(info[0], MULTISIG_EXTRA_INFO_MAGIC))
+  if (!info[0].starts_with(MULTISIG_EXTRA_INFO_MAGIC))
   {
     THROW_WALLET_EXCEPTION(
       error::wallet_internal_error, "Unsupported info string");
@@ -5430,7 +5430,7 @@ std::string wallet2::get_multisig_info() const
 
 bool wallet2::verify_multisig_info(const std::string &data, crypto::secret_key &skey, crypto::public_key &pkey)
 {
-  if (!tools::starts_with(data, MULTISIG_MAGIC))
+  if (!data.starts_with(MULTISIG_MAGIC))
   {
     MERROR("Multisig info header check error");
     return false;
@@ -5467,7 +5467,7 @@ bool wallet2::verify_multisig_info(const std::string &data, crypto::secret_key &
 
 bool wallet2::verify_extra_multisig_info(const std::string &data, std::unordered_set<crypto::public_key> &pkeys, crypto::public_key &signer)
 {
-  if (!tools::starts_with(data, MULTISIG_EXTRA_INFO_MAGIC))
+  if (!data.starts_with(MULTISIG_EXTRA_INFO_MAGIC))
   {
     MERROR("Multisig info header check error");
     return false;
@@ -5632,7 +5632,7 @@ bool wallet2::check_connection(rpc::version_t *version, bool *ssl, bool throw_on
   }
 
   if (ssl)
-    *ssl = tools::starts_with(m_http_client.get_base_url(), "https://");
+    *ssl = m_http_client.get_base_url().starts_with("https://");
 
   if (!m_rpc_version)
   {
@@ -7076,7 +7076,7 @@ bool wallet2::load_unsigned_tx(const fs::path& unsigned_filename, unsigned_tx_se
 //----------------------------------------------------------------------------------------------------
 bool wallet2::parse_unsigned_tx_from_str(std::string_view s, unsigned_tx_set &exported_txs) const
 {
-  if (!tools::starts_with(s, UNSIGNED_TX_PREFIX_NOVER))
+  if (!s.starts_with(UNSIGNED_TX_PREFIX_NOVER))
   {
     LOG_PRINT_L0("Bad magic from unsigned tx");
     return false;
@@ -7360,7 +7360,7 @@ bool wallet2::load_tx(const fs::path& signed_filename, std::vector<tools::wallet
 bool wallet2::parse_tx_from_str(std::string_view s, std::vector<tools::wallet2::pending_tx> &ptx, std::function<bool(const signed_tx_set &)> accept_func)
 {
 
-  if (!tools::starts_with(s, SIGNED_TX_PREFIX_NOVER))
+  if (!s.starts_with(SIGNED_TX_PREFIX_NOVER))
   {
     LOG_PRINT_L0("Bad magic from signed transaction");
     return false;
@@ -7510,7 +7510,7 @@ bool wallet2::save_multisig_tx(const std::vector<pending_tx>& ptx_vector, const 
 //----------------------------------------------------------------------------------------------------
 bool wallet2::parse_multisig_tx_from_str(std::string_view multisig_tx_st, multisig_tx_set &exported_txs) const
 {
-  if (!tools::starts_with(multisig_tx_st, MULTISIG_UNSIGNED_TX_PREFIX))
+  if (!multisig_tx_st.starts_with(MULTISIG_UNSIGNED_TX_PREFIX))
   {
     LOG_PRINT_L0("Bad magic from multisig tx data");
     return false;
@@ -12676,7 +12676,7 @@ std::string wallet2::get_spend_proof(const crypto::hash &txid, std::string_view 
 //----------------------------------------------------------------------------------------------------
 bool wallet2::check_spend_proof(const crypto::hash &txid, std::string_view message, std::string_view sig_str)
 {
-  THROW_WALLET_EXCEPTION_IF(!tools::starts_with(sig_str, SPEND_PROOF_MAGIC),
+  THROW_WALLET_EXCEPTION_IF(!sig_str.starts_with(SPEND_PROOF_MAGIC),
       error::wallet_internal_error, "Signature header check error");
   sig_str.remove_prefix(SPEND_PROOF_MAGIC.size());
 
@@ -13033,10 +13033,10 @@ bool wallet2::check_tx_proof(const crypto::hash &txid, const cryptonote::account
 bool wallet2::check_tx_proof(const cryptonote::transaction &tx, const cryptonote::account_public_address &address, bool is_subaddress, std::string_view message, std::string_view sig_str, uint64_t &received) const
 {
   bool is_out;
-  if (tools::starts_with(sig_str, OUTBOUND_PROOF_MAGIC)) {
+  if (sig_str.starts_with(OUTBOUND_PROOF_MAGIC)) {
     is_out = true;
     sig_str.remove_prefix(OUTBOUND_PROOF_MAGIC.size());
-  } else if (tools::starts_with(sig_str, INBOUND_PROOF_MAGIC)) {
+  } else if (sig_str.starts_with(INBOUND_PROOF_MAGIC)) {
     is_out = false;
     sig_str.remove_prefix(INBOUND_PROOF_MAGIC.size());
   } else {
@@ -13254,7 +13254,7 @@ bool wallet2::check_reserve_proof(const cryptonote::account_public_address &addr
   THROW_WALLET_EXCEPTION_IF(!check_connection(&rpc_version), error::wallet_internal_error, "Failed to connect to daemon: " + get_daemon_address());
   THROW_WALLET_EXCEPTION_IF((rpc_version < rpc::version_t{1, 0}), error::wallet_internal_error, "Daemon RPC version is too old");
 
-  THROW_WALLET_EXCEPTION_IF(tools::starts_with(sig_str, RESERVE_PROOF_MAGIC), error::wallet_internal_error,
+  THROW_WALLET_EXCEPTION_IF(sig_str.starts_with(RESERVE_PROOF_MAGIC), error::wallet_internal_error,
     "Signature header check error");
   sig_str.remove_prefix(RESERVE_PROOF_MAGIC.size());
 
@@ -13600,7 +13600,7 @@ std::string wallet2::sign(std::string_view data, cryptonote::subaddress_index in
 
 bool wallet2::verify(std::string_view data, const cryptonote::account_public_address &address, std::string_view signature)
 {
-  if (!tools::starts_with(signature, SIG_MAGIC)) {
+  if (!signature.starts_with(SIG_MAGIC)) {
     LOG_PRINT_L0("Signature header check error");
     return false;
   }
@@ -13636,7 +13636,7 @@ std::string wallet2::sign_multisig_participant(std::string_view data) const
 
 bool wallet2::verify_with_public_key(std::string_view data, const crypto::public_key &public_key, std::string_view signature) const
 {
-  if (!tools::starts_with(signature, MULTISIG_SIGNATURE_MAGIC)) {
+  if (!signature.starts_with(MULTISIG_SIGNATURE_MAGIC)) {
     MERROR("Signature header check error");
     return false;
   }
@@ -13818,7 +13818,7 @@ uint64_t wallet2::import_key_images_from_file(const fs::path& filename, uint64_t
 
   THROW_WALLET_EXCEPTION_IF(!r, error::wallet_internal_error, std::string(tr("failed to read file ")) + tools::path_to_str(filename));
 
-  if (!tools::starts_with(data, KEY_IMAGE_EXPORT_FILE_MAGIC))
+  if (!data.starts_with(KEY_IMAGE_EXPORT_FILE_MAGIC))
   {
     THROW_WALLET_EXCEPTION(error::wallet_internal_error, std::string("Bad key image export file magic in ") + tools::path_to_str(filename));
   }
@@ -14353,7 +14353,7 @@ size_t wallet2::import_outputs(const std::pair<size_t, std::vector<tools::wallet
 size_t wallet2::import_outputs_from_str(std::string data)
 {
   PERF_TIMER(import_outputs_from_str);
-  if (!tools::starts_with(data, OUTPUT_EXPORT_FILE_MAGIC))
+  if (!data.starts_with(OUTPUT_EXPORT_FILE_MAGIC))
   {
     THROW_WALLET_EXCEPTION(error::wallet_internal_error, std::string("Bad magic from outputs"));
   }
@@ -14604,7 +14604,7 @@ size_t wallet2::import_multisig(std::vector<cryptonote::blobdata> blobs)
   std::unordered_set<crypto::public_key> seen;
   for (cryptonote::blobdata &data: blobs)
   {
-    THROW_WALLET_EXCEPTION_IF(!tools::starts_with(data, MULTISIG_EXPORT_FILE_MAGIC),
+    THROW_WALLET_EXCEPTION_IF(!data.starts_with(MULTISIG_EXPORT_FILE_MAGIC),
         error::wallet_internal_error, "Bad multisig info file magic in ");
 
     data = decrypt_with_view_secret_key(std::string_view{data}.substr(MULTISIG_EXPORT_FILE_MAGIC.size())).view();
@@ -14852,7 +14852,7 @@ std::string uri_decode(std::string_view encoded)
 //----------------------------------------------------------------------------------------------------
 bool wallet2::parse_uri(std::string_view uri, std::string &address, std::string &payment_id, uint64_t &amount, std::string &tx_description, std::string &recipient_name, std::vector<std::string> &unknown_parameters, std::string &error)
 {
-  if (!tools::starts_with(uri, uri_prefix))
+  if (!uri.starts_with(uri_prefix))
   {
     error = "URI has wrong scheme (expected \"" ;
     error += uri_prefix;

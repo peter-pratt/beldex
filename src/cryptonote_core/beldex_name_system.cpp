@@ -851,13 +851,13 @@ bool validate_bns_name(std::string name, std::string *reason)
 
     // Must end with .bdx
     auto constexpr SUFFIX = ".bdx"sv;
-    if (check_condition(!tools::ends_with(name_view, SUFFIX), reason, "Specifies mapping from name->value where the name does not end with the domain .bdx, name=", name))
+    if (check_condition(!name_view.ends_with(SUFFIX), reason, "Specifies mapping from name->value where the name does not end with the domain .bdx, name=", name))
       return false;
 
     name_view.remove_suffix(SUFFIX.size());
 
     // All domains containing '--' as 3rd/4th letter are reserved except for xn-- punycode domains
-    if (check_condition(name_view.size() >= 4 && name_view.substr(2, 2) == "--"sv && !tools::starts_with(name_view, "xn--"sv),
+    if (check_condition(name_view.size() >= 4 && name_view.substr(2, 2) == "--"sv && !name_view.starts_with("xn--"sv),
           reason, "Specifies reserved name `?\?--*.bdx': ", name))
       return false;
 
@@ -971,7 +971,7 @@ bool mapping_value::validate(cryptonote::network_type nettype, mapping_type type
     // We need a 52 char base32z string that decodes to a 32-byte value, which really means we need
     // 51 base32z chars (=255 bits) followed by a 1-bit value ('y'=0, or 'o'=0b10000); anything else
     // in the last spot isn't a valid belnet address.
-    if (check_condition(value.size() != 56 || !tools::ends_with(value, ".bdx") || !oxenc::is_base32z(value.substr(0, 52)) || !(value[51] == 'y' || value[51] == 'o'),
+    if (check_condition(value.size() != 56 || !value.ends_with(".bdx") || !oxenc::is_base32z(value.substr(0, 52)) || !(value[51] == 'y' || value[51] == 'o'),
                 reason, "'", value, "' is not a valid belnet address"))
       return false;
 
@@ -990,7 +990,7 @@ bool mapping_value::validate(cryptonote::network_type nettype, mapping_type type
     if (check_condition(!oxenc::is_hex(value_eth), reason, ", specifies name -> value mapping where the value is not a hex string given value="))
       return false;
 
-    if (check_condition(!tools::starts_with(value, "0x"), reason, "BNS type=eth_addr, specifies mapping from name -> ed25519 key where the key is not prefixed with 0x, given ed25519=", value))
+    if (check_condition(!value.starts_with("0x"), reason, "BNS type=eth_addr, specifies mapping from name -> ed25519 key where the key is not prefixed with 0x, given ed25519=", value))
       return false;
 
     if (blob) // NOTE: Given blob, write the binary output
@@ -1011,7 +1011,7 @@ bool mapping_value::validate(cryptonote::network_type nettype, mapping_type type
       return false;
 
     // NOTE: Bchat public keys are 33 bytes, with the first byte being 0xbd and the remaining 32 being the public key.
-    if (check_condition(!tools::starts_with(value, "bd"), reason, "BNS type=bchat, specifies mapping from name -> ed25519 key where the key is not prefixed with bd, given ed25519=", value))
+    if (check_condition(!value.starts_with("bd"), reason, "BNS type=bchat, specifies mapping from name -> ed25519 key where the key is not prefixed with bd, given ed25519=", value))
       return false;
 
     if (blob) // NOTE: Given blob, write the binary output

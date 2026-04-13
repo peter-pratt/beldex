@@ -181,7 +181,7 @@ std::string short_duration(std::chrono::duration<double> dur);
 template <typename It>
 std::string_view find_prefixed_value(It begin, It end, std::string_view prefix)
 {
-  auto it = std::find_if(begin, end, [&](const auto& s) { return starts_with(s, prefix); });
+  auto it = std::find_if(begin, end, [&](const auto& s) { return s.starts_with(prefix); });
   if (it == end) return {};
   return std::string_view{*it}.substr(prefix.size());
 }

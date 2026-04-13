@@ -5702,7 +5702,7 @@ std::string eat_named_argument(std::vector<std::string> &args, std::string_view 
   std::string result = {};
   for (auto it = args.begin(); it != args.end(); it++)
   {
-    if (it->size() > prefix.size() && tools::starts_with(*it, prefix))
+    if (it->size() > prefix.size() && it->starts_with(prefix))
     {
       result = it->substr(prefix.size());
       args.erase(it);
@@ -6006,7 +6006,7 @@ bool simple_wallet::transfer_main(Transfer transfer_type, const std::vector<std:
     }
     else
     {
-      if (boost::starts_with(local_args[i], "beldex:"))
+      if (local_args[i].starts_with("beldex:"))
         fail_msg_writer() << tr("Invalid last argument: ") << local_args.back() << ": " << error;
       else
         fail_msg_writer() << tr("Invalid last argument: ") << local_args.back();
@@ -6637,11 +6637,11 @@ static std::optional<bns::mapping_type> guess_bns_type(tools::wallet2& wallet, s
 {
   if (typestr.empty())
   {
-    if (tools::ends_with(name, ".bdx") && (tools::ends_with(value, ".bdx") || value.empty()))
+    if (name.ends_with(".bdx") && (value.ends_with(".bdx") || value.empty()))
       return bns::mapping_type::belnet;
-    if (tools::ends_with(name, ".bdx") && tools::starts_with(value, "bd") && value.length() == 2*bns::BCHAT_PUBLIC_KEY_BINARY_LENGTH)
+    if (name.ends_with(".bdx") && value.starts_with("bd") && value.length() == 2*bns::BCHAT_PUBLIC_KEY_BINARY_LENGTH)
       return bns::mapping_type::bchat;
-    if (tools::ends_with(name, ".bdx") && tools::starts_with(value, "0x") && value.substr(2).size() == 2*bns::ETH_ADDR_BINARY_LENGTH)
+    if (name.ends_with(".bdx") && value.starts_with("0x") && value.substr(2).size() == 2*bns::ETH_ADDR_BINARY_LENGTH)
       return bns::mapping_type::eth_addr;
     if (cryptonote::is_valid_address(std::string{value}, wallet.nettype()))
       return bns::mapping_type::wallet;
@@ -10079,7 +10079,7 @@ bool simple_wallet::sign_string(std::string_view value, const subaddress_index& 
     // Print the string directly if it's ascii without control characters, up to 100 bytes, and
     // doesn't contain any doubled, leading, or trailing spaces (because we can't feed those back
     // into verify_value in the cli wallet).
-    bool printable = value.size() <= 100 && !tools::starts_with(value, " ") && !tools::ends_with(value, " ") && value.find("  ") == std::string::npos &&
+    bool printable = value.size() <= 100 && !value.starts_with(" ") && !value.ends_with(" ") && value.find("  ") == std::string::npos &&
         std::all_of(value.begin(), value.end(), [](char x) { return x >= ' ' && x <= '~'; });
 
     success_msg_writer()

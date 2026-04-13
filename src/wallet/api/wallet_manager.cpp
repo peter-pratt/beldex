@@ -193,7 +193,7 @@ std::vector<std::string> WalletManagerImpl::findWallets(std::string_view path_)
 
         LOG_PRINT_L3("Checking filename: " << filename);
 
-        if (filename.extension() == ".keys") {
+        if (filename.extension().u8string() == u8".keys") {
             // if keys file found, checking if there's wallet file itself
             filename.replace_extension();
             if (fs::exists(filename)) {
@@ -214,7 +214,7 @@ std::string WalletManagerImpl::errorString() const
 EXPORT
 void WalletManagerImpl::setDaemonAddress(std::string address)
 {
-    if (!tools::starts_with(address, "https://") && !tools::starts_with(address, "http://"))
+    if (!address.starts_with("https://") && !address.starts_with("http://"))
         address.insert(0, "http://");
     m_http_client.set_base_url(std::move(address));
 }
