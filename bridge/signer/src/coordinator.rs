@@ -1097,12 +1097,10 @@ mod tests {
                     Box::new(|_d: &Duty, _p: &[u8], _s: &[u8]| ExecOutcome::Submitted)
                         as Box<dyn FnMut(&Duty, &[u8], &[u8]) -> ExecOutcome>,
                 );
-                // A settle delay is REQUIRED, not an optimisation: `canonical_signers` is
-                // the lowest `t` of the acks a node currently holds, so two nodes reading
-                // at different moments derive different sets and the mesh barrier
-                // deadlocks. Production sets this > 0 for exactly this reason; 0 only
-                // happened to work here while the leader was node 0.
-                coord.sign_settle_steps = 2;
+                // No settle delay: `canonical_signers` now withholds the set until it is
+                // provably final (session.rs), so correctness no longer depends on a
+                // timing guess. This used to need 2 and still deadlocked for some leaders.
+                coord.sign_settle_steps = 0;
                 Rec { coord, orch: Orchestrator::new(), net: bus.node(i) }
             })
             .collect();

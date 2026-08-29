@@ -279,17 +279,37 @@ impl Session {
         self.acks.iter().map(|&i| i as u16).collect()
     }
 
+    /// Test-only: mark a member excluded (production does this via the stage timeout).
+    #[cfg(test)]
+    pub fn exclude_for_test(&mut self, m: usize) {
+        self.excluded.insert(m);
+    }
+
     /// The **canonical** signing participant set: the lowest `threshold` ACKers in committee
     /// order. Every honest node must feed the *same* set to the scheme driver (its mesh
-    /// barrier waits on exactly those peers), so the rule is a deterministic function of the
-    /// ACK set — and callers must let ACKs settle before reading it (ACKs are broadcast, so
-    /// one full step after reaching `Sign` every live node holds the same set).
-    /// `None` if fewer than `threshold` ACKs are in.
+    /// barrier waits on exactly those peers), so the set is derived from committee index
+    /// rather than ACK arrival order, and is withheld until no lower-indexed member can
+    /// still change it. `None` if fewer than `threshold` ACKs are in, or the set is not
+    /// yet determined.
     pub fn canonical_signers(&self) -> Option<Vec<u16>> {
         if self.acks.len() < self.threshold {
             return None;
         }
-        Some(self.ack_set().into_iter().take(self.threshold).collect())
+        let prefix: Vec<u16> =
+            self.acks.iter().take(self.threshold).map(|&i| i as u16).collect();
+
+        // A lower-indexed member can still ACK and displace a slot, so the prefix is not
+        // final until every one of them has answered. Silent members are excluded by the
+        // stage timeout.
+        let highest = *prefix.last()? as usize;
+        for m in 0..highest {
+            let answered =
+                self.acks.contains(&m) || self.nacks.contains(&m) || self.excluded.contains(&m);
+            if !answered {
+                return None;
+            }
+        }
+        Some(prefix)
     }
 
     fn check_member(&self, m: usize) -> Result<(), SessionError> {
@@ -511,6 +531,53 @@ mod tests {
     fn start_session(n: usize, t: usize) -> Session {
         let c = committee(n, t, 2);
         Session::start(&c, Leg::Pgw, b"release-tx".to_vec(), [7u8; 32], 0).unwrap()
+    }
+
+    /// The signing set must be a function of the SESSION, not of message arrival
+    /// order. Two nodes that received the same ACKs in different orders must derive
+    /// the same set — or the scheme driver's mesh barrier deadlocks, each node waiting
+    /// on peers that are not running the round.
+    #[test]
+    fn canonical_signers_is_independent_of_ack_arrival_order() {
+        // Node A hears 0,1,2,3 ; Node B hears the same ACKs but 5 arrives early.
+        let mut a = start_session(6, 4);
+        for m in [0usize, 1, 2, 3] { a.on_ack(m).unwrap(); }
+
+        let mut b = start_session(6, 4);
+        for m in [5usize, 0, 1, 2, 3] { b.on_ack(m).unwrap(); }
+
+        assert_eq!(a.canonical_signers(), b.canonical_signers(),
+                   "same ACKs, different arrival order -> same set");
+        assert_eq!(a.canonical_signers(), Some(vec![0, 1, 2, 3]));
+    }
+
+    /// While a LOWER-indexed member could still ACK and displace a slot, the set is
+    /// undetermined. Reporting a provisional prefix is what allowed two nodes to
+    /// disagree; `None` makes the caller wait instead.
+    #[test]
+    fn canonical_signers_withholds_while_a_lower_index_may_still_ack() {
+        let mut s = start_session(6, 4);
+        // threshold reached, but member 0 has not answered — it could still ACK and
+        // push member 4 out of the prefix.
+        for m in [1usize, 2, 3, 4] { s.on_ack(m).unwrap(); }
+        assert_eq!(s.canonical_signers(), None, "undetermined while 0 is silent");
+
+        // Once 0 answers either way, the set is final and stable.
+        s.on_ack(0).unwrap();
+        assert_eq!(s.canonical_signers(), Some(vec![0, 1, 2, 3]));
+    }
+
+    /// A silent member must not stall the set forever: exclusion (driven by the stage
+    /// timeout) resolves the gate.
+    #[test]
+    fn canonical_signers_resolves_once_a_silent_member_is_excluded() {
+        let mut s = start_session(6, 4);
+        for m in [1usize, 2, 3, 4] { s.on_ack(m).unwrap(); }
+        assert_eq!(s.canonical_signers(), None);
+
+        s.exclude_for_test(0);
+        assert_eq!(s.canonical_signers(), Some(vec![1, 2, 3, 4]),
+                   "excluded member no longer blocks determination");
     }
 
     #[test]
