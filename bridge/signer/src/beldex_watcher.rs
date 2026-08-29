@@ -116,9 +116,7 @@ pub struct EncMemo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DepositRecord {
     pub beldex_txid: [u8; 32],
-    /// Index of this deposit's gateway output within `beldex_txid`. A single Beldex tx
-    /// may pay the gateway up to `GATEWAY_TX_MAX_OUTPUTS` times, each a separate deposit
-    /// with its own memo and destination, so the tx id alone does not identify one (H-2).
+    /// Which gateway output of `beldex_txid` this deposit is.
     pub output_index: u32,
     pub amount: u128,
     pub height: u64,
@@ -291,14 +289,9 @@ pub struct BeldexWatcher<C: BeldexRpc> {
     gateway_id: String,
     /// Highest height whose deposits we have already finalized.
     finalized_up_to: u64,
-    /// Finalized deposit txids (dedupe across polls).
-    /// Deposits already emitted, keyed on `(beldex_txid, output_index)`.
-    ///
-    /// NOT the txid alone (H-2): a Beldex tx may pay the gateway up to
-    /// `GATEWAY_TX_MAX_OUTPUTS` times, each output a separate deposit with its own memo
-    /// and destination. Keying on the txid dropped every output after the first here —
-    /// before it could ever become a duty — which is the same defect the contract's
-    /// replay guard and the orchestrator's DutyKey were fixed for.
+    /// Deposits already emitted (dedupe across polls), keyed on
+    /// `(beldex_txid, output_index)` — one tx may pay the gateway several times,
+    /// each output a separate deposit.
     seen: BTreeSet<([u8; 32], u32)>,
     /// Escape hatch for chains that produce no master-node checkpoints — see
     /// [`BeldexWatcher::with_fallback_confirmations`]. `None` (the default) means
@@ -477,7 +470,7 @@ mod tests {
         s
     }
 
-    /// H-2: several gateway outputs in ONE Beldex tx are separate deposits. The
+    /// Several gateway outputs in one Beldex tx are separate deposits. The
     /// watcher's `seen` set must key on (txid, output_index) — keying on the txid
     /// alone silently dropped every output after the first, before it could become
     /// a duty. Regression for a real devnet miss.
@@ -495,7 +488,7 @@ mod tests {
         // the dedup key the watcher uses must separate them
         let mut seen = std::collections::BTreeSet::new();
         let kept = recs.iter().filter(|r| seen.insert((r.beldex_txid, r.output_index))).count();
-        assert_eq!(kept, 3, "H-2: all three survive the watcher's seen-set");
+        assert_eq!(kept, 3, "all three survive the watcher's seen-set");
     }
 
     #[test]

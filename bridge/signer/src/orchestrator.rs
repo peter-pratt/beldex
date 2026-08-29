@@ -40,11 +40,7 @@ pub enum DutyKind {
 
 /// The unique identity of a duty: `(kind, 32-byte on-chain id, index within that id)`.
 ///
-/// `sub` exists because a single on-chain transaction can carry several units of value:
-/// an EVM tx may emit several `RedeemToNative` logs, and a Beldex tx may pay the gateway
-/// up to `GATEWAY_TX_MAX_OUTPUTS` times. Keying on the tx id alone collapsed those onto
-/// one duty and silently discarded the rest (H-1 / H-2). The tx id is kept whole rather
-/// than hashed with the index so it stays readable in logs, tombstones and reconciliation.
+/// One transaction can carry several units of value, so the tx id alone is not unique.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DutyKey {
     pub kind: DutyKind,
@@ -63,8 +59,7 @@ pub enum Duty {
 }
 
 impl Duty {
-    /// The dedup key: `(beldex_txid, output_index)` for a mint, `(evm_txid, log_index)`
-    /// for a release — the transaction plus which event inside it.
+    /// `(beldex_txid, output_index)` for a mint, `(evm_txid, log_index)` for a release.
     pub fn key(&self) -> DutyKey {
         match self {
             Duty::Mint(e) => {

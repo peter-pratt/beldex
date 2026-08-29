@@ -10,8 +10,7 @@
 use sha3::{Digest, Keccak256};
 
 /// `mint(address,uint256,bytes32,uint32,bytes)` selector — `keccak256(sig)[..4]`.
-/// H-2: `outputIndex` joined the signature so a deposit is identified by the gateway
-/// OUTPUT, not merely the transaction that carried it.
+/// `outputIndex` identifies the gateway output, not merely the transaction.
 pub const MINT_SELECTOR: [u8; 4] = [0x7f, 0x00, 0x00, 0x0a];
 /// `rotateSigner(address,uint64,bytes)` selector.
 pub const ROTATE_SELECTOR: [u8; 4] = [0xe8, 0xbc, 0x46, 0x89];
@@ -113,8 +112,7 @@ mod tests {
         let txid = [0xCD; 32];
         let cd = build_mint_calldata(to, 1000, txid, 7, &sig);
 
-        // selector + 5 head words + (len word + 65 bytes padded to 96). H-2 added the
-        // outputIndex word, so the head grew 4 -> 5 and the tail offset 0x80 -> 0xa0.
+        // selector + 5 head words + (len word + 65 bytes padded to 96).
         assert_eq!(&cd[0..4], &MINT_SELECTOR);
         assert_eq!(cd.len(), 4 + 32 * 5 + 32 + 96);
 

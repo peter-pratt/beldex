@@ -151,9 +151,7 @@ pub fn decode_redeem_log(
     let inclusion_height = hex_to_u64(field("blockNumber")?).ok_or(DecodeError::BadHex)?;
     let block_hash = hex_to_fixed32(field("blockHash")?).ok_or(DecodeError::BadHex)?;
     let evm_txid = hex_to_fixed32(field("transactionHash")?).ok_or(DecodeError::BadHex)?;
-    // H-1: which burn *within* the transaction. One tx may emit several RedeemToNative
-    // logs (a batching wallet or aggregator), and they differ only here. Without it,
-    // every burn after the first is indistinguishable from a duplicate and is dropped.
+    // Which burn within the transaction — one tx may emit several RedeemToNative logs.
     let log_index = hex_to_u64(field("logIndex")?).ok_or(DecodeError::BadHex)? as u32;
 
     let data = hex_to_bytes(field("data")?).ok_or(DecodeError::BadHex)?;
@@ -528,8 +526,7 @@ mod tests {
         })
     }
 
-    /// H-1: two burns in ONE transaction must decode as two distinct events. Before the
-    /// fix `logIndex` was never read and the second was indistinguishable from the first.
+    /// Two burns in one transaction must decode as two distinct events.
     #[test]
     fn two_burns_in_one_tx_decode_distinctly() {
         let txid = [0xAA; 32];

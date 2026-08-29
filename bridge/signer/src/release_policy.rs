@@ -40,9 +40,8 @@ use crate::watch::ReleaseEvent;
 
 /// The leader's release proposal, broadcast in `Propose` and admitted by R1–R6.
 ///
-/// `log_index` disambiguates multiple burns in one EVM tx. The watcher now carries it
-/// (H-1), so it names the specific burn this proposal discharges rather than being
-/// pinned at 0.
+/// `log_index` disambiguates multiple burns in one EVM tx: the watcher carries it, so a
+/// proposal names the specific burn it discharges rather than being pinned at 0.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseProposal {
     pub version: u8,

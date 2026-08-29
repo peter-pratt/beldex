@@ -58,10 +58,7 @@ pub fn session_key(leg: Leg, epoch: u64, key: &DutyKey) -> [u8; 32] {
         DutyKind::Release => 1,
     });
     buf.extend_from_slice(&key.id);
-    // `sub` (burn log_index / deposit output_index) is part of the identity: a single
-    // transaction can carry several duties, and without this they would share one session
-    // key — two concurrent withdrawals from one tx would collide on session identity and
-    // leader selection, undoing the H-1/H-2 separation one layer up.
+    // One transaction can carry several duties; without `sub` they share a session key.
     buf.extend_from_slice(&key.sub.to_le_bytes());
     sha256(&buf)
 }
@@ -542,19 +539,10 @@ where
                                     Ok(sig) => {
                                         live.signature = Some(sig.clone());
                                         report.signed += 1;
-                                        // The FIRST canonical signer distributes; everyone
-                                        // advances locally so a lost broadcast only costs the
-                                        // laggards, not the quorum.
-                                        //
-                                        // NOT the leader: the leader only reaches this branch if
-                                        // it is inside the canonical set, and the leader is picked
-                                        // by hash while the set is the lowest `t` ackers. Whenever
-                                        // the leader landed outside the set (indices >= t in the
-                                        // common case — 6 of 20 in production) the set signed but
-                                        // NOBODY broadcast, and every other node waited forever.
-                                        // `signers` is ascending and non-empty here, so its first
-                                        // member is always a participant and every node agrees on
-                                        // who it is.
+                                        // The first canonical signer distributes; it is always a
+                                        // participant, unlike the leader, which may sit outside the
+                                        // set. Everyone advances locally so a lost broadcast costs
+                                        // only the laggards.
                                         if signers.first() == Some(&self.self_index) {
                                             let m = Self::msg_for(
                                                 &live.session,
@@ -889,7 +877,7 @@ mod tests {
         let key = DutyKey { kind: DutyKind::Mint, id: [7u8; 32] , sub: 0};
         let a = session_key(Leg::Pevm, 2, &key);
         assert_eq!(a, session_key(Leg::Pevm, 2, &key), "same inputs, same key (all nodes agree)");
-        // Two duties from the SAME transaction must not share a session (H-1/H-2).
+        // Two duties from the same transaction must not share a session.
         assert_ne!(
             a,
             session_key(Leg::Pevm, 2, &DutyKey { kind: DutyKind::Mint, id: [7u8; 32], sub: 1 }),

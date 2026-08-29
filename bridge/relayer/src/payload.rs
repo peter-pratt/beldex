@@ -25,7 +25,7 @@ pub enum RelayPayload {
         to: [u8; 20],
         amount: u128,
         beldex_txid: [u8; 32],
-        /// Which gateway output of `beldex_txid` this mint discharges (H-2).
+        /// Which gateway output of `beldex_txid` this mint discharges.
         output_index: u32,
         /// The `Pevm` committee ECDSA signature (r‖s‖v, 65 bytes) — verified by `ecrecover`.
         sig: Vec<u8>,
@@ -138,8 +138,7 @@ mod json {
                     let amount = get_str(&v, "amount")?
                         .parse::<u128>()
                         .map_err(|_| PayloadError::BadAmount)?;
-                    // H-2: optional on the wire so an older producer still parses; a
-                    // single-output deposit is index 0, which is the overwhelming case.
+                    // Optional on the wire so an older producer still parses.
                     let output_index = v
                         .get("output_index")
                         .and_then(Value::as_u64)

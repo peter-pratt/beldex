@@ -117,9 +117,8 @@ pub fn processed_deposits_selector() -> [u8; 4] {
     [h[0], h[1], h[2], h[3]]
 }
 
-/// The contract's replay-guard key for one deposit: `keccak256(abi.encode(txid, outIdx))`
-/// (H-2). MUST match `WrappedBDX.mint`'s `depositId` exactly — querying the bare txid
-/// instead would report every post-upgrade mint as unsettled and re-work it forever.
+/// The contract's replay-guard key for one deposit. MUST match `WrappedBDX.mint`'s
+/// `depositId` byte-for-byte.
 #[cfg(all(feature = "evm-watcher", feature = "tss-integration"))]
 pub fn deposit_id(beldex_txid: &[u8; 32], output_index: u32) -> [u8; 32] {
     use sha3::{Digest, Keccak256};
@@ -152,8 +151,8 @@ impl<C: crate::evm_watcher::JsonRpcClient> DutyReconciler for EvmMintReconciler<
             Some(s.chars().any(|c| c != '0'))
         };
 
-        // Mirror the contract's own two checks, in the same order (H-2): the legacy raw-txid
-        // key closes pre-upgrade deposits, the composite key covers everything since.
+        // Mirror the contract's two checks: the legacy raw-txid key closes pre-upgrade
+        // deposits, the composite key covers everything since.
         if ask(ev.beldex_txid)? {
             return Some(true);
         }
@@ -231,9 +230,8 @@ impl DutyReconciler for GatewayReleaseReconciler {
 mod deposit_id_parity {
     use super::deposit_id;
 
-    /// LOAD-BEARING (H-2): `deposit_id` must equal the contract's
-    /// `keccak256(abi.encode(beldexTxid, outputIndex))` byte-for-byte. If it drifts, the
-    /// reconciler silently reports every minted deposit as unsettled and re-works it.
+    /// `deposit_id` must equal the contract's `keccak256(abi.encode(beldexTxid,
+    /// outputIndex))` byte-for-byte; drift makes every minted deposit look unsettled.
     /// Expected value produced by:
     ///   cast keccak "$(cast abi-encode 'f(bytes32,uint32)' 0xcd..cd 7)"
     #[test]
@@ -243,7 +241,7 @@ mod deposit_id_parity {
             hex_lit("60cb746051e34ca09b7590ce7112a42a5d3498b404bfb1a8f71a24fc856bcf81");
         assert_eq!(got, want, "deposit_id drifted from WrappedBDX.mint");
 
-        // A different output of the same tx must key differently, or H-2 is undone.
+        // A different output of the same tx must key differently.
         assert_ne!(deposit_id(&[0xCD; 32], 0), deposit_id(&[0xCD; 32], 1));
     }
 
