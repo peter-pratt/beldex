@@ -371,6 +371,104 @@ fn run_dkg(_cfg: &Config) -> Result<(), String> {
     Err("the `dkg` subcommand requires a build with `--features live-dkg`".into())
 }
 
+/// Read secret material written by [`write_secret_file`], decrypting if it is marked
+/// encrypted. A plaintext file is returned as-is so an existing share tree still loads.
+#[cfg(feature = "live-dkg")]
+fn read_secret_file(path: &str) -> Result<Vec<u8>, String> {
+    let raw = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
+    if !raw.starts_with(SHARE_MAGIC) {
+        return Ok(raw);
+    }
+    let key = share_encryption_key()?.ok_or_else(|| {
+        format!("{path} is encrypted but BRIDGE_SIGNER_SHARE_KEY is not set")
+    })?;
+    beldex_bridge_signer::ffi::aead_decrypt(&key, &raw[SHARE_MAGIC.len()..]).map_err(|e| format!("{path}: {e}"))
+}
+
+/// Create a directory for secret material, owner-only.
+#[cfg(feature = "live-dkg")]
+fn create_secret_dir(dir: &str) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("create share dir {dir}: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Best effort: an existing directory may be owned by someone else.
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(())
+}
+
+/// The at-rest encryption key, from `BRIDGE_SIGNER_SHARE_KEY` (64 hex chars).
+///
+/// A full-width random key rather than a passphrase: an environment variable set by
+/// the service manager is not a place a human types something memorable, and taking a
+/// raw key avoids choosing key-derivation parameters and the weak-passphrase problem
+/// entirely. Unset means shares stay in plaintext, which is the previous behaviour.
+///
+/// Worth being clear about the limit: this key sits on the same host, so it protects
+/// copies that leave the machine — backups, snapshots, log shippers — not an attacker
+/// who has already compromised the running node. That needs a vault or HSM.
+#[cfg(feature = "live-dkg")]
+fn share_encryption_key() -> Result<Option<[u8; 32]>, String> {
+    let hex = match std::env::var("BRIDGE_SIGNER_SHARE_KEY") {
+        Ok(h) if !h.trim().is_empty() => h,
+        _ => return Ok(None),
+    };
+    config::parse_hex32(hex.trim())
+        .map(Some)
+        .ok_or_else(|| "BRIDGE_SIGNER_SHARE_KEY must be 64 hex characters (32 bytes)".to_string())
+}
+
+/// Marks a share file as encrypted. A file without it is read as plaintext, so an
+/// existing share tree keeps working and can be re-encrypted by re-running the DKG.
+#[cfg(feature = "live-dkg")]
+const SHARE_MAGIC: &[u8; 8] = b"BXSHARE1";
+
+/// Write secret material owner-readable and atomically.
+///
+/// The mode matters: with the default umask a key share is world-readable, so any
+/// other account on the host — and every backup, snapshot or log shipper that walks
+/// the directory — can take a copy. The temp-file-and-rename matters because a crash
+/// part way through a plain write leaves a truncated share that is only discovered at
+/// the next signing round.
+#[cfg(feature = "live-dkg")]
+fn write_secret_file(path: &str, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    // Encrypt when a key is configured; otherwise write as before.
+    let owned;
+    let bytes: &[u8] = match share_encryption_key()? {
+        Some(key) => {
+            let mut framed = Vec::with_capacity(SHARE_MAGIC.len() + bytes.len() + 40);
+            framed.extend_from_slice(SHARE_MAGIC);
+            framed.extend_from_slice(&beldex_bridge_signer::ffi::aead_encrypt(&key, bytes).map_err(|e| e.to_string())?);
+            owned = framed;
+            &owned
+        }
+        None => bytes,
+    };
+    let tmp = format!("{path}.tmp");
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp).map_err(|e| format!("open {tmp}: {e}"))?;
+        f.write_all(bytes).map_err(|e| format!("write {tmp}: {e}"))?;
+        f.sync_all().map_err(|e| format!("fsync {tmp}: {e}"))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename {tmp} -> {path}: {e}"))?;
+    // fsync the directory too, or the rename itself may not survive a power loss.
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if let Ok(d) = std::fs::File::open(parent) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
 /// Write this node's `Pgw` DKG material to `<dir>/pgw-<index>.{keypackage,
 /// pubkeypackage,groupvk}` for a later `sign` invocation. Dev file store only.
 #[cfg(feature = "live-dkg")]
@@ -381,10 +479,9 @@ fn persist_pgw_material(
     pk: &[u8],
     vk: &[u8; 32],
 ) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("create share dir {dir}: {e}"))?;
+    create_secret_dir(dir)?;
     let write = |suffix: &str, bytes: &[u8]| {
-        std::fs::write(format!("{dir}/pgw-{self_index}.{suffix}"), bytes)
-            .map_err(|e| format!("write {suffix}: {e}"))
+        write_secret_file(&format!("{dir}/pgw-{self_index}.{suffix}"), bytes)
     };
     write("keypackage", kp)?;
     write("pubkeypackage", pk)?;
@@ -401,11 +498,9 @@ fn persist_pevm_material(
     keyshare: &[u8],
     x33: &[u8; 33],
 ) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("create share dir {dir}: {e}"))?;
-    std::fs::write(format!("{dir}/pevm-{self_index}.keyshare"), keyshare)
-        .map_err(|e| format!("write keyshare: {e}"))?;
-    std::fs::write(format!("{dir}/pevm-{self_index}.groupkey"), x33)
-        .map_err(|e| format!("write groupkey: {e}"))?;
+    create_secret_dir(dir)?;
+    write_secret_file(&format!("{dir}/pevm-{self_index}.keyshare"), keyshare)?;
+    write_secret_file(&format!("{dir}/pevm-{self_index}.groupkey"), x33)?;
     Ok(())
 }
 
@@ -543,8 +638,8 @@ fn sign_pgw(
         }
     };
     let read = |suffix: &str| {
-        std::fs::read(format!("{dir}/pgw-{self_index}.{suffix}"))
-            .map_err(|e| format!("read {suffix}: {e} (run `dkg` first with BRIDGE_SIGNER_SHARE_DIR set)"))
+        read_secret_file(&format!("{dir}/pgw-{self_index}.{suffix}"))
+            .map_err(|e| format!("{e} (run `dkg` first with BRIDGE_SIGNER_SHARE_DIR set)"))
     };
     let key_package = frost::keys::KeyPackage::deserialize(&read("keypackage")?)
         .map_err(|e| format!("bad keypackage: {e}"))?;
@@ -603,8 +698,8 @@ fn sign_pevm(
             b"BELDEX_BRIDGE_MINT_V1 || chainid || wBDX || to || amount || beldexTxid".to_vec()
         }
     };
-    let key_share = std::fs::read(format!("{dir}/pevm-{self_index}.keyshare"))
-        .map_err(|e| format!("read pevm keyshare: {e} (run `dkg` first with SHARE_DIR set)"))?;
+    let key_share = read_secret_file(&format!("{dir}/pevm-{self_index}.keyshare"))
+        .map_err(|e| format!("pevm: {e} (run `dkg` first with SHARE_DIR set)"))?;
 
     println!("running Pevm cggmp21 signing over the mesh…");
     let (rs, x33) = run_live_pevm_sign(
@@ -1242,8 +1337,8 @@ fn build_live_signers(cfg: &Config) -> Result<LiveSigners, String> {
         }
     }
     let read = |suffix: &str| {
-        std::fs::read(format!("{dir}/pgw-{self_index}.{suffix}"))
-            .map_err(|e| format!("read pgw {suffix}: {e} (run `dkg` first with BRIDGE_SIGNER_SHARE_DIR set)"))
+        read_secret_file(&format!("{dir}/pgw-{self_index}.{suffix}"))
+            .map_err(|e| format!("pgw: {e} (run `dkg` first with BRIDGE_SIGNER_SHARE_DIR set)"))
     };
     let pgw_key_package = frost::keys::KeyPackage::deserialize(&read("keypackage")?)
         .map_err(|e| format!("bad pgw keypackage: {e}"))?;
@@ -1605,8 +1700,48 @@ where
         println!("  reconciliation DISABLED (BRIDGE_SIGNER_RECONCILE=0)");
     }
 
+    // The committee this process was built against. It is read once at startup — the
+    // shares, the mesh identities and the signer indices all derive from it — so if the
+    // on-chain committee moves underneath us, everything this node computes is against a
+    // view that no longer exists: it may hold no usable share at its new index, or count a
+    // member who has left. Opening new work in that state produces rounds that cannot
+    // reach threshold. Detect it and stop taking on new duties; in-flight ones still
+    // finish, and the node is restarted to pick up the new committee.
+    let started_with = ls.committee.identity_bytes();
+    let committee_probe = beldex_bridge_signer::omq_client::OmqCommitteeClient::new(
+        cfg.oxenmq_endpoint.clone(),
+    );
+    let mut committee_changed = false;
+
+    // H.6.3 rotation acknowledgements. Each member observes a wBDX key change on its own
+    // RPC, signs the fact, and shares that signature over the mesh; once threshold-many
+    // agree, any member may submit the evidence. Until L1 sees it, `observed_key_epoch`
+    // never advances and a departed member's bond stays locked forever.
+    let mut ack_collector = beldex_bridge_signer::rotation_ack::RotationAckCollector::new();
+    if bus_genesis == [0u8; 32] {
+        println!("  rotation acks DISABLED: BRIDGE_SIGNER_GENESIS_HASH is unset, and the \
+                  acknowledgement is genesis-bound");
+    }
+
     let mut ticks = 0u64;
     loop {
+        // Re-read the committee about once a minute. A transport error is not a change —
+        // only a view that parses and differs counts, or a blip would stall the node.
+        if !committee_changed && ticks % 12 == 0 {
+            if let Ok(now) = committee_probe.fetch_committee(None) {
+                if now.identity_bytes() != started_with {
+                    committee_changed = true;
+                    eprintln!(
+                        "!! COMMITTEE CHANGED (epoch {} -> {}): this node was built against the \
+                         previous view, so its share index and mesh identities no longer match. \
+                         Not opening further duties; in-flight work will finish. Re-run the DKG \
+                         for the new committee and restart.",
+                        ls.committee.epoch, now.epoch
+                    );
+                }
+            }
+        }
+
         // Ingest the watchers (re-emission is safe — the orchestrator dedups, and a duty is
         // reconciled against chain state at most once per process).
         let mut ingest = |orch: &mut beldex_bridge_signer::orchestrator::Orchestrator, d: Duty| {
@@ -1618,12 +1753,85 @@ where
                 orch.observe(d);
             }
         };
+        // Keep draining the watchers so their cursors advance, but do not turn events into
+        // duties against a committee view that has moved on.
         for m in src.poll_mints() {
-            ingest(orch, Duty::Mint(m));
+            if !committee_changed {
+                ingest(orch, Duty::Mint(m));
+            }
         }
         for r in src.poll_releases() {
-            ingest(orch, Duty::Release(r));
+            if !committee_changed {
+                ingest(orch, Duty::Release(r));
+            }
         }
+        // Observe: a settled key change on any watched chain. Sign it and tell the mesh.
+        if bus_genesis != [0u8; 32] {
+            for r in src.poll_rotations() {
+                let ack = beldex_bridge_signer::rotation_ack::RotationAck {
+                    chain_id: r.chain.0,
+                    key_epoch: r.key_epoch,
+                    new_signer: r.new_signer,
+                };
+                let key = ack.mesh_key(&bus_genesis);
+                match ack_collector.observe_and_sign(
+                    ack,
+                    ls.committee.epoch,
+                    ls.self_index,
+                    &ls.ed25519_secret,
+                    &bus_genesis,
+                ) {
+                    Ok(body) => {
+                        println!(
+                            "rotation observed: chain {} key epoch {} -> {}",
+                            r.chain.0,
+                            r.key_epoch,
+                            hex(&r.new_signer)
+                        );
+                        // `payload_hash` is the fact's own hash, so peers group signatures
+                        // for the same rotation and can never pool two different ones.
+                        let msg = beldex_bridge_signer::wire::WireMsg {
+                            leg: Leg::Pgw,
+                            epoch: ls.committee.epoch,
+                            payload_hash: key,
+                            attempt: 0,
+                            from: ls.self_index,
+                            body: beldex_bridge_signer::wire::SessionMsg::RotationAckSig(body),
+                        };
+                        use beldex_bridge_signer::wire::SessionTransport as _;
+                        beldex_bridge_signer::wire::note_send_failure(
+                            "rotation-ack",
+                            net.broadcast(&msg),
+                        );
+                    }
+                    Err(e) => eprintln!("  rotation ack signing failed: {e}"),
+                }
+            }
+
+            // Absorb peers' signatures. Each was set aside by the coordinator's pump, which
+            // sees them before a session would drop them as unopened. A signature for a
+            // rotation this node has not observed itself is refused inside `absorb` — the
+            // bond gate must never turn on someone else's word about what happened.
+            for (key, body) in std::mem::take(&mut coord.rotation_ack_inbox) {
+                ack_collector.absorb(&key, &body, &bus_genesis);
+            }
+
+            // Submit anything that has reached threshold. The daemon verifies and returns a
+            // tx_extra for a wallet to broadcast — it does not submit the transaction.
+            for done in ack_collector.take_complete(&ls.committee, &bus_genesis) {
+                let json = done.to_submission_json();
+                match committee_probe.submit_rotation_ack(&json) {
+                    Ok(reply) => println!(
+                        "rotation ack accepted for chain {} key epoch {}: {reply}\n  \
+                         submit this tx_extra from a funded wallet to advance L1's observed \
+                         key epoch — until it is mined, departed members' bonds stay locked",
+                        done.ack.chain_id, done.ack.key_epoch
+                    ),
+                    Err(e) => eprintln!("  rotation ack submission failed ({e}); will retry"),
+                }
+            }
+        }
+
         let rep = coord.step(orch, &mut net);
         if rep != Default::default() {
             let (pending, in_flight, done) = orch.counts();
@@ -1737,5 +1945,104 @@ fn main() -> ExitCode {
             print_status(&cfg);
             ExitCode::SUCCESS
         }
+    }
+}
+
+#[cfg(all(test, feature = "live-dkg"))]
+mod secret_file_tests {
+    use super::*;
+
+    /// `BRIDGE_SIGNER_SHARE_KEY` is process-global, so these tests must not run
+    /// concurrently or one will observe another's key.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A key share written with the default umask is world-readable, so any other
+    /// account on the host — and every backup or log shipper that walks the
+    /// directory — can take a copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_share_is_written_owner_only() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bx-secret-{}", std::process::id()));
+        let d = dir.to_str().unwrap();
+        create_secret_dir(d).unwrap();
+        let path = format!("{d}/share");
+        std::env::remove_var("BRIDGE_SIGNER_SHARE_KEY");
+        write_secret_file(&path, b"key material").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "share must not be readable by anyone else");
+        let dmode = std::fs::metadata(d).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dmode, 0o700, "share directory must not be listable by others");
+        assert_eq!(std::fs::read(&path).unwrap(), b"key material");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// With a key set, the share must not be on disk in the clear, and must come back
+    /// intact. This is what makes a stolen backup or snapshot useless on its own.
+    #[test]
+    fn an_encrypted_share_round_trips_and_is_not_plaintext_on_disk() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("bx-enc-{}", std::process::id()));
+        let d = dir.to_str().unwrap();
+        create_secret_dir(d).unwrap();
+        let path = format!("{d}/share");
+        let secret = b"the key share bytes";
+
+        std::env::set_var("BRIDGE_SIGNER_SHARE_KEY", "11".repeat(32));
+        write_secret_file(&path, secret).unwrap();
+
+        let on_disk = std::fs::read(&path).unwrap();
+        assert!(on_disk.starts_with(SHARE_MAGIC), "must be marked encrypted");
+        assert!(
+            !on_disk.windows(secret.len()).any(|w| w == secret),
+            "the share must not appear in the clear on disk"
+        );
+        assert_eq!(read_secret_file(&path).unwrap(), secret);
+
+        // The wrong key must fail loudly rather than return rubbish.
+        std::env::set_var("BRIDGE_SIGNER_SHARE_KEY", "22".repeat(32));
+        assert!(read_secret_file(&path).is_err());
+
+        // And an encrypted share with no key configured must say so plainly.
+        std::env::remove_var("BRIDGE_SIGNER_SHARE_KEY");
+        let err = read_secret_file(&path).unwrap_err();
+        assert!(err.contains("BRIDGE_SIGNER_SHARE_KEY"), "got: {err}");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// A share tree written before encryption existed must still load, so enabling the
+    /// key does not strand a node that already holds shares.
+    #[test]
+    fn an_existing_plaintext_share_still_loads() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("bx-plain-{}", std::process::id()));
+        let d = dir.to_str().unwrap();
+        create_secret_dir(d).unwrap();
+        let path = format!("{d}/share");
+        std::env::remove_var("BRIDGE_SIGNER_SHARE_KEY");
+        std::fs::write(&path, b"legacy share").unwrap();
+        assert_eq!(read_secret_file(&path).unwrap(), b"legacy share");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// Overwriting must not leave a truncated share behind: the content is replaced
+    /// in one step, and no temp file survives.
+    #[test]
+    fn overwriting_a_share_is_atomic() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("bx-atomic-{}", std::process::id()));
+        let d = dir.to_str().unwrap();
+        create_secret_dir(d).unwrap();
+        let path = format!("{d}/share");
+
+        std::env::remove_var("BRIDGE_SIGNER_SHARE_KEY");
+        write_secret_file(&path, &vec![0xAA; 4096]).unwrap();
+        write_secret_file(&path, b"short").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"short", "content fully replaced");
+        assert!(!std::path::Path::new(&format!("{path}.tmp")).exists(), "no temp file left");
+        let _ = std::fs::remove_dir_all(d);
     }
 }

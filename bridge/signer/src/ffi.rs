@@ -329,3 +329,108 @@ mod tests {
         assert!(!ed25519_verify_consensus(&mal, &MSG, &PUBKEY));
     }
 }
+
+// ---- authenticated encryption for share material at rest --------------------
+
+/// Key length for [`aead_encrypt`] / [`aead_decrypt`] (XChaCha20-Poly1305).
+pub const AEAD_KEY_LEN: usize = 32;
+/// Nonce length. 24 bytes is wide enough to pick at random without a counter.
+pub const AEAD_NONCE_LEN: usize = 24;
+
+/// Encrypt `plaintext` under `key`, returning `nonce ‖ ciphertext‖tag`.
+///
+/// XChaCha20-Poly1305: authenticated, so a truncated or edited file fails to open
+/// rather than yielding a corrupted share. The nonce is random per call, which is
+/// safe at this width and needs no persisted counter.
+pub fn aead_encrypt(key: &[u8; AEAD_KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>, &'static str> {
+    ensure_init()?;
+    let mut nonce = [0u8; AEAD_NONCE_LEN];
+    // SAFETY: writes exactly NONCE_LEN bytes into a buffer of that size.
+    unsafe { sodium::randombytes_buf(nonce.as_mut_ptr() as *mut _, nonce.len()) };
+
+    let mut out = vec![0u8; plaintext.len() + sodium::crypto_aead_xchacha20poly1305_ietf_ABYTES as usize];
+    let mut out_len: u64 = 0;
+    // SAFETY: out is sized plaintext+ABYTES per the libsodium contract; all other
+    // pointers are valid for their stated lengths and the AD is empty.
+    let rc = unsafe {
+        sodium::crypto_aead_xchacha20poly1305_ietf_encrypt(
+            out.as_mut_ptr(),
+            &mut out_len,
+            plaintext.as_ptr(),
+            plaintext.len() as u64,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            nonce.as_ptr(),
+            key.as_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err("aead encrypt failed");
+    }
+    out.truncate(out_len as usize);
+    let mut framed = Vec::with_capacity(AEAD_NONCE_LEN + out.len());
+    framed.extend_from_slice(&nonce);
+    framed.extend_from_slice(&out);
+    Ok(framed)
+}
+
+/// Reverse of [`aead_encrypt`]. Fails if the key is wrong or the bytes were altered.
+pub fn aead_decrypt(key: &[u8; AEAD_KEY_LEN], framed: &[u8]) -> Result<Vec<u8>, &'static str> {
+    ensure_init()?;
+    if framed.len() < AEAD_NONCE_LEN + sodium::crypto_aead_xchacha20poly1305_ietf_ABYTES as usize {
+        return Err("aead ciphertext too short");
+    }
+    let (nonce, ct) = framed.split_at(AEAD_NONCE_LEN);
+    let mut out = vec![0u8; ct.len()];
+    let mut out_len: u64 = 0;
+    // SAFETY: out is sized to the ciphertext, which bounds the plaintext; the nonce
+    // slice is exactly NONCE_LEN by the split above.
+    let rc = unsafe {
+        sodium::crypto_aead_xchacha20poly1305_ietf_decrypt(
+            out.as_mut_ptr(),
+            &mut out_len,
+            std::ptr::null_mut(),
+            ct.as_ptr(),
+            ct.len() as u64,
+            std::ptr::null(),
+            0,
+            nonce.as_ptr(),
+            key.as_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err("aead decrypt failed (wrong key or altered file)");
+    }
+    out.truncate(out_len as usize);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod aead_tests {
+    use super::*;
+
+    #[test]
+    fn round_trips_and_rejects_tampering() {
+        let key = [7u8; AEAD_KEY_LEN];
+        let msg = b"a key share";
+        let ct = aead_encrypt(&key, msg).unwrap();
+        assert_ne!(&ct[AEAD_NONCE_LEN..], &msg[..], "must not store plaintext");
+        assert_eq!(aead_decrypt(&key, &ct).unwrap(), msg);
+
+        // Wrong key, and any edited byte, must both fail rather than return garbage.
+        assert!(aead_decrypt(&[8u8; AEAD_KEY_LEN], &ct).is_err());
+        let mut bad = ct.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 1;
+        assert!(aead_decrypt(&key, &bad).is_err());
+    }
+
+    /// A fresh nonce per call, so writing the same share twice does not produce
+    /// identical files.
+    #[test]
+    fn each_encryption_is_distinct() {
+        let key = [7u8; AEAD_KEY_LEN];
+        assert_ne!(aead_encrypt(&key, b"x").unwrap(), aead_encrypt(&key, b"x").unwrap());
+    }
+}
