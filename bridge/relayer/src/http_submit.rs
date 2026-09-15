@@ -82,7 +82,8 @@ impl HttpSubmitter {
 
     fn rpc(&self, url: &str, method: &str, params: Value) -> Result<Value, SubmitError> {
         let req = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-        let resp = ureq::post(url)
+        let resp = crate::http_agent()
+            .post(url)
             .send_json(req)
             .map_err(|e| SubmitError::Transport(format!("{method}: {e}")))?;
         let v: Value = resp

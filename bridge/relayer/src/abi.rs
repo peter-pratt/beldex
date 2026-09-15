@@ -12,12 +12,15 @@ use sha3::{Digest, Keccak256};
 /// `mint(address,uint256,bytes32,uint32,bytes)` selector — `keccak256(sig)[..4]`.
 /// `outputIndex` identifies the gateway output, not merely the transaction.
 pub const MINT_SELECTOR: [u8; 4] = [0x7f, 0x00, 0x00, 0x0a];
-/// `rotateSigner(address,uint64,bytes)` selector.
-pub const ROTATE_SELECTOR: [u8; 4] = [0xe8, 0xbc, 0x46, 0x89];
+/// `rotateSigner(address,uint64,uint64,uint256,bytes)` selector.
+/// The nonce and deadline make an authorization single-use and time-bounded, so a
+/// relayed proposal cannot be replayed to revive a vetoed hand-off or restart the
+/// challenge window.
+pub const ROTATE_SELECTOR: [u8; 4] = [0x95, 0x0c, 0x57, 0xf3];
 
 /// The canonical function signatures (used only by the drift-guard tests).
 pub const MINT_SIG: &[u8] = b"mint(address,uint256,bytes32,uint32,bytes)";
-pub const ROTATE_SIG: &[u8] = b"rotateSigner(address,uint64,bytes)";
+pub const ROTATE_SIG: &[u8] = b"rotateSigner(address,uint64,uint64,uint256,bytes)";
 
 /// `keccak256(fn_sig)[..4]` — the 4-byte selector for a function signature.
 pub fn selector_of(fn_sig: &[u8]) -> [u8; 4] {
@@ -79,15 +82,25 @@ pub fn build_mint_calldata(
     out
 }
 
-/// Build the calldata for `rotateSigner(address newSigner, uint64 newKeyEpoch, bytes sig)`.
+/// Build the calldata for `rotateSigner(address newSigner, uint64 newKeyEpoch,
+/// uint64 nonce, uint256 deadline, bytes sig)`.
 ///
-/// Head is `word(newSigner) ‖ word(newKeyEpoch) ‖ offset(=0x60)`; tail is the encoded `sig`.
-pub fn build_rotate_calldata(new_signer: [u8; 20], new_key_epoch: u64, sig: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + 32 * 4 + sig.len() + 32);
+/// Head is `word(newSigner) ‖ word(newKeyEpoch) ‖ word(nonce) ‖ word(deadline) ‖
+/// offset(=0xa0)`; tail is the encoded `sig`.
+pub fn build_rotate_calldata(
+    new_signer: [u8; 20],
+    new_key_epoch: u64,
+    nonce: u64,
+    deadline: u128,
+    sig: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 32 * 6 + sig.len() + 32);
     out.extend_from_slice(&ROTATE_SELECTOR);
     out.extend_from_slice(&word_address(new_signer));
     out.extend_from_slice(&word_u64(new_key_epoch));
-    out.extend_from_slice(&word_u256(0x60)); // offset to `sig`: 3 head words = 96 bytes
+    out.extend_from_slice(&word_u64(nonce));
+    out.extend_from_slice(&word_u256(deadline));
+    out.extend_from_slice(&word_u256(0xa0)); // offset to `sig`: 5 head words = 160 bytes
     push_dynamic_bytes(&mut out, sig);
     out
 }
@@ -102,7 +115,7 @@ mod tests {
         assert_eq!(ROTATE_SELECTOR, selector_of(ROTATE_SIG));
         // Pin the exact bytes so a drift is caught even if the signature string changed.
         assert_eq!(MINT_SELECTOR, [0x7f, 0x00, 0x00, 0x0a]);
-        assert_eq!(ROTATE_SELECTOR, [0xe8, 0xbc, 0x46, 0x89]);
+        assert_eq!(ROTATE_SELECTOR, [0x95, 0x0c, 0x57, 0xf3]);
     }
 
     #[test]
@@ -136,15 +149,21 @@ mod tests {
     fn rotate_calldata_is_abi_shaped() {
         let ns = [0x22u8; 20];
         let sig = vec![0xEE; 65];
-        let cd = build_rotate_calldata(ns, 7, &sig);
+        let cd = build_rotate_calldata(ns, 7, 3, 1_700_000_000, &sig);
 
         assert_eq!(&cd[0..4], &ROTATE_SELECTOR);
-        assert_eq!(cd.len(), 4 + 32 * 3 + 32 + 96);
-        assert_eq!(&cd[4 + 12..4 + 32], &ns);                 // newSigner
-        assert_eq!(cd[4 + 32 + 31], 7);                       // newKeyEpoch
-        assert_eq!(cd[4 + 64 + 31], 0x60);                    // offset
-        assert_eq!(cd[4 + 96 + 31], 65);                      // sig length
-        assert_eq!(&cd[4 + 128..4 + 128 + 65], &sig[..]);
+        // selector + 5 head words + (length word + 65 bytes padded to 96)
+        assert_eq!(cd.len(), 4 + 32 * 5 + 32 + 96);
+        assert_eq!(&cd[4 + 12..4 + 32], &ns);                  // newSigner
+        assert_eq!(cd[4 + 32 + 31], 7);                        // newKeyEpoch
+        assert_eq!(cd[4 + 64 + 31], 3);                        // nonce
+        assert_eq!(                                            // deadline
+            u128::from_be_bytes(cd[4 + 96 + 16..4 + 128].try_into().unwrap()),
+            1_700_000_000
+        );
+        assert_eq!(cd[4 + 128 + 31], 0xa0);                    // offset to `sig`
+        assert_eq!(cd[4 + 160 + 31], 65);                      // sig length
+        assert_eq!(&cd[4 + 192..4 + 192 + 65], &sig[..]);
     }
 
     #[test]

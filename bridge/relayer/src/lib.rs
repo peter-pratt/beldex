@@ -46,3 +46,26 @@ pub use http_submit::{ChainEndpoint, HttpSubmitter};
 
 /// Crate version.
 pub const RELAYER_VERSION: [u16; 3] = [0, 1, 0];
+
+/// A shared HTTP agent with bounded timeouts.
+///
+/// `ureq` applies no read timeout by default, so an endpoint that accepts the
+/// connection and then never answers stalls the submitter indefinitely — with a
+/// signed transaction in hand and no way to know whether it landed.
+///
+/// Overridable per deployment:
+///   * `BRIDGE_RELAYER_HTTP_CONNECT_SECS` (default 5)
+///   * `BRIDGE_RELAYER_HTTP_READ_SECS`    (default 20)
+///   * `BRIDGE_RELAYER_HTTP_TOTAL_SECS`   (default 30)
+#[cfg(feature = "submit-http")]
+pub fn http_agent() -> ureq::Agent {
+    fn secs(var: &str, default: u64) -> std::time::Duration {
+        let v = std::env::var(var).ok().and_then(|s| s.trim().parse::<u64>().ok());
+        std::time::Duration::from_secs(v.filter(|n| *n > 0).unwrap_or(default))
+    }
+    ureq::AgentBuilder::new()
+        .timeout_connect(secs("BRIDGE_RELAYER_HTTP_CONNECT_SECS", 5))
+        .timeout_read(secs("BRIDGE_RELAYER_HTTP_READ_SECS", 20))
+        .timeout(secs("BRIDGE_RELAYER_HTTP_TOTAL_SECS", 30))
+        .build()
+}

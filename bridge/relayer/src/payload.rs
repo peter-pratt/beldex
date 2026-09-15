@@ -36,6 +36,10 @@ pub enum RelayPayload {
         chain_id: u64,
         new_signer: [u8; 20],
         new_key_epoch: u64,
+        /// Single-use authorization number; the contract requires `rotationNonce + 1`.
+        nonce: u64,
+        /// Last timestamp at which this authorization may be relayed.
+        deadline: u128,
         sig: Vec<u8>,
     },
 }
@@ -59,8 +63,8 @@ impl RelayPayload {
             RelayPayload::Mint { to, amount, beldex_txid, output_index, sig, .. } => {
                 build_mint_calldata(*to, *amount, *beldex_txid, *output_index, sig)
             }
-            RelayPayload::Rotate { new_signer, new_key_epoch, sig, .. } => {
-                build_rotate_calldata(*new_signer, *new_key_epoch, sig)
+            RelayPayload::Rotate { new_signer, new_key_epoch, nonce, deadline, sig, .. } => {
+                build_rotate_calldata(*new_signer, *new_key_epoch, *nonce, *deadline, sig)
             }
         }
     }
@@ -153,7 +157,17 @@ mod json {
                         .get("new_key_epoch")
                         .and_then(Value::as_u64)
                         .ok_or(PayloadError::MissingField("new_key_epoch"))?;
-                    Ok(RelayPayload::Rotate { contract, chain_id, new_signer, new_key_epoch, sig })
+                    let nonce = v
+                        .get("nonce")
+                        .and_then(Value::as_u64)
+                        .ok_or(PayloadError::MissingField("nonce"))?;
+                    // Accepted as a string so a deadline beyond 2^53 survives JSON.
+                    let deadline = get_str(&v, "deadline")?
+                        .parse::<u128>()
+                        .map_err(|_| PayloadError::MissingField("deadline"))?;
+                    Ok(RelayPayload::Rotate {
+                        contract, chain_id, new_signer, new_key_epoch, nonce, deadline, sig,
+                    })
                 }
                 other => Err(PayloadError::UnknownKind(other.to_string())),
             }
@@ -173,12 +187,16 @@ mod json {
                     hexs(contract), chain_id, hexs(to), amount, hexs(beldex_txid),
                     output_index, hexs(sig),
                 ),
-                RelayPayload::Rotate { contract, chain_id, new_signer, new_key_epoch, sig } => format!(
+                RelayPayload::Rotate {
+                    contract, chain_id, new_signer, new_key_epoch, nonce, deadline, sig,
+                } => format!(
                     concat!(
                         r#"{{"kind":"rotate","contract":"{}","chain_id":{},"#,
-                        r#""new_signer":"{}","new_key_epoch":{},"sig":"{}"}}"#
+                        r#""new_signer":"{}","new_key_epoch":{},"nonce":{},"#,
+                        r#""deadline":"{}","sig":"{}"}}"#
                     ),
-                    hexs(contract), chain_id, hexs(new_signer), new_key_epoch, hexs(sig),
+                    hexs(contract), chain_id, hexs(new_signer), new_key_epoch, nonce,
+                    deadline, hexs(sig),
                 ),
             }
         }
@@ -221,6 +239,9 @@ mod tests {
             chain_id: 42,
             new_signer: [0x33; 20],
             new_key_epoch: 7,
+            nonce: 3,
+            // Past 2^53, so the round trip proves the deadline survives JSON.
+            deadline: 9_007_199_254_740_995,
             sig: vec![0xee; 65],
         };
         assert_eq!(RelayPayload::from_json(&r.to_json()).unwrap(), r);
