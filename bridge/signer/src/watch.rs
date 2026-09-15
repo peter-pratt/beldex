@@ -158,9 +158,20 @@ pub struct Observation<E> {
     pub block_hash: [u8; 32],
 }
 
-/// Pure finality decision. `confirmations` counts blocks built **on top of** the
-/// inclusion block (depth): an event `required_confs` deep is [`Finality::Final`],
-/// unless its block is no longer canonical (→ [`Finality::Dropped`]).
+/// Pure finality decision.
+///
+/// Two sources, in order of strength:
+///
+/// * `finalized_height` — the chain's own statement that a block will never be
+///   reversed (BSC's fast finality, Ethereum's finalized checkpoint). When the chain
+///   offers this, it is an actual guarantee.
+/// * `required_confs` — depth, as a fallback for a chain or endpoint that does not
+///   publish one. Depth is a *probability*, not a promise: a reorg deeper than the
+///   configured number erases a burn the bridge has already paid out against, and the
+///   native release cannot be taken back.
+///
+/// Depth is still required even when a finalized height is available, so a chain that
+/// reports an implausibly high finalized block cannot make a shallow event final.
 pub struct FinalityGate;
 
 impl FinalityGate {
@@ -169,15 +180,23 @@ impl FinalityGate {
         still_canonical: bool,
         tip_height: u64,
         required_confs: u64,
+        finalized_height: Option<u64>,
     ) -> Finality {
         if !still_canonical {
             return Finality::Dropped;
         }
-        let depth = tip_height.saturating_sub(inclusion_height);
-        if depth >= required_confs {
-            Finality::Final
-        } else {
-            Finality::Pending
+        let deep_enough = tip_height.saturating_sub(inclusion_height) >= required_confs;
+        match finalized_height {
+            // Both: the chain calls it settled AND it is as deep as configured.
+            Some(f) => {
+                if inclusion_height <= f && deep_enough {
+                    Finality::Final
+                } else {
+                    Finality::Pending
+                }
+            }
+            None if deep_enough => Finality::Final,
+            None => Finality::Pending,
         }
     }
 }
@@ -216,6 +235,12 @@ impl<E: Clone> Tracker<E> {
 
     /// The observations awaiting finality — the caller reads their inclusion
     /// heights to fetch current block hashes before [`poll`](Self::poll).
+    /// Confirmation depth an event must reach before it is final. Also the depth a
+    /// watcher must keep re-reading: below it a reorg can still replace a block.
+    pub fn required_confs(&self) -> u64 {
+        self.required_confs
+    }
+
     pub fn pending(&self) -> &[Observation<E>] {
         &self.pending
     }
@@ -224,7 +249,14 @@ impl<E: Clone> Tracker<E> {
     /// report whether that exact block is still on the canonical chain (the RPC
     /// layer answers this; in tests it's a closure). Returns what finalized and what
     /// dropped this step; both are removed from the pending set.
-    pub fn poll<F>(&mut self, tip_height: u64, mut is_canonical: F) -> TrackerUpdate<E>
+    /// `finalized_height` is the chain's own finalised block, when it publishes one;
+    /// `None` falls back to confirmation depth alone.
+    pub fn poll<F>(
+        &mut self,
+        tip_height: u64,
+        finalized_height: Option<u64>,
+        mut is_canonical: F,
+    ) -> TrackerUpdate<E>
     where
         F: FnMut(u64, &[u8; 32]) -> bool,
     {
@@ -239,6 +271,7 @@ impl<E: Clone> Tracker<E> {
                 canonical,
                 tip_height,
                 self.required_confs,
+                finalized_height,
             ) {
                 Finality::Final => finalized.push(obs.event),
                 Finality::Dropped => dropped.push(obs),
@@ -365,10 +398,27 @@ mod tests {
     #[test]
     fn finality_gate_pending_final_dropped() {
         // required 12 confs, included at height 100.
-        assert_eq!(FinalityGate::classify(100, true, 105, 12), Finality::Pending);
-        assert_eq!(FinalityGate::classify(100, true, 112, 12), Finality::Final);
+        assert_eq!(FinalityGate::classify(100, true, 105, 12, None), Finality::Pending);
+        assert_eq!(FinalityGate::classify(100, true, 112, 12, None), Finality::Final);
         // reorged away (not canonical) → dropped, even if deep enough.
-        assert_eq!(FinalityGate::classify(100, false, 200, 12), Finality::Dropped);
+        assert_eq!(FinalityGate::classify(100, false, 200, 12, None), Finality::Dropped);
+    }
+
+    /// The chain's own finalised marker is the stronger signal, but depth still has to
+    /// be satisfied — a chain reporting an implausible finalised height must not be able
+    /// to make a shallow event settle.
+    #[test]
+    fn chain_finality_is_required_as_well_as_depth() {
+        // Deep enough, but the chain has not finalised that far yet.
+        assert_eq!(FinalityGate::classify(100, true, 120, 12, Some(90)), Finality::Pending);
+        // Finalised AND deep enough.
+        assert_eq!(FinalityGate::classify(100, true, 120, 12, Some(100)), Finality::Final);
+        // Finalised far ahead, but not yet deep — still pending.
+        assert_eq!(FinalityGate::classify(100, true, 105, 12, Some(999)), Finality::Pending);
+        // No finality source: depth alone decides, as before.
+        assert_eq!(FinalityGate::classify(100, true, 120, 12, None), Finality::Final);
+        // Never final once the block is gone, whatever the chain says.
+        assert_eq!(FinalityGate::classify(100, false, 120, 12, Some(999)), Finality::Dropped);
     }
 
     #[test]
@@ -378,12 +428,12 @@ mod tests {
         t.observe(Observation { event: mint(2), inclusion_height: 100, block_hash: [2; 32] });
 
         // Tip at 105: nothing deep enough yet.
-        let u = t.poll(105, |_, _| true);
+        let u = t.poll(105, None, |_, _| true);
         assert!(u.finalized.is_empty() && u.dropped.is_empty());
         assert_eq!(t.pending_len(), 2);
 
         // Tip at 120: block [1;32] still canonical → final; block [2;32] reorged → dropped.
-        let u = t.poll(120, |_h, hash| *hash == [1u8; 32]);
+        let u = t.poll(120, None, |_h, hash| *hash == [1u8; 32]);
         assert_eq!(u.finalized, vec![mint(1)]);
         assert_eq!(u.dropped.len(), 1);
         assert_eq!(u.dropped[0].event, mint(2));

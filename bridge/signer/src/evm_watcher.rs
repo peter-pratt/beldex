@@ -261,12 +261,24 @@ pub fn decode_rotated_logs(result: &Value, chain: ChainId, contract: [u8; 20]) -
 
 // ---- the watcher -----------------------------------------------------------
 
+/// Blocks per `eth_getLogs` request. Hosted providers reject a wider span, and an
+/// unbounded request wedges the watcher permanently once the gap exceeds their cap.
+const MAX_SCAN_SPAN: u64 = 2_000;
+
 /// One member's EVM watcher for one chain.
 pub struct EvmWatcher<C: JsonRpcClient> {
     client: C,
     chain: ChainId,
     contract: [u8; 20],
     tracker: Tracker<ReleaseEvent>,
+    /// Rotations that have settled and are ready to acknowledge, drained by
+    /// [`take_finalized_rotations`](Self::take_finalized_rotations).
+    finalized_rotations: Vec<RotationEvent>,
+    /// Rotations observed on this chain, finality-gated exactly like burns. A key change
+    /// that a reorg could still undo must never be acknowledged to L1: the bond gate
+    /// treats the acknowledgement as proof the old key is retired, and that cannot be
+    /// taken back.
+    rotations: Tracker<RotationEvent>,
     /// Next block to scan (inclusive).
     next_scan: u64,
 }
@@ -278,6 +290,8 @@ impl<C: JsonRpcClient> EvmWatcher<C> {
             chain,
             contract,
             tracker: Tracker::new(confirmations),
+            rotations: Tracker::new(confirmations),
+            finalized_rotations: Vec::new(),
             next_scan: start_block,
         }
     }
@@ -290,6 +304,22 @@ impl<C: JsonRpcClient> EvmWatcher<C> {
             .ok_or_else(|| RpcError::BadResponse("eth_blockNumber".into()))
     }
 
+    /// Rotation logs over the same block span, for the H.6.3 acknowledgement.
+    fn get_rotation_logs(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<Observation<RotationEvent>>, RpcError> {
+        let params = json!([{
+            "address": to_hex_bytes(&self.contract),
+            "topics": [to_hex_bytes(&rotated_topic0())],
+            "fromBlock": to_hex_quantity(from),
+            "toBlock": to_hex_quantity(to),
+        }]);
+        let v = self.client.call("eth_getLogs", params)?;
+        Ok(decode_rotated_logs(&v, self.chain, self.contract))
+    }
+
     fn get_logs(&self, from: u64, to: u64) -> Result<Vec<Observation<ReleaseEvent>>, RpcError> {
         let params = json!([{
             "address": to_hex_bytes(&self.contract),
@@ -299,6 +329,23 @@ impl<C: JsonRpcClient> EvmWatcher<C> {
         }]);
         let v = self.client.call("eth_getLogs", params)?;
         Ok(decode_get_logs(&v, self.chain, self.contract))
+    }
+
+    /// The chain's own finalised block height, if it publishes one.
+    ///
+    /// BSC (fast finality) and Ethereum both answer the `finalized` tag; a chain or
+    /// endpoint that does not simply returns nothing and the watcher falls back to
+    /// confirmation depth. An error is treated the same as absence — a finality source
+    /// that is briefly unreachable must not make events look settled.
+    fn finalized_height(&self) -> Option<u64> {
+        let v = self
+            .client
+            .call("eth_getBlockByNumber", json!(["finalized", false]))
+            .ok()?;
+        if v.is_null() {
+            return None;
+        }
+        v.get("number").and_then(Value::as_str).and_then(hex_to_u64)
     }
 
     /// The current canonical block hash at `height`, or `None` if that height is not
@@ -317,12 +364,38 @@ impl<C: JsonRpcClient> EvmWatcher<C> {
     /// [`ReleaseEvent`]s) and what dropped this step.
     pub fn advance(&mut self) -> Result<TrackerUpdate<ReleaseEvent>, RpcError> {
         let tip = self.tip()?;
+        let finalized = self.finalized_height();
 
         if tip >= self.next_scan {
-            for obs in self.get_logs(self.next_scan, tip)? {
-                self.tracker.observe(obs);
+            // Bounded span: providers cap the range one `eth_getLogs` may cover, so a
+            // long outage is closed over several polls instead of one request that is
+            // refused every time and never lets the cursor move.
+            let scan_to = tip.min(self.next_scan.saturating_add(MAX_SCAN_SPAN - 1));
+            for obs in self.get_logs(self.next_scan, scan_to)? {
+                // Blocks inside the re-read window arrive more than once.
+                if !self.tracker.pending().contains(&obs) {
+                    self.tracker.observe(obs);
+                }
             }
-            self.next_scan = tip + 1;
+            for obs in self.get_rotation_logs(self.next_scan, scan_to)? {
+                if !self.rotations.pending().contains(&obs) {
+                    self.rotations.observe(obs);
+                }
+            }
+            // Re-read the unfinalized tail on the next poll. A reorg can replace one of
+            // those blocks with a *different* burn, and the replacement is only ever seen
+            // by reading that height again; moving the cursor straight past it dropped
+            // the old observation and never made a new one. Blocks below the tail are
+            // already final, so re-reading them would only re-emit settled work.
+            // Re-read everything the chain has not called final yet. Where no finalised
+            // height is published, fall back to the configured depth.
+            let unsettled_from = match finalized {
+                Some(f) => f.saturating_add(1).min(
+                    scan_to.saturating_sub(self.tracker.required_confs()).saturating_add(1),
+                ),
+                None => scan_to.saturating_sub(self.tracker.required_confs()).saturating_add(1),
+            };
+            self.next_scan = unsettled_from.max(self.next_scan);
         }
 
         // Pre-fetch the current hash at each pending inclusion height (so `poll`'s
@@ -333,7 +406,105 @@ impl<C: JsonRpcClient> EvmWatcher<C> {
             current.insert(h, self.block_hash_at(h)?);
         }
 
-        Ok(self.tracker.poll(tip, |h, hash| current.get(&h).copied().flatten() == Some(*hash)))
+        // Rotations settle on the same evidence as burns: reuse the hashes already
+        // fetched, and fetch any extra heights only a rotation is waiting on.
+        let mut rot_heights: BTreeSet<u64> =
+            self.rotations.pending().iter().map(|o| o.inclusion_height).collect();
+        rot_heights.retain(|h| !current.contains_key(h));
+        for h in rot_heights {
+            current.insert(h, self.block_hash_at(h)?);
+        }
+        let rot = self.rotations.poll(tip, finalized, |h, hash| {
+            current.get(&h).copied().flatten() == Some(*hash)
+        });
+        self.finalized_rotations.extend(rot.finalized);
+
+        Ok(self.tracker.poll(tip, finalized, |h, hash| {
+            current.get(&h).copied().flatten() == Some(*hash)
+        }))
+    }
+
+    /// Verify at startup that this really is the wBDX contract we were configured for.
+    ///
+    /// Without it a wrong address after a redeploy, or a stale config, lets the signer
+    /// start happily and sign against the wrong contract — and the failure only shows up
+    /// as a rejected mint at the very end of the pipeline, where it reads as a signature
+    /// problem rather than a configuration one. Fail closed here instead.
+    ///
+    /// `per_tx_max` / `window_cap` are the registry row's values; a mismatch means the
+    /// committee's soft pre-checks disagree with the caps the contract will actually
+    /// enforce, so a session could be run for an amount that can never mint.
+    pub fn verify_contract(&self, per_tx_max: u128, window_cap: u128) -> Result<(), String> {
+        let remote = self
+            .client
+            .call("eth_chainId", json!([]))
+            .map_err(|e| format!("chain {}: eth_chainId: {e:?}", self.chain.0))?;
+        let remote = remote
+            .as_str()
+            .and_then(hex_to_u64)
+            .ok_or_else(|| format!("chain {}: bad eth_chainId reply", self.chain.0))?;
+        if remote != self.chain.0 {
+            return Err(format!(
+                "chain id mismatch: configured {} but the endpoint reports {remote}",
+                self.chain.0
+            ));
+        }
+
+        let addr = to_hex_bytes(&self.contract);
+        let code = self
+            .client
+            .call("eth_getCode", json!([addr, "latest"]))
+            .map_err(|e| format!("chain {}: eth_getCode: {e:?}", self.chain.0))?;
+        if code.as_str().is_none_or(|c| strip0x(c).is_empty()) {
+            return Err(format!(
+                "chain {}: no contract code at {addr}",
+                self.chain.0
+            ));
+        }
+
+        let read = |selector: &str, what: &str| -> Result<Vec<u8>, String> {
+            let v = self
+                .client
+                .call("eth_call", json!([{"to": addr, "data": selector}, "latest"]))
+                .map_err(|e| format!("chain {}: eth_call {what}: {e:?}", self.chain.0))?;
+            v.as_str()
+                .and_then(hex_to_bytes)
+                .ok_or_else(|| format!("chain {}: bad {what} reply", self.chain.0))
+        };
+        let word_u128 = |b: &[u8], what: &str| -> Result<u128, String> {
+            if b.len() != 32 || b[..16].iter().any(|x| *x != 0) {
+                return Err(format!("chain {}: {what} does not fit u128", self.chain.0));
+            }
+            Ok(u128::from_be_bytes(b[16..].try_into().expect("length checked")))
+        };
+
+        let tag = read("0x6749ccae", "MINT_TAG")?;
+        if tag.len() != 32 || tag[..] != crate::watch::MINT_TAG[..] {
+            return Err(format!(
+                "chain {}: MINT_TAG at {addr} is not the one this signer signs under",
+                self.chain.0
+            ));
+        }
+
+        let on_chain_per_tx = word_u128(&read("0x89fbcc98", "perTxMax")?, "perTxMax")?;
+        let on_chain_window = word_u128(&read("0x466351f2", "windowMintCap")?, "windowMintCap")?;
+        if on_chain_per_tx != per_tx_max || on_chain_window != window_cap {
+            return Err(format!(
+                "chain {}: cap mismatch — config per_tx/window {per_tx_max}/{window_cap}, \
+                 contract {on_chain_per_tx}/{on_chain_window}",
+                self.chain.0
+            ));
+        }
+        Ok(())
+    }
+
+    /// Take the rotations that have settled since the last call.
+    ///
+    /// Each is an objective, finalised fact — chain `c`'s wBDX signer moved to `s` at key
+    /// epoch `e` — which the committee co-signs into the acknowledgement that lets L1
+    /// release a departed member's bond.
+    pub fn take_finalized_rotations(&mut self) -> Vec<RotationEvent> {
+        std::mem::take(&mut self.finalized_rotations)
     }
 
     pub fn chain(&self) -> ChainId {
@@ -365,7 +536,8 @@ impl JsonRpcClient for HttpJsonRpc {
         let id = self.id.get();
         self.id.set(id.wrapping_add(1));
         let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        let resp = ureq::post(&self.url)
+        let resp = crate::http_agent()
+            .post(&self.url)
             .send_json(req)
             .map_err(|e| RpcError::Transport(e.to_string()))?;
         let v: Value = resp.into_json().map_err(|e| RpcError::BadResponse(e.to_string()))?;
@@ -562,8 +734,10 @@ mod tests {
     /// requested block range), and a height→hash map for the canonical check.
     struct MockNode {
         tip: Cell<u64>,
-        logs: Vec<Value>,
+        logs: RefCell<Vec<Value>>,
         hashes: RefCell<BTreeMap<u64, [u8; 32]>>,
+        /// `None` = the chain publishes no finalised marker (depth-only).
+        finalized: Cell<Option<u64>>,
     }
     impl JsonRpcClient for MockNode {
         fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
@@ -574,6 +748,7 @@ mod tests {
                     let to = hex_to_u64(params[0]["toBlock"].as_str().unwrap()).unwrap();
                     let hits: Vec<Value> = self
                         .logs
+                        .borrow()
                         .iter()
                         .filter(|l| {
                             let b = hex_to_u64(l["blockNumber"].as_str().unwrap()).unwrap();
@@ -584,7 +759,16 @@ mod tests {
                     Ok(json!(hits))
                 }
                 "eth_getBlockByNumber" => {
-                    let h = hex_to_u64(params[0].as_str().unwrap()).unwrap();
+                    let tag = params[0].as_str().unwrap();
+                    // `finalized` models a chain that publishes one; the default node
+                    // answers null, i.e. depth-only finality as before.
+                    if tag == "finalized" {
+                        return Ok(match self.finalized.get() {
+                            Some(h) => json!({ "number": to_hex_quantity(h) }),
+                            None => Value::Null,
+                        });
+                    }
+                    let h = hex_to_u64(tag).unwrap();
                     Ok(match self.hashes.borrow().get(&h) {
                         Some(hash) => json!({ "hash": to_hex_bytes(hash) }),
                         None => Value::Null,
@@ -658,12 +842,215 @@ mod tests {
         assert_eq!(decode_redeem_log(&log, ChainId(1), [0x22; 20]), Err(DecodeError::WrongTopic));
     }
 
+    /// A reorg can replace a scanned block with one carrying a DIFFERENT burn. The
+    /// replacement is only ever seen by reading that height again, so the cursor must
+    /// not run past the unfinalized tail. Reading forward once lost the user's burn
+    /// permanently: the old observation was dropped and no new one was made.
+    #[test]
+    fn a_burn_only_in_the_replacement_block_is_still_found() {
+        let node = MockNode {
+            tip: Cell::new(105),
+            logs: RefCell::new(vec![burn_log(100, [0xAA; 32], [0x01; 32], 500, b"bxAlice")]),
+            hashes: RefCell::new([(100u64, [0xAA; 32])].into_iter().collect()),
+            finalized: Cell::new(None),
+        };
+        let mut w = EvmWatcher::new(node, ChainId(1), [0x22; 20], 12, 100);
+
+        // Alice's burn is seen but is only 5 deep, so it is still pending.
+        let u = w.advance().unwrap();
+        assert!(u.finalized.is_empty());
+        assert_eq!(w.pending_len(), 1);
+
+        // Block 100 is reorged out and replaced by one containing BOB's burn instead.
+        *w.client.logs.borrow_mut() = vec![burn_log(100, [0xBB; 32], [0x02; 32], 700, b"bxBob")];
+        w.client.hashes.borrow_mut().insert(100, [0xBB; 32]);
+
+        let u = w.advance().unwrap();
+        assert_eq!(u.dropped.len(), 1, "Alice's observation is no longer canonical");
+        assert_eq!(w.pending_len(), 1, "Bob's burn must have been picked up");
+
+        // Bob's burn finalizes normally once deep enough.
+        w.client.tip.set(120);
+        let u = w.advance().unwrap();
+        assert_eq!(u.finalized.len(), 1, "the replacement burn must settle");
+        assert_eq!(u.finalized[0].amount, 700);
+        assert_eq!(u.finalized[0].beldex_recipient, b"bxBob");
+    }
+
+    /// Re-reading the tail must not re-emit a burn that is already pending.
+    #[test]
+    fn re_reading_the_tail_does_not_duplicate_a_pending_burn() {
+        let node = MockNode {
+            tip: Cell::new(105),
+            logs: RefCell::new(vec![burn_log(100, [0xAA; 32], [0x01; 32], 500, b"bxAlice")]),
+            hashes: RefCell::new([(100u64, [0xAA; 32])].into_iter().collect()),
+            finalized: Cell::new(None),
+        };
+        let mut w = EvmWatcher::new(node, ChainId(1), [0x22; 20], 12, 100);
+
+        for _ in 0..5 {
+            w.advance().unwrap();
+            assert_eq!(w.pending_len(), 1, "the same burn must be tracked once");
+        }
+        w.client.tip.set(120);
+        assert_eq!(w.advance().unwrap().finalized.len(), 1, "settles exactly once");
+    }
+
+    /// A node that starts against the wrong contract signs work that can never mint,
+    /// and the failure surfaces at the far end as a rejected signature rather than as
+    /// the configuration error it is. Every mismatch must stop the node instead.
+    #[test]
+    fn contract_verification_fails_closed_on_every_mismatch() {
+        // A node that answers whatever the attestation asks, with settable answers.
+        struct Attest {
+            chain_id: u64,
+            code: &'static str,
+            tag: [u8; 32],
+            per_tx: u128,
+            window: u128,
+        }
+        impl JsonRpcClient for Attest {
+            fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+                let word = |v: u128| {
+                    let mut w = [0u8; 32];
+                    w[16..].copy_from_slice(&v.to_be_bytes());
+                    json!(format!("0x{}", w.iter().map(|b| format!("{b:02x}")).collect::<String>()))
+                };
+                match method {
+                    "eth_chainId" => Ok(json!(to_hex_quantity(self.chain_id))),
+                    "eth_getCode" => Ok(json!(self.code)),
+                    "eth_call" => match params[0]["data"].as_str().unwrap() {
+                        "0x6749ccae" => Ok(json!(format!(
+                            "0x{}",
+                            self.tag.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                        ))),
+                        "0x89fbcc98" => Ok(word(self.per_tx)),
+                        "0x466351f2" => Ok(word(self.window)),
+                        other => panic!("unexpected selector {other}"),
+                    },
+                    other => panic!("unexpected method {other}"),
+                }
+            }
+        }
+        let good = || Attest {
+            chain_id: 1,
+            code: "0x6080604052",
+            tag: crate::watch::MINT_TAG,
+            per_tx: 1000,
+            window: 5000,
+        };
+        let watcher = |n: Attest| EvmWatcher::new(n, ChainId(1), [0x22; 20], 12, 100);
+
+        // The correct contract passes.
+        assert!(watcher(good()).verify_contract(1000, 5000).is_ok());
+
+        // Wrong chain behind the endpoint.
+        let mut n = good();
+        n.chain_id = 56;
+        assert!(watcher(n).verify_contract(1000, 5000).unwrap_err().contains("chain id mismatch"));
+
+        // Address with no code — a wrong or not-yet-deployed address.
+        let mut n = good();
+        n.code = "0x";
+        assert!(watcher(n).verify_contract(1000, 5000).unwrap_err().contains("no contract code"));
+
+        // A contract that signs under a different domain tag.
+        let mut n = good();
+        n.tag = [0xAB; 32];
+        assert!(watcher(n).verify_contract(1000, 5000).unwrap_err().contains("MINT_TAG"));
+
+        // Caps that disagree with the registry row.
+        assert!(watcher(good()).verify_contract(999, 5000).unwrap_err().contains("cap mismatch"));
+        assert!(watcher(good()).verify_contract(1000, 4999).unwrap_err().contains("cap mismatch"));
+    }
+
+    /// With a chain that publishes a finalised marker, depth alone is not enough. This
+    /// is the case depth-only finality gets wrong: a burn deep enough by count but not
+    /// yet settled by the chain could be paid out and then erased by a deeper reorg,
+    /// leaving the native release unrecoverable.
+    #[test]
+    fn a_burn_waits_for_the_chain_to_call_it_final() {
+        let node = MockNode {
+            tip: Cell::new(200),
+            logs: RefCell::new(vec![burn_log(100, [0xAA; 32], [0x01; 32], 500, b"bxAlice")]),
+            hashes: RefCell::new([(100u64, [0xAA; 32])].into_iter().collect()),
+            finalized: Cell::new(Some(90)), // chain has only finalised up to 90
+        };
+        let mut w = EvmWatcher::new(node, ChainId(1), [0x22; 20], 12, 100);
+
+        // 100 blocks deep — depth alone would have settled this already.
+        let u = w.advance().unwrap();
+        assert!(u.finalized.is_empty(), "the chain has not finalised block 100 yet");
+        assert_eq!(w.pending_len(), 1);
+
+        // The chain finalises past it.
+        w.client.finalized.set(Some(100));
+        let u = w.advance().unwrap();
+        assert_eq!(u.finalized.len(), 1, "settles once the chain calls it final");
+        assert_eq!(u.finalized[0].amount, 500);
+    }
+
+    /// A rotation must be as settled as a burn before it is acknowledged. The bond gate
+    /// treats the acknowledgement as proof the old key is retired, and releasing a bond
+    /// cannot be undone — so acknowledging a rotation a reorg could still erase would
+    /// return 100,000 BDX to someone whose share still signs.
+    #[test]
+    fn a_rotation_is_only_reported_once_it_is_final() {
+        let node = MockNode {
+            tip: Cell::new(105),
+            logs: RefCell::new(vec![rotated_log(100, [0xAA; 32], [0x07; 32], [0xCD; 20], 4)]),
+            hashes: RefCell::new([(100u64, [0xAA; 32])].into_iter().collect()),
+            finalized: Cell::new(None),
+        };
+        let mut w = EvmWatcher::new(node, ChainId(1), [0x22; 20], 12, 100);
+
+        // Seen, but only 5 deep — not yet acknowledgeable.
+        w.advance().unwrap();
+        assert!(w.take_finalized_rotations().is_empty(), "too shallow to acknowledge");
+
+        // Deep enough now.
+        w.client.tip.set(120);
+        w.advance().unwrap();
+        let rots = w.take_finalized_rotations();
+        assert_eq!(rots.len(), 1);
+        assert_eq!(rots[0].key_epoch, 4);
+        assert_eq!(rots[0].new_signer, [0xCD; 20]);
+
+        // Draining is one-shot: acknowledging the same rotation twice is pointless work.
+        assert!(w.take_finalized_rotations().is_empty());
+    }
+
+    /// A rotation whose block is reorged away must never be acknowledged.
+    #[test]
+    fn a_reorged_rotation_is_never_acknowledged() {
+        let node = MockNode {
+            tip: Cell::new(105),
+            logs: RefCell::new(vec![rotated_log(100, [0xAA; 32], [0x07; 32], [0xCD; 20], 4)]),
+            hashes: RefCell::new([(100u64, [0xAA; 32])].into_iter().collect()),
+            finalized: Cell::new(None),
+        };
+        let mut w = EvmWatcher::new(node, ChainId(1), [0x22; 20], 12, 100);
+        w.advance().unwrap();
+
+        // Block 100 is replaced, and the rotation is not in the replacement.
+        *w.client.logs.borrow_mut() = vec![];
+        w.client.hashes.borrow_mut().insert(100, [0xBB; 32]);
+        w.client.tip.set(120);
+
+        w.advance().unwrap();
+        assert!(
+            w.take_finalized_rotations().is_empty(),
+            "a rotation that was reorged away must never be acknowledged"
+        );
+    }
+
     #[test]
     fn watcher_finalizes_after_confirmations() {
         let node = MockNode {
             tip: Cell::new(105),
-            logs: vec![burn_log(100, [0xAA; 32], [0x01; 32], 500, b"bxRecipient")],
+            logs: RefCell::new(vec![burn_log(100, [0xAA; 32], [0x01; 32], 500, b"bxRecipient")]),
             hashes: RefCell::new([(100u64, [0xAA; 32])].into_iter().collect()),
+            finalized: Cell::new(None),
         };
         let mut w = EvmWatcher::new(node, ChainId(1), [0x22; 20], 12, 100);
 
@@ -730,8 +1117,9 @@ mod tests {
     fn watcher_drops_reorged_burn() {
         let node = MockNode {
             tip: Cell::new(105),
-            logs: vec![burn_log(100, [0xAA; 32], [0x01; 32], 500, b"bx")],
+            logs: RefCell::new(vec![burn_log(100, [0xAA; 32], [0x01; 32], 500, b"bx")]),
             hashes: RefCell::new([(100u64, [0xAA; 32])].into_iter().collect()),
+            finalized: Cell::new(None),
         };
         let mut w = EvmWatcher::new(node, ChainId(1), [0x22; 20], 12, 100);
         assert!(w.advance().unwrap().finalized.is_empty()); // pending
