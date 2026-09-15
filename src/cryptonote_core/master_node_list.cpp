@@ -2260,6 +2260,57 @@ namespace master_nodes
     return crypto::cn_fast_hash(buf.data(), buf.size());
   }
 
+  // --- H.6.3 rotation-observation helpers (small vectors; chains are few) -------------
+  namespace
+  {
+    uint64_t chain_epoch_get(const std::vector<bridge_chain_epoch> &v, uint64_t chain_id)
+    {
+      for (const auto &e : v)
+        if (e.chain_id == chain_id) return e.key_epoch;
+      return 0;
+    }
+    bool chain_epoch_present(const std::vector<bridge_chain_epoch> &v, uint64_t chain_id)
+    {
+      for (const auto &e : v)
+        if (e.chain_id == chain_id) return true;
+      return false;
+    }
+    // Advance to `epoch` monotonically (never lowers). Returns true if it changed.
+    bool chain_epoch_advance(std::vector<bridge_chain_epoch> &v, uint64_t chain_id, uint64_t epoch)
+    {
+      for (auto &e : v)
+        if (e.chain_id == chain_id)
+        {
+          if (epoch > e.key_epoch) { e.key_epoch = epoch; return true; }
+          return false;
+        }
+      bridge_chain_epoch e;
+      e.chain_id  = chain_id;
+      e.key_epoch = epoch;
+      v.push_back(e);
+      return true;
+    }
+
+    // H.6.3 gate: has every chain in this seat's baseline snapshot rotated strictly past
+    // its baseline? Iterates the SEAT's snapshot (grandfathering, §6.2): a chain added
+    // after the seat unbonded is simply not in the snapshot, so it is never required. A
+    // chain no longer "registered" (implicit model: no longer present in `observed`) is
+    // skipped, so a retired chain never strands an honest bond. An empty snapshot (taken
+    // before any rotation was observed) is vacuously satisfied.
+    bool rotation_completed_for(const std::vector<bridge_chain_epoch> &observed,
+                                const std::vector<bridge_chain_epoch> &serving)
+    {
+      for (const auto &b : serving)
+      {
+        if (!chain_epoch_present(observed, b.chain_id))
+          continue; // no longer registered (retired) → does not gate
+        if (chain_epoch_get(observed, b.chain_id) <= b.key_epoch)
+          return false; // this chain has not yet rotated past the seat's baseline
+      }
+      return true;
+    }
+  }
+
   bool master_node_list::state_t::process_bridge_unbond_tx(cryptonote::network_type nettype,
                                                            const cryptonote::block &block,
                                                            const cryptonote::transaction &tx)
@@ -2308,15 +2359,35 @@ namespace master_nodes
     auto &info = duplicate_info(iter->second);
     info.bridge_seat.requested_unbond_height = block_height;
     info.bridge_seat.bond_unlock_height      = block_height + cryptonote::bridge_bond_unlock_blocks(nettype);
-    info.bridge_seat.seated                  = false;
+    // NOT unseated here. The seat keeps serving until its key is retired: its share is
+    // the only thing that can sign under the current key, so dropping it now would take
+    // the signers away while leaving the key they hold live — and with enough seats
+    // leaving at once, nothing could reach threshold, not even to authorize the
+    // rotation that would fix it. `finalize_bridge_unbonds` unseats it once the key
+    // has moved past its baseline, which is the same moment the bond is released.
     // H.6.3: snapshot the per-chain baseline — where every EVM chain's wBDX key epoch
     // stood right now. The bond is not released until every chain here has rotated
     // strictly past its baseline (proof the departure's hand-off landed), gated in
     // finalize_bridge_unbonds. bridge_seat version 1 marks the presence of this field.
     info.bridge_seat.version           = 1;
     info.bridge_seat.serving_key_epoch = observed_key_epoch;
+    // The seat also holds a share of the NATIVE gateway owner key, and that share keeps
+    // signing until the gateway is re-pointed. Releasing the bond once only the wBDX
+    // chains have rotated would hand the stake back while the gateway share is still
+    // live — the very thing the bond is there to prevent. Ensure the baseline carries a
+    // gateway entry even when none has been observed yet, or `rotation_completed_for`
+    // would treat the gateway as "not registered" and skip it entirely.
+    if (!chain_epoch_present(info.bridge_seat.serving_key_epoch,
+                             cryptonote::BRIDGE_GATEWAY_CHAIN_ID))
+    {
+      bridge_chain_epoch gw{};
+      gw.chain_id  = cryptonote::BRIDGE_GATEWAY_CHAIN_ID;
+      gw.key_epoch = chain_epoch_get(observed_key_epoch, cryptonote::BRIDGE_GATEWAY_CHAIN_ID);
+      info.bridge_seat.serving_key_epoch.push_back(gw);
+    }
     return true;
   }
+
 
   bool master_node_list::state_t::process_bridge_slash_tx(cryptonote::network_type nettype,
                                                           const cryptonote::block &block,
@@ -2408,56 +2479,6 @@ namespace master_nodes
     return true;
   }
 
-  // --- H.6.3 rotation-observation helpers (small vectors; chains are few) -------------
-  namespace
-  {
-    uint64_t chain_epoch_get(const std::vector<bridge_chain_epoch> &v, uint64_t chain_id)
-    {
-      for (const auto &e : v)
-        if (e.chain_id == chain_id) return e.key_epoch;
-      return 0;
-    }
-    bool chain_epoch_present(const std::vector<bridge_chain_epoch> &v, uint64_t chain_id)
-    {
-      for (const auto &e : v)
-        if (e.chain_id == chain_id) return true;
-      return false;
-    }
-    // Advance to `epoch` monotonically (never lowers). Returns true if it changed.
-    bool chain_epoch_advance(std::vector<bridge_chain_epoch> &v, uint64_t chain_id, uint64_t epoch)
-    {
-      for (auto &e : v)
-        if (e.chain_id == chain_id)
-        {
-          if (epoch > e.key_epoch) { e.key_epoch = epoch; return true; }
-          return false;
-        }
-      bridge_chain_epoch e;
-      e.chain_id  = chain_id;
-      e.key_epoch = epoch;
-      v.push_back(e);
-      return true;
-    }
-
-    // H.6.3 gate: has every chain in this seat's baseline snapshot rotated strictly past
-    // its baseline? Iterates the SEAT's snapshot (grandfathering, §6.2): a chain added
-    // after the seat unbonded is simply not in the snapshot, so it is never required. A
-    // chain no longer "registered" (implicit model: no longer present in `observed`) is
-    // skipped, so a retired chain never strands an honest bond. An empty snapshot (taken
-    // before any rotation was observed) is vacuously satisfied.
-    bool rotation_completed_for(const std::vector<bridge_chain_epoch> &observed,
-                                const std::vector<bridge_chain_epoch> &serving)
-    {
-      for (const auto &b : serving)
-      {
-        if (!chain_epoch_present(observed, b.chain_id))
-          continue; // no longer registered (retired) → does not gate
-        if (chain_epoch_get(observed, b.chain_id) <= b.key_epoch)
-          return false; // this chain has not yet rotated past the seat's baseline
-      }
-      return true;
-    }
-  }
 
   bool master_node_list::state_t::process_bridge_rotation_ack_tx(cryptonote::network_type nettype,
                                                                  const cryptonote::block &block,
@@ -2535,6 +2556,9 @@ namespace master_nodes
     }
     for (const auto &pk : to_release)
     {
+      // Resetting to the unregistered default also clears `seated` — the seat stops
+      // serving at exactly the moment its key is retired and its bond is released, so
+      // there is never a gap where it is unseated but its share still signs.
       auto iter = master_nodes_infos.find(pk);
       duplicate_info(iter->second).bridge_seat = master_node_info::bridge_seat_info{}; // reset to unregistered default
     }
@@ -2546,10 +2570,25 @@ namespace master_nodes
     // by (registration_height, registration_txid) — never by stake — and seat the
     // first BRIDGE_SEAT_CAP, queue the rest. Only flip a seat's `seated` flag when
     // it actually changes (duplicate_info is copy-on-write).
+    //
+    // An exiting seat that is still seated holds its slot: it is still serving, and its
+    // slot is only freed for the queue head once its key has been retired
+    // (finalize_bridge_unbonds). Promoting a replacement earlier would seat a member
+    // holding no share of the live key while unseating one that does.
     std::vector<crypto::public_key> registered;
+    size_t held_by_exiting = 0;
     for (const auto &[pk, info] : master_nodes_infos)
-      if (info->bridge_seat.registered && info->bridge_seat.requested_unbond_height == 0)
-        registered.push_back(pk);
+    {
+      if (!info->bridge_seat.registered)
+        continue;
+      if (info->bridge_seat.requested_unbond_height != 0)
+      {
+        if (info->bridge_seat.seated)
+          ++held_by_exiting;
+        continue;
+      }
+      registered.push_back(pk);
+    }
 
     std::sort(registered.begin(), registered.end(), [this](const crypto::public_key &a, const crypto::public_key &b) {
       const auto &ia = master_nodes_infos.at(a)->bridge_seat;
@@ -2559,9 +2598,12 @@ namespace master_nodes
       return ia.registration_txid < ib.registration_txid;
     });
 
+    const size_t free_slots = cryptonote::BRIDGE_SEAT_CAP > held_by_exiting
+                                  ? cryptonote::BRIDGE_SEAT_CAP - held_by_exiting
+                                  : 0;
     for (size_t i = 0; i < registered.size(); ++i)
     {
-      const bool should_seat = i < cryptonote::BRIDGE_SEAT_CAP;
+      const bool should_seat = i < free_slots;
       auto iter              = master_nodes_infos.find(registered[i]);
       if (iter->second->bridge_seat.seated != should_seat)
         duplicate_info(iter->second).bridge_seat.seated = should_seat;

@@ -324,7 +324,13 @@ namespace master_nodes
       // >= 1 (a seat that never unbonded stays version 0 and omits it).
       std::vector<bridge_chain_epoch> serving_key_epoch;
 
-      bool is_active_seat() const { return registered && seated && requested_unbond_height == 0; }
+      // Serving right now. An EXITING seat is deliberately still serving: its share is
+      // the only thing that can sign under the current key, so removing it from the
+      // committee the moment it asks to leave takes away the very members who can sign.
+      // `finalize_bridge_unbonds` clears `seated` once the key has actually rotated.
+      bool is_active_seat() const { return registered && seated; }
+      // Asked to leave, but still serving until its key is retired.
+      bool is_exiting_seat() const { return registered && seated && requested_unbond_height != 0; }
 
       // Phase F forfeiture: a slashed seat is recorded as an unbond that **never
       // unlocks** (bond_unlock_height == UINT64_MAX). This reuses the existing

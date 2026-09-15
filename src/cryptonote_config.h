@@ -115,6 +115,17 @@ inline constexpr uint64_t BRIDGE_EPOCH_BLOCKS                 = 2880;
 // Minimum unbonding period before a released bridge bond unlocks: ≥ 30 days and
 // must span ≥ 1 refresh (plan §6.1 B.2). Expressed in blocks.
 inline constexpr uint64_t BRIDGE_BOND_UNLOCK_BLOCKS           = 30 * 2880; // ~30 days
+
+// Reserved `chain_id` for the NATIVE gateway owner key inside a seat's
+// `serving_key_epoch` / the state's `observed_key_epoch`. Those lists are keyed by EVM
+// chain id, and no EVM chain uses 0, so the gateway takes that slot.
+//
+// It has to be in the same list as the EVM chains: a departing seat holds a share of the
+// gateway key as well as the wBDX keys, and releasing its bond once only the wBDX side
+// has rotated would hand back the stake while the gateway share still signs — exactly
+// what the bond exists to prevent. Its "key epoch" is the gateway's descriptor count,
+// which advances only on a re-point, i.e. only when the owner key actually changes.
+inline constexpr uint64_t BRIDGE_GATEWAY_CHAIN_ID              = 0;
 // Max length (bytes) of a gateway descriptor's meta_info string. The descriptor
 // is persisted append-only into the consensus DB and an update tx pays only a
 // normal fee (no 100 BDX burn), so an unbounded meta_info would let a gateway

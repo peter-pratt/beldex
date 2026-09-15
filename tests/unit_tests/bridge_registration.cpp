@@ -124,3 +124,85 @@ TEST(BridgeRegistration, mn_info_v7_has_no_bridge_seat)
   // bridge_seat was not serialized at v7, so it stays default (unregistered).
   EXPECT_FALSE(got.bridge_seat.registered);
 }
+
+// --- an exiting seat keeps serving until its key is retired -------------------
+//
+// A seat's share is the only thing that can sign under the current key. Unseating it
+// the moment it asks to leave removes the members who can still sign while leaving the
+// key they hold live — and if enough leave at once, nothing can reach threshold, not
+// even to authorize the rotation that would fix it.
+TEST(BridgeRegistration, exiting_seat_keeps_serving_until_its_key_retires)
+{
+  master_nodes::master_node_info info{};
+  auto &bs = info.bridge_seat;
+  bs.registered          = true;
+  bs.seated              = true;
+  bs.bond_amount         = cryptonote::BRIDGE_BOND;
+  bs.registration_height = 1000;
+
+  EXPECT_TRUE(bs.is_active_seat())  << "a registered, seated member is serving";
+  EXPECT_FALSE(bs.is_exiting_seat()) << "it has not asked to leave";
+
+  // It asks to leave. The bond starts unbonding, but the seat keeps serving.
+  bs.requested_unbond_height = 2000;
+  bs.bond_unlock_height      = 2000 + 30 * 2880;
+
+  EXPECT_TRUE(bs.is_active_seat())
+      << "an exiting seat must STILL serve — it holds the only usable share";
+  EXPECT_TRUE(bs.is_exiting_seat()) << "and is recognisable as on its way out";
+
+  // Its key is retired and the bond released: the seat resets, and only now does it
+  // stop serving. There is never a moment where it is unseated but still holds a
+  // live share.
+  bs = master_nodes::master_node_info::bridge_seat_info{};
+  EXPECT_FALSE(bs.is_active_seat()) << "released seats stop serving";
+  EXPECT_FALSE(bs.is_exiting_seat());
+}
+
+// --- the bond waits for the gateway key too, not just the wBDX keys -----------
+//
+// A departing seat holds a share of the NATIVE gateway owner key as well as the wBDX
+// keys. Releasing its bond once only the wBDX side has rotated hands the stake back
+// while the gateway share still signs — the very thing the bond exists to prevent.
+TEST(BridgeRegistration, bond_baseline_covers_the_gateway_key)
+{
+  // A baseline snapshotted while one EVM chain was at key epoch 3.
+  std::vector<master_nodes::bridge_chain_epoch> serving;
+  {
+    master_nodes::bridge_chain_epoch evm{};
+    evm.chain_id  = 56;
+    evm.key_epoch = 3;
+    serving.push_back(evm);
+    master_nodes::bridge_chain_epoch gw{};
+    gw.chain_id  = cryptonote::BRIDGE_GATEWAY_CHAIN_ID;
+    gw.key_epoch = 1;
+    serving.push_back(gw);
+  }
+
+  // The gateway slot must be distinct from every EVM chain id, or the two would
+  // overwrite each other in the same list.
+  EXPECT_EQ(cryptonote::BRIDGE_GATEWAY_CHAIN_ID, 0u);
+  EXPECT_NE(cryptonote::BRIDGE_GATEWAY_CHAIN_ID, 56u);
+
+  // Both entries survive serialization as part of the seat.
+  master_nodes::master_node_info info{};
+  info.version                       = master_nodes::master_node_info::version_t::v8_bridge;
+  info.bridge_seat.registered        = true;
+  info.bridge_seat.version           = 1;
+  info.bridge_seat.serving_key_epoch = serving;
+
+  const std::string blob = serialization::dump_binary(info);
+  master_nodes::master_node_info got{};
+  ASSERT_NO_THROW(serialization::parse_binary(blob, got));
+
+  ASSERT_EQ(got.bridge_seat.serving_key_epoch.size(), 2u)
+      << "both the wBDX chain and the gateway must be in the baseline";
+  bool saw_gateway = false;
+  for (const auto &e : got.bridge_seat.serving_key_epoch)
+    if (e.chain_id == cryptonote::BRIDGE_GATEWAY_CHAIN_ID)
+    {
+      saw_gateway = true;
+      EXPECT_EQ(e.key_epoch, 1u) << "the gateway baseline is preserved";
+    }
+  EXPECT_TRUE(saw_gateway) << "the gateway must gate the bond alongside the wBDX chains";
+}
