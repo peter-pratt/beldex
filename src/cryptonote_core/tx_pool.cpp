@@ -949,22 +949,10 @@ namespace cryptonote
   //---------------------------------------------------------------------------------
   bool tx_memory_pool::insert_key_images(const transaction_prefix &tx, const crypto::hash &id, bool kept_by_block, std::string *out_gw_reason)
   {
-    for(const auto& in: tx.vin)
-    {
-      // HF22: gateway withdrawal inputs carry no key image; their double-spend
-      // protection is the per-(gateway,asset) tracker (insert_gateway_spends).
-      if (std::holds_alternative<txin_gateway>(in))
-        continue;
-      CHECKED_GET_SPECIFIC_VARIANT(in, txin_to_key, txin, false);
-      std::unordered_set<crypto::hash>& kei_image_set = m_spent_key_images[txin.k_image];
-      CHECK_AND_ASSERT_MES(kept_by_block || kei_image_set.size() == 0, false, "internal error: kept_by_block=" << kept_by_block
-                                          << ",  kei_image_set.size()=" << kei_image_set.size() << "\ntxin.k_image=" << txin.k_image
-                                          << "\ntx_id=" << id );
-      auto ins_res = kei_image_set.insert(id);
-      CHECK_AND_ASSERT_MES(ins_res.second, false, "internal error: try to insert duplicate iterator in key_image set");
-    }
-    // HF22: track gateway withdrawals / register op for pool txs only (block txs
-    // are authoritative and go straight to the chain). Reject pool overdraws.
+    // HF22: the gateway check runs FIRST. It can legitimately reject (an overdraw),
+    // and rejecting before any key image is recorded means a failure leaves nothing
+    // half-applied. Track withdrawals / register ops for pool txs only; block txs are
+    // authoritative and go straight to the chain.
     if (!kept_by_block)
     {
       std::string gw_reason;
@@ -975,6 +963,57 @@ namespace cryptonote
           *out_gw_reason = std::move(gw_reason);
         return false;
       }
+    }
+
+    // Unwind everything this call recorded if a later input is rejected, so the caller
+    // never has to reason about a partially-inserted transaction.
+    std::vector<crypto::key_image> inserted;
+    inserted.reserve(tx.vin.size());
+    auto rollback = [this, &inserted, &tx, &id, kept_by_block]() {
+      for (const auto& ki : inserted)
+      {
+        auto it = m_spent_key_images.find(ki);
+        if (it == m_spent_key_images.end())
+          continue;
+        // Drop only THIS tx's entry: a kept-by-block key image set can legitimately
+        // hold other transactions, and erasing the set would take them with it.
+        it->second.erase(id);
+        if (it->second.empty())
+          m_spent_key_images.erase(it);
+      }
+      if (!kept_by_block)
+        remove_gateway_spends(tx);
+    };
+
+    for(const auto& in: tx.vin)
+    {
+      // HF22: gateway withdrawal inputs carry no key image; their double-spend
+      // protection is the per-(gateway,asset) tracker (insert_gateway_spends).
+      if (std::holds_alternative<txin_gateway>(in))
+        continue;
+      if (!std::holds_alternative<txin_to_key>(in))
+      {
+        MERROR("wrong variant type in tx " << id << ": expected txin_to_key");
+        rollback();
+        return false;
+      }
+      const auto& txin = var::get<txin_to_key>(in);
+      std::unordered_set<crypto::hash>& kei_image_set = m_spent_key_images[txin.k_image];
+      if (!(kept_by_block || kei_image_set.size() == 0))
+      {
+        MERROR("internal error: kept_by_block=" << kept_by_block
+               << ",  kei_image_set.size()=" << kei_image_set.size()
+               << "\ntxin.k_image=" << txin.k_image << "\ntx_id=" << id);
+        rollback();
+        return false;
+      }
+      if (!kei_image_set.insert(id).second)
+      {
+        MERROR("internal error: try to insert duplicate iterator in key_image set");
+        rollback();
+        return false;
+      }
+      inserted.push_back(txin.k_image);
     }
     ++m_cookie;
     return true;
@@ -2176,8 +2215,12 @@ end:
         }
         if (!insert_key_images(tx, txid, meta.kept_by_block))
         {
-          MFATAL("Failed to insert key images from txpool tx");
-          return false;
+          // Evict and carry on, exactly as the parse failure above does. Treating one
+          // bad persisted entry as fatal stopped the daemon booting at all, and it
+          // could not boot on the next attempt either because the entry is on disk.
+          MWARNING("Failed to insert key images from txpool tx " << txid << ", removing");
+          remove.push_back(txid);
+          return true;
         }
 
         const bool non_standard_tx = !tx.is_transfer();

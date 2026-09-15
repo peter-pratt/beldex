@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "checkpoints/checkpoints.h" // complete checkpoint_t for BaseTestDB's checkpoint vectors
 #include "blockchain_db/testdb.h"
 #include "cryptonote_core/uptime_proof.h" // complete uptime_proof::Proof for BaseTestDB's proof_info map
 #include "cryptonote_basic/cryptonote_basic.h"

@@ -13,7 +13,7 @@
 #   WINDOW_MINT_CAP / PER_TX_MAX / BOND_BACKING_CAP_LIMIT / EPOCH_SECONDS / ROTATE_TIMELOCK
 set -euo pipefail
 
-: "${INITIAL_SIGNER:?set INITIAL_SIGNER to the Pevm DKG address printed by the signer's \`dkg\` run}"
+: "${INITIAL_SIGNER:?set INITIAL_SIGNER to the Pevm DKG address printed by the dkg run}"
 
 # anvil account #0 — a well-known, value-less local dev key/address. NEVER use on a real chain.
 DEPLOYER_KEY="${DEPLOYER_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
@@ -46,3 +46,8 @@ forge script script/Deploy.s.sol \
 
 echo
 echo "Note the 'WrappedBDX proxy' address above — that is your wBDX contract for the mint loop."
+echo
+echo "Then set the redemption floor on the proxy (it is not an initialize argument, so an"
+echo "already-deployed proxy can adopt it too):"
+echo "  cast send <proxy> 'setMinRedeemAmount(uint256)' \${MIN_REDEEM_AMOUNT:-1000000} \\"
+echo "    --rpc-url $RPC --private-key \$DEPLOYER_KEY"
