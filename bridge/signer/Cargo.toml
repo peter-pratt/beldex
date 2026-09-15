@@ -81,14 +81,17 @@ live-dkg = ["tss-integration", "omq-mesh", "omq-client", "dep:rand"]
 # (needs serde_json for the reply shape + sha3 for the event topic hash); the real
 # blocking HTTP client is a separate, thin opt-in so the core stays dep-light.
 evm-watcher = ["dep:serde_json", "dep:sha3"]
-evm-watcher-http = ["evm-watcher", "dep:ureq"]
+evm-watcher-http = ["evm-watcher", "ureq"]
 
 # Phase E.1 Beldex watcher: consume `gateway_get_history` deposit events, decode the
 # A.5 bridge memo (destination), resolve via the E.3 chain registry into a MintEvent,
 # and gate on checkpoint finality. Std-only core + serde_json; real HTTP client (the
 # member's own beldexd JSON-RPC) is a thin, separate opt-in.
 beldex-watcher = ["dep:serde_json"]
-beldex-watcher-http = ["beldex-watcher", "dep:ureq"]
+beldex-watcher-http = ["beldex-watcher", "ureq"]
+
+# Shared bounded-timeout HTTP agent; enabled by any feature that speaks HTTP.
+ureq = ["dep:ureq"]
 
 # Autonomy: the `serve` subcommand's watcher-driven loop — both watchers over their real
 # HTTP RPCs, plus tss-integration for the A.5 memo decrypt in the mint EventSource.

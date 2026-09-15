@@ -39,6 +39,17 @@ pub enum SessionMsg {
     Signature(Vec<u8>),
     /// Member → all: I have the distributed signature.
     DistributeAck,
+    /// Member → all: my ed25519 signature over an observed wBDX rotation (H.6.3).
+    ///
+    /// Not part of a signing session: each member observes the rotation on its own RPC
+    /// and signs the same objective fact, and the threshold evidence is assembled by
+    /// merging. It rides the session mesh because `payload_hash` already groups messages
+    /// by exactly the right key — the hash of the canonical ack bytes — so signatures for
+    /// two different rotations can never be pooled, and every frame is already
+    /// authenticated under the sender's committee key.
+    ///
+    /// Body: `committee_index(u16 LE) ‖ signature(64)`.
+    RotationAckSig(Vec<u8>),
 }
 
 /// A full, routable session message.
@@ -69,6 +80,7 @@ const T_NACK: u8 = 2;
 const T_ROUND: u8 = 3;
 const T_SIGNATURE: u8 = 4;
 const T_DIST_ACK: u8 = 5;
+const T_ROTATION_ACK_SIG: u8 = 6;
 
 fn leg_to_u8(l: Leg) -> u8 {
     match l {
@@ -112,6 +124,10 @@ impl WireMsg {
                 push_bytes(&mut out, b);
             }
             SessionMsg::DistributeAck => out.push(T_DIST_ACK),
+            SessionMsg::RotationAckSig(b) => {
+                out.push(T_ROTATION_ACK_SIG);
+                push_bytes(&mut out, b);
+            }
         }
         out
     }
@@ -140,6 +156,7 @@ impl WireMsg {
             T_ROUND => SessionMsg::Round(take_bytes(rest)?),
             T_SIGNATURE => SessionMsg::Signature(take_bytes(rest)?),
             T_DIST_ACK => SessionMsg::DistributeAck,
+            T_ROTATION_ACK_SIG => SessionMsg::RotationAckSig(take_bytes(rest)?),
             _ => return Err(WireError::BadTag),
         };
         Ok(WireMsg { leg, epoch, payload_hash, attempt, from, body })
@@ -205,6 +222,11 @@ pub fn apply(session: &mut Session, wire: &WireMsg) -> Result<(), DispatchError>
         SessionMsg::Round(bytes) => session.on_round_message(from, bytes.clone()),
         SessionMsg::Signature(bytes) => session.signature_ready(bytes.clone()),
         SessionMsg::DistributeAck => session.on_distribute_ack(from),
+        // Not a session message. It rides the same mesh for authentication and for the
+        // grouping `payload_hash` gives, but it belongs to the rotation-ack collector,
+        // which handles it before dispatch. Reaching here means no collector was
+        // listening; ignore it rather than failing a live signing session.
+        SessionMsg::RotationAckSig(_) => Ok(()),
     };
 
     match r {
@@ -243,6 +265,77 @@ pub trait SessionTransport {
     fn send_to(&mut self, peer_index: u16, msg: &WireMsg) -> Result<(), MeshError>;
     /// Non-blocking receive of the next inbound message, if any is ready.
     fn poll(&mut self) -> Result<Option<WireMsg>, MeshError>;
+}
+
+/// Report a failed mesh send rather than discarding it.
+///
+/// A dropped frame is partial dissemination, and the round then fails as an
+/// unexplained timeout with nothing in the log pointing at the cause. The send is not
+/// retried here — the protocol drivers re-broadcast on their own schedule — but the
+/// failure is made visible so a delivery problem can be told apart from a peer that
+/// is simply slow.
+pub fn note_send_failure(what: &str, r: Result<(), MeshError>) {
+    if let Err(e) = r {
+        eprintln!("  mesh send failed ({what}): {e:?}");
+    }
+}
+
+#[cfg(test)]
+mod rotation_ack_wire_tests {
+    use super::*;
+
+    /// A rotation-ack signature must survive the wire unchanged, and must carry the
+    /// acknowledged fact's own hash as `payload_hash` — that is what keeps signatures for
+    /// two different rotations from ever being pooled.
+    #[test]
+    fn an_ack_signature_round_trips_with_its_fact_hash() {
+        let body = {
+            let mut v = Vec::new();
+            v.extend_from_slice(&7u16.to_le_bytes());
+            v.extend_from_slice(&[0xAB; 64]);
+            v
+        };
+        let msg = WireMsg {
+            leg: crate::transport::Leg::Pgw,
+            epoch: 12,
+            payload_hash: [0x5A; 32], // the fact's hash, not a session's
+            attempt: 0,
+            from: 7,
+            body: SessionMsg::RotationAckSig(body.clone()),
+        };
+        let decoded = WireMsg::decode(&msg.encode()).expect("round trip");
+        assert_eq!(decoded, msg);
+        match decoded.body {
+            SessionMsg::RotationAckSig(b) => assert_eq!(b, body),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// It must not collide with the session message types that share the wire.
+    #[test]
+    fn its_tag_is_distinct_from_session_messages() {
+        let hdr = |b: SessionMsg| {
+            WireMsg {
+                leg: crate::transport::Leg::Pgw,
+                epoch: 1,
+                payload_hash: [0; 32],
+                attempt: 0,
+                from: 0,
+                body: b,
+            }
+            .encode()[HEADER_LEN - 1]
+        };
+        let ack_sig = hdr(SessionMsg::RotationAckSig(vec![0; 66]));
+        for other in [
+            hdr(SessionMsg::Ack),
+            hdr(SessionMsg::DistributeAck),
+            hdr(SessionMsg::Round(vec![1])),
+            hdr(SessionMsg::Signature(vec![1])),
+            hdr(SessionMsg::Propose(vec![1])),
+        ] {
+            assert_ne!(ack_sig, other, "tag must be unique");
+        }
+    }
 }
 
 #[cfg(test)]

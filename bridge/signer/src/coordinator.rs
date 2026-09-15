@@ -244,6 +244,12 @@ where
     /// scheme driver, whose mesh barrier waits on exactly those peers. Must be ≥ 1 in a real
     /// mesh; tests with a synchronous bus can use 0.
     pub sign_settle_steps: u32,
+    /// Rotation-ack signatures seen on the mesh, drained by the service loop.
+    ///
+    /// These are not session traffic: they carry the acknowledged fact's own hash as
+    /// `payload_hash`, so no session ever claims them and `pump_inbox` would otherwise
+    /// drop them as belonging to an unopened session. Held as `(fact hash, body)`.
+    pub rotation_ack_inbox: Vec<([u8; 32], Vec<u8>)>,
     live: BTreeMap<[u8; 32], LiveSession>,
 }
 
@@ -268,6 +274,7 @@ where
             complete,
             stage_timeout_ticks: 10,
             sign_settle_steps: 1,
+            rotation_ack_inbox: Vec::new(),
             live: BTreeMap::new(),
         }
     }
@@ -304,6 +311,12 @@ where
     /// every tick while in Consensus, so laggards converge as soon as their watcher catches up.
     fn pump_inbox<T: SessionTransport>(&mut self, net: &mut T, report: &mut StepReport) {
         while let Ok(Some(msg)) = net.poll() {
+            // Not session traffic — set aside for the rotation-ack collector before the
+            // unopened-session drop below would discard it.
+            if let SessionMsg::RotationAckSig(body) = &msg.body {
+                self.rotation_ack_inbox.push((msg.payload_hash, body.clone()));
+                continue;
+            }
             let Some(live) = self.live.get_mut(&msg.payload_hash) else {
                 continue; // unopened session — benign drop (see doc above)
             };
@@ -367,14 +380,14 @@ where
                 live.proposal = Some(proposal.to_vec());
                 live.acked = true;
                 let m = Self::msg_for(&live.session, self_index, SessionMsg::Ack);
-                let _ = net.broadcast(&m);
+                crate::wire::note_send_failure("session", net.broadcast(&m));
                 let _ = apply(&mut live.session, &m); // count own ACK locally
                 report.acked += 1;
             }
             ProposalVerdict::Reject(reason) => {
                 live.nacked = true;
                 let m = Self::msg_for(&live.session, self_index, SessionMsg::Nack(reason));
-                let _ = net.broadcast(&m);
+                crate::wire::note_send_failure("session", net.broadcast(&m));
                 let _ = apply(&mut live.session, &m);
                 report.nacked += 1;
             }
@@ -498,14 +511,14 @@ where
                                 self.self_index,
                                 SessionMsg::Propose(p),
                             );
-                            let _ = net.broadcast(&m);
+                            crate::wire::note_send_failure("session", net.broadcast(&m));
                             report.proposed += 1;
                             if !live.acked {
                                 // The leader's own build passed its own policy by construction.
                                 live.acked = true;
                                 let a =
                                     Self::msg_for(&live.session, self.self_index, SessionMsg::Ack);
-                                let _ = net.broadcast(&a);
+                                crate::wire::note_send_failure("session", net.broadcast(&a));
                                 let _ = apply(&mut live.session, &a);
                                 report.acked += 1;
                             }
@@ -549,7 +562,7 @@ where
                                                 self.self_index,
                                                 SessionMsg::Signature(sig.clone()),
                                             );
-                                            let _ = net.broadcast(&m);
+                                            crate::wire::note_send_failure("session", net.broadcast(&m));
                                         }
                                         let _ = live.session.signature_ready(sig);
                                     }
@@ -564,7 +577,7 @@ where
                         live.dist_acked = true;
                         let m =
                             Self::msg_for(&live.session, self.self_index, SessionMsg::DistributeAck);
-                        let _ = net.broadcast(&m);
+                        crate::wire::note_send_failure("session", net.broadcast(&m));
                         let _ = apply(&mut live.session, &m);
                     }
                 }

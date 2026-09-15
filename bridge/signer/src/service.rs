@@ -132,6 +132,22 @@ where
 }
 
 #[cfg(all(feature = "beldex-watcher", feature = "evm-watcher", feature = "tss-integration"))]
+impl<B, C> WatcherEventSource<B, C>
+where
+    B: crate::beldex_watcher::BeldexRpc,
+    C: crate::evm_watcher::JsonRpcClient,
+{
+    /// Rotations that settled since the last call, across every watched chain.
+    ///
+    /// Deliberately not part of [`EventSource`]: that trait yields *duties* — work the
+    /// committee signs for a user. A rotation is an observation the committee attests to
+    /// so L1 can release a departed member's bond, and it takes its own path.
+    pub fn poll_rotations(&mut self) -> Vec<crate::evm_watcher::RotationEvent> {
+        self.evm.iter_mut().flat_map(|w| w.take_finalized_rotations()).collect()
+    }
+}
+
+#[cfg(all(feature = "beldex-watcher", feature = "evm-watcher", feature = "tss-integration"))]
 impl<B, C> EventSource for WatcherEventSource<B, C>
 where
     B: crate::beldex_watcher::BeldexRpc,
@@ -157,7 +173,22 @@ where
                 // Held, never minted — but surfaced, so a wrong view secret / chain id is
                 // diagnosable from the logs rather than reading as "nothing happened".
                 Resolution::Unresolved { reason, .. } => {
-                    eprintln!("deposit held (not minted): {reason:?}")
+                    // An over-cap deposit is not a decoding problem: the BDX is already in
+                    // the gateway and the contract will refuse every mint for it, so it
+                    // stays locked until governance raises the cap. Say that plainly —
+                    // it needs an operator, not a retry.
+                    if let crate::beldex_watcher::UnresolvedReason::OverPerTxMax { amount, max } =
+                        &reason
+                    {
+                        eprintln!(
+                            "deposit held (not minted): {amount} exceeds the per-transaction \
+                             cap of {max}. The BDX is locked in the gateway and no mint can \
+                             succeed for it until the cap is raised (contract and registry \
+                             together) — it will not resolve on its own."
+                        );
+                    } else {
+                        eprintln!("deposit held (not minted): {reason:?}");
+                    }
                 }
             }
         }

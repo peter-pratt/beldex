@@ -1,6 +1,13 @@
-//! Preprocessed-material pool (**S3**).
+//! Preprocessed-material pool (**S3**) — **not wired to any signing path**.
 //!
-//! Both signing legs pre-compute message-independent material ahead of demand:
+//! NOT IN USE. No live signing path calls this module: both legs currently compute
+//! their material inside the round. It is kept as the specification of the lifecycle
+//! a preprocessing scheme would have to honour, and the invariants below are tested,
+//! but nothing here is protecting a running system today. Read the rules as
+//! requirements on a future implementation, not as guarantees the bridge currently
+//! provides.
+//!
+//! Were both signing legs to pre-compute message-independent material ahead of demand:
 //! CGGMP21 **presignature tuples** (`Pevm`) and FROST **nonce-commitment pairs**
 //! (`Pgw`). This material is *key-equivalent*: reusing one item for two different
 //! messages leaks the secret key (the classic ECDSA nonce-reuse / FROST
@@ -15,9 +22,13 @@
 //!     ([`Pool::MAX_CAPACITY`]); CGGMP21 unforgeability degrades with `L`.
 //!
 //! This module owns the *lifecycle*, not the cryptography: `T` is opaque
-//! (`PresignatureTuple` / `FrostNoncePair` from the TSS crates). In production the
-//! backing store is the [`crate::share_store`] (so a crash cannot leave a reusable
-//! item on disk); this in-memory pool models and tests the invariants.
+//! (`PresignatureTuple` / `FrostNoncePair` from the TSS crates).
+//!
+//! The single-use rule above holds only while an item never reaches disk. This pool is
+//! in memory, so it cannot by itself deliver that guarantee across a crash: a real
+//! implementation needs crash-safe atomic consumption in whichever custody backend is
+//! chosen, so a restart cannot hand out an item that was already used. Until that
+//! exists, treat this as a model rather than a safe preprocessing store.
 
 /// Errors from pool operations.
 #[derive(Debug, PartialEq, Eq)]

@@ -206,7 +206,7 @@ impl DutyReconciler for GatewayReleaseReconciler {
                 "log_indices": [ev.log_index],
             }
         });
-        let resp = ureq::post(&self.rpc_url).send_json(req).ok()?;
+        let resp = crate::http_agent().post(&self.rpc_url).send_json(req).ok()?;
         let v: serde_json::Value = resp.into_json().ok()?;
         let result = v.get("result")?;
         // A missing/malformed field is a transport-level unknown, not a negative (the `?`s
