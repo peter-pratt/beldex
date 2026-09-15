@@ -169,6 +169,41 @@ pub const BRIDGE_MINT_PUBLISH_DOMAIN: &[u8] = b"bridge_mint_publish_v1";
 ///
 /// Genesis-bound like every other bridge attestation, so a publication cannot be replayed onto
 /// another chain or fork. Byte-for-byte identical to C++ `bridge_mint_publish_message`.
+impl OmqCommitteeClient {
+    /// Submit a threshold-signed rotation acknowledgement to `bridge.rotation_ack`.
+    ///
+    /// The daemon verifies the evidence against the observing epoch's committee and
+    /// returns a serialized `tx_extra` — it does **not** broadcast. A wallet must put
+    /// that into a transaction and pay its fee, the same split `bridge.slash_report`
+    /// uses, since only a wallet can pay.
+    ///
+    /// Submitting is idempotent: an acknowledgement for a key epoch the chain has
+    /// already recorded is a harmless no-op, so whichever member assembles threshold
+    /// first may submit without coordinating.
+    pub fn submit_rotation_ack(&self, submission_json: &str) -> Result<String, String> {
+        let sock = self.ctx.socket(zmq::DEALER).map_err(|e| format!("socket: {e}"))?;
+        sock.set_linger(0).map_err(|e| format!("set_linger: {e}"))?;
+        sock.connect(&self.endpoint)
+            .map_err(|e| format!("connect {}: {e}", self.endpoint))?;
+        sock.send_multipart(
+            [b"bridge.rotation_ack".as_slice(), submission_json.as_bytes()],
+            0,
+        )
+        .map_err(|e| format!("send: {e}"))?;
+
+        let ms = self.timeout.as_millis() as i64;
+        let mut items = [sock.as_poll_item(zmq::POLLIN)];
+        if zmq::poll(&mut items, ms).map_err(|e| format!("poll: {e}"))? == 0 {
+            return Err(format!("timeout after {ms}ms submitting to {}", self.endpoint));
+        }
+        let reply = sock.recv_multipart(0).map_err(|e| format!("recv: {e}"))?;
+        if reply.len() < 2 || reply[0] != b"REPLY" {
+            return Err(format!("unexpected {}-part reply", reply.len()));
+        }
+        Ok(String::from_utf8_lossy(&reply[1]).into_owned())
+    }
+}
+
 pub fn mint_publish_message(genesis: &[u8; 32], payload: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(BRIDGE_MINT_PUBLISH_DOMAIN.len() + 32 + payload.len());
     buf.extend_from_slice(BRIDGE_MINT_PUBLISH_DOMAIN);
