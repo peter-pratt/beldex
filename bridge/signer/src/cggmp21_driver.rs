@@ -112,7 +112,7 @@ pub fn run_cggmp21_keygen_over_transport<T: SessionTransport>(
     let mut early: Vec<(u16, u8, Vec<u8>)> = Vec::new();
     let barrier_deadline = Instant::now() + timeout.min(Duration::from_secs(60));
     loop {
-        let _ = transport.broadcast(&hello);
+        crate::wire::note_send_failure("dkg", transport.broadcast(&hello));
         while let Ok(Some(w)) = transport.poll() {
             if w.leg != Leg::Pevm || w.epoch != epoch || w.payload_hash != tag {
                 continue;
@@ -136,7 +136,7 @@ pub fn run_cggmp21_keygen_over_transport<T: SessionTransport>(
     // Grace: keep answering HELLOs briefly so peers still finishing the barrier
     // see ours (and buffer any keygen frames that arrive meanwhile).
     for _ in 0..6 {
-        let _ = transport.broadcast(&hello);
+        crate::wire::note_send_failure("dkg", transport.broadcast(&hello));
         while let Ok(Some(w)) = transport.poll() {
             if w.leg == Leg::Pevm && w.epoch == epoch && w.payload_hash == tag {
                 if let SessionMsg::Round(payload) = &w.body {
@@ -156,10 +156,16 @@ pub fn run_cggmp21_keygen_over_transport<T: SessionTransport>(
     let (out_tx, out_rx) = mpsc::channel::<Outgoing<KeygenMsg>>();
     let (in_tx, in_rx) = mpsc::channel::<Incoming<KeygenMsg>>();
 
+    // Unique per run, from values every participant agrees on (crate::committee).
+    let eid_bytes = crate::committee::execution_id(
+        b"beldex-pevm-dkg-v1",
+        &[&committee.identity_bytes(), &key_generation.to_le_bytes()],
+    );
+
     // Protocol thread: drive the cggmp21 keygen state machine synchronously.
     let proto = std::thread::spawn(move || -> Result<([u8; 33], Vec<u8>), String> {
         let mut rng = rand::rngs::OsRng;
-        let eid = ExecutionId::new(b"beldex-pevm-live-dkg");
+        let eid = ExecutionId::new(&eid_bytes);
         let mut state = wrap_protocol(|party| async move {
             cggmp21::keygen::<Secp256k1>(eid, self_index, n)
                 .set_threshold(t)
@@ -218,10 +224,10 @@ pub fn run_cggmp21_keygen_over_transport<T: SessionTransport>(
                 .map_err(|e| DriverError::Protocol(format!("serialize outgoing: {e}")))?;
             match out.recipient {
                 MessageDestination::AllParties => {
-                    let _ = transport.broadcast(&wire(epoch, tag, self_index, CGGMP_BCAST, &bytes));
+                    crate::wire::note_send_failure("dkg", transport.broadcast(&wire(epoch, tag, self_index, CGGMP_BCAST, &bytes)));
                 }
                 MessageDestination::OneParty(idx) => {
-                    let _ = transport.send_to(idx, &wire(epoch, tag, self_index, CGGMP_P2P, &bytes));
+                    crate::wire::note_send_failure("dkg", transport.send_to(idx, &wire(epoch, tag, self_index, CGGMP_P2P, &bytes)));
                 }
             }
         }
@@ -271,10 +277,10 @@ pub fn run_cggmp21_keygen_over_transport<T: SessionTransport>(
             .map_err(|e| DriverError::Protocol(format!("serialize outgoing: {e}")))?;
         match out.recipient {
             MessageDestination::AllParties => {
-                let _ = transport.broadcast(&wire(epoch, tag, self_index, CGGMP_BCAST, &bytes));
+                crate::wire::note_send_failure("dkg", transport.broadcast(&wire(epoch, tag, self_index, CGGMP_BCAST, &bytes)));
             }
             MessageDestination::OneParty(idx) => {
-                let _ = transport.send_to(idx, &wire(epoch, tag, self_index, CGGMP_P2P, &bytes));
+                crate::wire::note_send_failure("dkg", transport.send_to(idx, &wire(epoch, tag, self_index, CGGMP_P2P, &bytes)));
             }
         }
     }

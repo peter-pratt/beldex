@@ -547,3 +547,87 @@ mod tests {
         assert!(!churned.overlaps_for_reshare(&prev));
     }
 }
+
+/// Bytes identifying this committee for a protocol transcript: epoch, size,
+/// threshold and the ordered member set. Two nodes holding the same view derive
+/// the same bytes, which is what makes a derived execution id agree across the mesh.
+impl CommitteeView {
+    pub fn identity_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(24 + self.members.len() * 32);
+        v.extend_from_slice(&self.epoch.to_le_bytes());
+        v.extend_from_slice(&(self.members.len() as u32).to_le_bytes());
+        v.extend_from_slice(&(self.threshold as u32).to_le_bytes());
+        for m in &self.members {
+            v.extend_from_slice(m);
+        }
+        v
+    }
+}
+
+/// A domain-separated execution id for one protocol run.
+///
+/// cggmp21 documents this as unique per execution. A constant leaves the library's
+/// security argument inapplicable and weakens separation between concurrent and
+/// retried runs, so each run derives its own from the values that identify it.
+/// Every part must be agreed by all participants: if two honest nodes derive
+/// different ids the round cannot complete, so nothing node-local may be included.
+/// Parts are length-prefixed so no two different inputs can produce the same bytes.
+pub fn execution_id(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(domain.len() as u32).to_le_bytes());
+    buf.extend_from_slice(domain);
+    for p in parts {
+        buf.extend_from_slice(&(p.len() as u32).to_le_bytes());
+        buf.extend_from_slice(p);
+    }
+    crate::coordinator::sha256(&buf)
+}
+
+#[cfg(test)]
+mod execution_id_tests {
+    use super::*;
+
+    fn view(epoch: u64, n: usize, t: usize) -> CommitteeView {
+        CommitteeView {
+            epoch,
+            height: epoch * 100,
+            members: (0..n).map(|i| [i as u8; 32]).collect(),
+            signer_keys: (0..n).map(|i| [i as u8; 32]).collect(),
+            threshold: t,
+            member_ips: Vec::new(),
+            member_x25519: Vec::new(),
+            daemon_self_index: None,
+        }
+    }
+
+    /// Every honest node must derive the SAME id from the same run, or the mesh
+    /// splits and the round can never complete.
+    #[test]
+    fn is_agreed_by_every_node_with_the_same_view() {
+        let a = execution_id(b"d", &[&view(7, 6, 4).identity_bytes(), &1u32.to_le_bytes()]);
+        let b = execution_id(b"d", &[&view(7, 6, 4).identity_bytes(), &1u32.to_le_bytes()]);
+        assert_eq!(a, b);
+    }
+
+    /// ...and a DIFFERENT id for anything that makes it a different execution.
+    #[test]
+    fn changes_with_every_part_of_the_run() {
+        let base = execution_id(b"d", &[&view(7, 6, 4).identity_bytes(), &1u32.to_le_bytes()]);
+        // a different domain (dkg vs aux vs sign)
+        assert_ne!(base, execution_id(b"e", &[&view(7, 6, 4).identity_bytes(), &1u32.to_le_bytes()]));
+        // a different epoch, committee size, threshold, or key generation
+        assert_ne!(base, execution_id(b"d", &[&view(8, 6, 4).identity_bytes(), &1u32.to_le_bytes()]));
+        assert_ne!(base, execution_id(b"d", &[&view(7, 7, 4).identity_bytes(), &1u32.to_le_bytes()]));
+        assert_ne!(base, execution_id(b"d", &[&view(7, 6, 5).identity_bytes(), &1u32.to_le_bytes()]));
+        assert_ne!(base, execution_id(b"d", &[&view(7, 6, 4).identity_bytes(), &2u32.to_le_bytes()]));
+    }
+
+    /// Length prefixing: no two different part lists may collapse to the same bytes.
+    #[test]
+    fn parts_cannot_be_confused_by_concatenation() {
+        assert_ne!(
+            execution_id(b"d", &[b"ab", b"c"]),
+            execution_id(b"d", &[b"a", b"bc"]),
+        );
+    }
+}

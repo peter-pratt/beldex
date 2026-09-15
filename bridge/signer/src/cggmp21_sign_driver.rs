@@ -129,7 +129,7 @@ pub fn run_cggmp21_sign_over_transport<T: SessionTransport>(
     let need_peers = parties.len() as u16 - 1;
     let barrier_deadline = Instant::now() + timeout.min(Duration::from_secs(60));
     loop {
-        let _ = transport.broadcast(&hello);
+        crate::wire::note_send_failure("sign", transport.broadcast(&hello));
         while let Ok(Some(w)) = transport.poll() {
             if w.leg != Leg::Pevm || w.epoch != epoch || w.payload_hash != tag || w.attempt != attempt {
                 continue;
@@ -156,7 +156,7 @@ pub fn run_cggmp21_sign_over_transport<T: SessionTransport>(
         std::thread::sleep(Duration::from_millis(150));
     }
     for _ in 0..6 {
-        let _ = transport.broadcast(&hello);
+        crate::wire::note_send_failure("sign", transport.broadcast(&hello));
         while let Ok(Some(w)) = transport.poll() {
             if w.leg == Leg::Pevm
                 && w.epoch == epoch
@@ -183,9 +183,23 @@ pub fn run_cggmp21_sign_over_transport<T: SessionTransport>(
     // Protocol thread: drive the cggmp21 signing state machine synchronously.
     let parties_for_proto = parties.clone();
     let preimage_owned = preimage.to_vec();
+    // Unique per run: the committee, the exact signer set, the retry attempt and the
+    // payload. Two runs of the same duty under different signers or attempts are
+    // separate executions and must not share a transcript.
+    let parties_bytes: Vec<u8> = parties.iter().flat_map(|p| p.to_le_bytes()).collect();
+    let eid_bytes = crate::committee::execution_id(
+        b"beldex-pevm-sign-v1",
+        &[
+            &committee.identity_bytes(),
+            &parties_bytes,
+            &attempt.to_le_bytes(),
+            preimage,
+        ],
+    );
+
     let proto = std::thread::spawn(move || -> Result<[u8; 64], String> {
         let mut rng = rand::rngs::OsRng;
-        let eid = ExecutionId::new(b"beldex-pevm-live-sign");
+        let eid = ExecutionId::new(&eid_bytes);
         let data = DataToSign::<Secp256k1>::digest::<Keccak256>(&preimage_owned);
         let mut state = wrap_protocol(|party| async move {
             cggmp21::signing(eid, self_pos, &parties_for_proto, &key_share)
@@ -230,7 +244,7 @@ pub fn run_cggmp21_sign_over_transport<T: SessionTransport>(
             .map_err(|e| DriverError::Protocol(format!("serialize outgoing: {e}")))?;
         match out.recipient {
             MessageDestination::AllParties => {
-                let _ = transport.broadcast(&wire(epoch, tag, attempt, self_index, CGGMP_BCAST, &bytes));
+                crate::wire::note_send_failure("sign", transport.broadcast(&wire(epoch, tag, attempt, self_index, CGGMP_BCAST, &bytes)));
             }
             MessageDestination::OneParty(pos) => {
                 if let Some(&peer_idx) = parties.get(pos as usize) {

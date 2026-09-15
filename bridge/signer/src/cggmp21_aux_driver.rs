@@ -116,7 +116,7 @@ pub fn run_cggmp21_aux_over_transport<T: SessionTransport>(
     let mut early: Vec<(u16, u8, Vec<u8>)> = Vec::new();
     let barrier_deadline = Instant::now() + timeout.min(Duration::from_secs(60));
     loop {
-        let _ = transport.broadcast(&hello);
+        crate::wire::note_send_failure("aux", transport.broadcast(&hello));
         while let Ok(Some(w)) = transport.poll() {
             if w.leg != Leg::Pevm || w.epoch != epoch || w.payload_hash != tag {
                 continue;
@@ -140,7 +140,7 @@ pub fn run_cggmp21_aux_over_transport<T: SessionTransport>(
         std::thread::sleep(Duration::from_millis(150));
     }
     for _ in 0..6 {
-        let _ = transport.broadcast(&hello);
+        crate::wire::note_send_failure("aux", transport.broadcast(&hello));
         while let Ok(Some(w)) = transport.poll() {
             if w.leg == Leg::Pevm && w.epoch == epoch && w.payload_hash == tag {
                 if let SessionMsg::Round(payload) = &w.body {
@@ -160,9 +160,15 @@ pub fn run_cggmp21_aux_over_transport<T: SessionTransport>(
     let (in_tx, in_rx) = mpsc::channel::<Incoming<AuxMsg>>();
 
     // Protocol thread: generate safe primes, then drive the aux-info state machine.
+    // Unique per run, from values every participant agrees on (crate::committee).
+    let eid_bytes = crate::committee::execution_id(
+        b"beldex-pevm-aux-v1",
+        &[&committee.identity_bytes(), &key_generation.to_le_bytes()],
+    );
+
     let proto = std::thread::spawn(move || -> Result<Vec<u8>, String> {
         let mut rng = rand::rngs::OsRng;
-        let eid = ExecutionId::new(b"beldex-pevm-live-aux");
+        let eid = ExecutionId::new(&eid_bytes);
         let primes = PregeneratedPrimes::<SecurityLevel128>::generate(&mut rng);
         let mut state = wrap_protocol(|party| async move {
             cggmp21::aux_info_gen(eid, self_index, n, primes)
@@ -215,10 +221,10 @@ pub fn run_cggmp21_aux_over_transport<T: SessionTransport>(
                 .map_err(|e| DriverError::Protocol(format!("serialize outgoing: {e}")))?;
             match out.recipient {
                 MessageDestination::AllParties => {
-                    let _ = transport.broadcast(&wire(epoch, tag, self_index, AUX_BCAST, &bytes));
+                    crate::wire::note_send_failure("aux", transport.broadcast(&wire(epoch, tag, self_index, AUX_BCAST, &bytes)));
                 }
                 MessageDestination::OneParty(idx) => {
-                    let _ = transport.send_to(idx, &wire(epoch, tag, self_index, AUX_P2P, &bytes));
+                    crate::wire::note_send_failure("aux", transport.send_to(idx, &wire(epoch, tag, self_index, AUX_P2P, &bytes)));
                 }
             }
         }
@@ -262,10 +268,10 @@ pub fn run_cggmp21_aux_over_transport<T: SessionTransport>(
             .map_err(|e| DriverError::Protocol(format!("serialize outgoing: {e}")))?;
         match out.recipient {
             MessageDestination::AllParties => {
-                let _ = transport.broadcast(&wire(epoch, tag, self_index, AUX_BCAST, &bytes));
+                crate::wire::note_send_failure("aux", transport.broadcast(&wire(epoch, tag, self_index, AUX_BCAST, &bytes)));
             }
             MessageDestination::OneParty(idx) => {
-                let _ = transport.send_to(idx, &wire(epoch, tag, self_index, AUX_P2P, &bytes));
+                crate::wire::note_send_failure("aux", transport.send_to(idx, &wire(epoch, tag, self_index, AUX_P2P, &bytes)));
             }
         }
     }
