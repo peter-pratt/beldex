@@ -1707,7 +1707,7 @@ where
     // member who has left. Opening new work in that state produces rounds that cannot
     // reach threshold. Detect it and stop taking on new duties; in-flight ones still
     // finish, and the node is restarted to pick up the new committee.
-    let started_with = ls.committee.identity_bytes();
+    let started_with = ls.committee.membership_bytes();
     let committee_probe = beldex_bridge_signer::omq_client::OmqCommitteeClient::new(
         cfg.oxenmq_endpoint.clone(),
     );
@@ -1729,7 +1729,7 @@ where
         // only a view that parses and differs counts, or a blip would stall the node.
         if !committee_changed && ticks % 12 == 0 {
             if let Ok(now) = committee_probe.fetch_committee(None) {
-                if now.identity_bytes() != started_with {
+                if now.membership_bytes() != started_with {
                     committee_changed = true;
                     eprintln!(
                         "!! COMMITTEE CHANGED (epoch {} -> {}): this node was built against the \

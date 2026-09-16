@@ -552,6 +552,23 @@ mod tests {
 /// threshold and the ordered member set. Two nodes holding the same view derive
 /// the same bytes, which is what makes a derived execution id agree across the mesh.
 impl CommitteeView {
+    /// Who is on the committee, WITHOUT the epoch.
+    ///
+    /// The epoch advances on its own every epoch boundary while the same members carry on
+    /// — selection is deterministic, so a stable roster re-selects to exactly the same
+    /// committee. Comparing epoch-bearing bytes would therefore report a change every
+    /// boundary and stall a perfectly healthy bridge. What matters for "are my shares and
+    /// indices still valid" is the roster and threshold, which is what this covers.
+    pub fn membership_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(8 + self.members.len() * 32);
+        v.extend_from_slice(&(self.members.len() as u32).to_le_bytes());
+        v.extend_from_slice(&(self.threshold as u32).to_le_bytes());
+        for m in &self.members {
+            v.extend_from_slice(m);
+        }
+        v
+    }
+
     pub fn identity_bytes(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(24 + self.members.len() * 32);
         v.extend_from_slice(&self.epoch.to_le_bytes());
@@ -629,5 +646,49 @@ mod execution_id_tests {
             execution_id(b"d", &[b"ab", b"c"]),
             execution_id(b"d", &[b"a", b"bc"]),
         );
+    }
+}
+
+#[cfg(test)]
+mod membership_tests {
+    use super::*;
+
+    fn view(epoch: u64, members: &[u8], t: usize) -> CommitteeView {
+        CommitteeView {
+            epoch,
+            height: epoch * 2880,
+            members: members.iter().map(|i| [*i; 32]).collect(),
+            signer_keys: members.iter().map(|i| [*i; 32]).collect(),
+            member_ips: Vec::new(),
+            member_x25519: Vec::new(),
+            daemon_self_index: None,
+            threshold: t,
+        }
+    }
+
+    /// The epoch advances every boundary while the same members carry on. If that counted
+    /// as a change, every node would down tools every epoch and the bridge would stop
+    /// roughly once a day for no reason.
+    #[test]
+    fn a_new_epoch_with_the_same_members_is_not_a_change() {
+        let a = view(7, &[1, 2, 3, 4, 5, 6], 4);
+        let b = view(8, &[1, 2, 3, 4, 5, 6], 4);
+        assert_eq!(a.membership_bytes(), b.membership_bytes(), "same roster, just a new epoch");
+        assert_ne!(a.identity_bytes(), b.identity_bytes(), "but a different protocol run");
+    }
+
+    /// An actual roster change must be caught: this node's share index and mesh
+    /// identities were derived from the old view and no longer apply.
+    #[test]
+    fn a_changed_roster_is_a_change() {
+        let base = view(7, &[1, 2, 3, 4, 5, 6], 4);
+        // someone replaced
+        assert_ne!(base.membership_bytes(), view(7, &[1, 2, 3, 4, 5, 9], 4).membership_bytes());
+        // committee grew
+        assert_ne!(base.membership_bytes(), view(7, &[1, 2, 3, 4, 5, 6, 7], 4).membership_bytes());
+        // threshold moved
+        assert_ne!(base.membership_bytes(), view(7, &[1, 2, 3, 4, 5, 6], 5).membership_bytes());
+        // order changed — a different index means a different share
+        assert_ne!(base.membership_bytes(), view(7, &[6, 5, 4, 3, 2, 1], 4).membership_bytes());
     }
 }
