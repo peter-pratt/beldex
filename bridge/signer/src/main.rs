@@ -1584,6 +1584,16 @@ where
     };
     let bus_sign_key = ls.ed25519_secret;
 
+    // Where signed releases are kept until they are known to have landed. A release that
+    // cannot be re-sent is a payout that can go missing silently.
+    let release_outbox_dir = std::env::var("BRIDGE_SIGNER_RELEASE_OUTBOX")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "releases".to_string());
+    println!("  signed releases kept in: {release_outbox_dir}");
+    // The completion closure takes ownership; the retry sweep needs its own handle.
+    let outbox_dir_for_sweep = release_outbox_dir.clone();
+
     let relay_cmd = std::env::var("BRIDGE_SIGNER_RELAY_CMD").ok().filter(|s| !s.trim().is_empty());
     let relay_stagger_ms: u64 = std::env::var("BRIDGE_SIGNER_RELAY_STAGGER_MS")
         .ok()
@@ -1646,6 +1656,33 @@ where
                 let mut s64 = [0u8; 64];
                 s64.copy_from_slice(sig);
                 let blob_hex: String = p.unsigned_tx_blob.iter().map(|b| format!("{b:02x}")).collect();
+                let sig_hex: String = s64.iter().map(|b| format!("{b:02x}")).collect();
+                let evm_txid_hex: String = p.evm_txid.iter().map(|b| format!("{b:02x}")).collect();
+
+                // Keep the signed bytes BEFORE submitting. Acceptance into a mempool is not
+                // inclusion in a block: a fee spike can evict this, and without a saved copy
+                // nothing could ever re-send it — the user's wBDX is already destroyed.
+                let record = beldex_bridge_signer::release_outbox::ReleaseRecord {
+                    txid: hex(&p.hash_to_sign),
+                    tx_blob: blob_hex.clone(),
+                    signature: sig_hex,
+                    chain_id: p.chain_id,
+                    evm_txid: evm_txid_hex,
+                    log_index: p.log_index,
+                    first_seen: beldex_bridge_signer::release_outbox::now_secs(),
+                    attempts: 1,
+                    gave_up: false,
+                };
+                match beldex_bridge_signer::release_outbox::save(&release_outbox_dir, &record) {
+                    Ok(path) => println!("  release saved for re-send: {}", path.display()),
+                    Err(e) => {
+                        // Submitting something we cannot re-send is how a payout goes
+                        // missing silently. Retry rather than proceed blind.
+                        eprintln!("  release outbox write failed ({e}); not submitting yet");
+                        return ExecOutcome::Retry;
+                    }
+                }
+
                 match done_rpc.borrow_mut().submit_transfer(&blob_hex, &s64) {
                     Ok(txid) => {
                         println!("RELEASE submitted: {txid}");
@@ -1722,6 +1759,11 @@ where
         println!("  rotation acks DISABLED: BRIDGE_SIGNER_GENESIS_HASH is unset, and the \
                   acknowledgement is genesis-bound");
     }
+
+    // Re-send pacing in loop ticks. A Beldex block is ~30s, so re-sending every tick
+    // would repeat before a block could even exist.
+    let release_retry_ticks =
+        std::cmp::max(1, beldex_bridge_signer::release_outbox::RETRY_INTERVAL_SECS / poll_secs.max(1));
 
     let mut ticks = 0u64;
     loop {
@@ -1832,6 +1874,68 @@ where
             }
         }
 
+        // Re-send any release that has not been seen in a block yet. The SAME signed
+        // bytes, never a fresh signature: a duplicate carries the same transaction id and
+        // the chain ignores it, so paying twice is impossible by construction.
+        if ticks % release_retry_ticks == 0 {
+            use beldex_bridge_signer::release_outbox as outbox;
+            let now = outbox::now_secs();
+            for (_, mut rec) in outbox::load_all(&outbox_dir_for_sweep) {
+                if rec.gave_up {
+                    continue; // already handed to a person; do not keep churning
+                }
+                if rec.should_give_up(now) {
+                    rec.gave_up = true;
+                    let _ = outbox::save(&outbox_dir_for_sweep, &rec);
+                    eprintln!(
+                        "!! RELEASE UNDELIVERED after {}h — chain {} burn {} log {} (txid {})\n   \
+                         signed transaction kept in {}; NOT retrying further.\n   \
+                         Before re-sending by hand, CHECK THE TXID IS NOT ALREADY ON CHAIN: \
+                         consensus only refuses a second payout for 24h, and past that a \
+                         stale re-send would pay twice.",
+                        outbox::GIVE_UP_AFTER_SECS / 3600,
+                        rec.chain_id,
+                        rec.evm_txid,
+                        rec.log_index,
+                        rec.txid,
+                        outbox_dir_for_sweep
+                    );
+                    continue;
+                }
+                let mut sig = [0u8; 64];
+                let Some(bytes) = config::parse_hex64(&rec.signature) else {
+                    continue;
+                };
+                sig.copy_from_slice(&bytes);
+                match rpc.borrow_mut().submit_transfer(&rec.tx_blob, &sig) {
+                    Ok(_) => {
+                        rec.attempts += 1;
+                        let _ = outbox::save(&outbox_dir_for_sweep, &rec);
+                    }
+                    Err(e) => {
+                        // Only "discharged" means it is ON CHAIN — that is the consensus
+                        // replay guard ("gateway release replays an already-discharged burn
+                        // ref"), which is recorded when the release is mined. A bare
+                        // "already known / already in mempool" means it is merely queued,
+                        // and dropping the record then would leave nothing to re-send if it
+                        // is later evicted. Keeping a record too long costs one redundant
+                        // re-send; dropping it early costs the user their payout.
+                        let el = e.to_lowercase();
+                        if el.contains("discharged") {
+                            println!(
+                                "release settled on chain (burn {} log {}) — no longer tracked",
+                                rec.evm_txid, rec.log_index
+                            );
+                            outbox::remove(&outbox_dir_for_sweep, &rec);
+                        } else {
+                            rec.attempts += 1;
+                            let _ = outbox::save(&outbox_dir_for_sweep, &rec);
+                        }
+                    }
+                }
+            }
+        }
+
         let rep = coord.step(orch, &mut net);
         if rep != Default::default() {
             let (pending, in_flight, done) = orch.counts();
@@ -1892,6 +1996,47 @@ fn main() -> ExitCode {
     // key, no shares. Requiring the full signer config here would force operators to invent
     // dummy values for keys they must not have. It needs exactly one setting: the OMQ
     // endpoint to subscribe to.
+    // `list-stuck` is dispatched BEFORE the config load, deliberately: it is the recovery
+    // command, and the moment it is most needed is when something is wrong. Requiring a
+    // full signer identity to ask "which payouts are outstanding" would make it unusable
+    // from an operator's laptop, or on a node whose config is the thing that broke. It
+    // needs exactly one setting: where the signed releases are kept.
+    if subcommand.as_deref() == Some("list-stuck") {
+            // The daily sweep: every release still outstanding, and whether it is still
+            // being retried or is waiting for a person.
+            use beldex_bridge_signer::release_outbox as outbox;
+            let dir = std::env::var("BRIDGE_SIGNER_RELEASE_OUTBOX")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "releases".to_string());
+            let now = outbox::now_secs();
+            let all = outbox::load_all(&dir);
+            if all.is_empty() {
+                println!("no outstanding releases in {dir}");
+            } else {
+                println!("{} outstanding release(s) in {dir}:\n", all.len());
+                for (path, r) in &all {
+                    let hours = r.age_secs(now) / 3600;
+                    let state = if r.gave_up {
+                        "NEEDS A PERSON — retries stopped"
+                    } else {
+                        "still retrying"
+                    };
+                    println!(
+                        "  burn chain {} tx {} log {}\n    txid      {}\n    waiting   {hours}h ({} attempts)\n    state     {state}\n    file      {}\n",
+                        r.chain_id, r.evm_txid, r.log_index, r.txid, r.attempts, path.display()
+                    );
+                }
+                println!(
+                    "Before re-sending any of these by hand, CHECK THE TXID IS NOT ALREADY ON\n\
+                     CHAIN. Consensus refuses a second payout for the same burn for only 24h;\n\
+                     past that a stale re-send would pay the user twice. Since a release is\n\
+                     never re-signed, that one txid is the only transaction that can pay it."
+                );
+            }
+        return ExitCode::SUCCESS;
+    }
+
     if subcommand.as_deref() == Some("relay-watch") {
         return match run_relay_watch_standalone() {
             Ok(()) => ExitCode::SUCCESS,

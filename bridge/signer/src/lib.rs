@@ -113,6 +113,7 @@ pub mod coordinator;
 /// hash-binds-blob, replay-ref binding) — C.5 with a predicate instead of byte-equality.
 /// Inspection outages abstain (never NACK an honest leader). [`release_policy::DualPolicy`]
 /// composes mint + release for `serve --live`. std-only; multi-node tested.
+pub mod release_outbox;
 pub mod release_policy;
 
 /// **On-chain reconciliation** — a restarted signer must not re-work duties consensus already
