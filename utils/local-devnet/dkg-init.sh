@@ -24,6 +24,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 cd testdata
+. ../sockbase.sh   # we are in testdata/; the helper lives one level up
+sockbase_init || exit 1
 
 # --- locate the signer binary ------------------------------------------------------------
 if [ -z "${SIGNER:-}" ]; then
@@ -77,8 +79,8 @@ rm -f dkg-*.log
 
 PIDS=""
 for d in beldex-127.0.0.1-*/; do
-  sock="$PWD/${d}devnet/beldexd.sock"
-  key="$PWD/${d}devnet/key_ed25519"
+  sock="$SOCKBASE/${d}devnet/beldexd.sock"
+  key="$SOCKBASE/${d}devnet/key_ed25519"
   # No live socket or no ed25519 identity ⇒ the node cannot join the authenticated mesh.
   [ -S "$sock" ] && [ -f "$key" ] || continue
   BRIDGE_SIGNER_BELDEXD_RPC_URL="http://127.0.0.1:19191" \
@@ -88,7 +90,7 @@ for d in beldex-127.0.0.1-*/; do
   BRIDGE_SIGNER_MN_KEY_FILE="$key" BRIDGE_SIGNER_MESH_PORT_BASE=6000 \
   BRIDGE_SIGNER_MESH_USE_CURVE=false \
   BRIDGE_SIGNER_DKG_TIMEOUT_SECS="$TIMEOUT" \
-  BRIDGE_SIGNER_SHARE_DIR="$PWD/${d}devnet/shares" \
+  BRIDGE_SIGNER_SHARE_DIR="$SOCKBASE/${d}devnet/shares" \
     "$SIGNER" dkg > "dkg-${d%/}.log" 2>&1 &
   PIDS="$PIDS $!"
 done

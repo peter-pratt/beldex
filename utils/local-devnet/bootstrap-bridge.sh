@@ -178,6 +178,13 @@ EOF
 echo "wrote $ENVFILE"
 
 GATEWAY_ID="$GATEWAY_ID" VIEW_SECRET="$VIEW_SECRET" WBDX="$WBDX" ./serve-live.sh
+(cd testdata && . "$PWD/../sockbase.sh" && sockbase_init >/dev/null 2>&1 \
+   && echo "$SOCKBASE/beldex-127.0.0.1-19191/devnet/beldexd.sock") \
+  > /tmp/.bdx-relay-sock.$$ 2>/dev/null || true
+RELAY_SOCK="$(cat /tmp/.bdx-relay-sock.$$ 2>/dev/null)"
+rm -f /tmp/.bdx-relay-sock.$$
+: "${RELAY_SOCK:=$PWD/testdata/beldex-127.0.0.1-19191/devnet/beldexd.sock}"
+
 
 cat <<EOF
 
@@ -188,7 +195,7 @@ Bridge is up. Next, from a CLI wallet (fund it per DEVNET_SETUP.md §4):
 
 and to auto-broadcast mints, in another shell:
 
-  BRIDGE_SIGNER_OXENMQ_ENDPOINT=ipc://\$PWD/testdata/beldex-127.0.0.1-19191/devnet/beldexd.sock \\
+  BRIDGE_SIGNER_OXENMQ_ENDPOINT=ipc://${RELAY_SOCK} \\
   BRIDGE_SIGNER_RELAY_CMD='$HOME/Desktop/beldex/beldex/dkg-tss/beldex/bridge/relayer/target/debug/beldex-bridge-relayer relay -' \\
   RELAYER_GAS_KEY=ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \\
   RELAYER_CHAINS='[{"chain_id":31337,"rpc_url":"http://127.0.0.1:8545"}]' \\

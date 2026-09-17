@@ -104,6 +104,8 @@ case "$PREFIX" in
 esac
 
 cd testdata
+. ../sockbase.sh   # we are in testdata/; the helper lives one level up
+sockbase_init || exit 1
 
 # --- locate the signer binary -------------------------------------------------------------
 # Resolved to an ABSOLUTE path, and resolved AFTER `cd testdata` — a relative path would
@@ -175,9 +177,9 @@ ANY32=$(printf '11%.0s' {1..32})
 
 PIDS=""
 for d in beldex-127.0.0.1-*/; do
-  sock="$PWD/${d}devnet/beldexd.sock"
-  key="$PWD/${d}devnet/key_ed25519"
-  share="$PWD/${d}devnet/$SUBDIR"
+  sock="$SOCKBASE/${d}devnet/beldexd.sock"
+  key="$SOCKBASE/${d}devnet/key_ed25519"
+  share="$SOCKBASE/${d}devnet/$SUBDIR"
   # Same filter as sign-mint.sh: a node without a live socket and an ed25519 identity
   # cannot join the authenticated mesh, so it is not a participant.
   [ -S "$sock" ] && [ -f "$key" ] || continue

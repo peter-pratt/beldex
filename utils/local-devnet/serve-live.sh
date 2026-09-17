@@ -117,6 +117,8 @@ EOF
 )
 
 cd testdata
+. ../sockbase.sh   # we are in testdata/; the helper lives one level up
+sockbase_init || exit 1
 
 SIGNER="${SIGNER:-$(git rev-parse --show-toplevel)/bridge/signer/target/debug/beldex-bridge-signer}"
 [ -x "$SIGNER" ] || { echo "build first: cargo build -p beldex-bridge-signer --features serve-live"; exit 1; }
@@ -129,13 +131,13 @@ rm -f serve-*.log
 started=0
 PIDS=()
 for d in beldex-127.0.0.1-*/; do
-  sock="$PWD/${d}devnet/beldexd.sock"; key="$PWD/${d}devnet/key_ed25519"
+  sock="$SOCKBASE/${d}devnet/beldexd.sock"; key="$SOCKBASE/${d}devnet/key_ed25519"
   # SHARE_SUBDIR: which per-node share tree the signer loads from (default `shares`).
   # `shares-pool` is the devnet-only workaround for EPOCH_RESHUFFLE_ORPHANS_SHARES.md —
   # a symlinked pool holding every node's share, so a node whose live committee index no
   # longer matches its dkg index can still open the share for the seat it now occupies.
   # Same knob name as sign-pevm.sh, deliberately.
-  share="$PWD/${d}devnet/${SHARE_SUBDIR:-shares}"
+  share="$SOCKBASE/${d}devnet/${SHARE_SUBDIR:-shares}"
   [ -S "$sock" ] && [ -f "$key" ] || continue
 
   # This node's committee index, from its own dkg share filename.
@@ -146,7 +148,7 @@ for d in beldex-127.0.0.1-*/; do
   # NB: read from the node's OWN `shares` tree, never from $share — under SHARE_SUBDIR=shares-pool
   # every node sees all six keypackages and `head -1` would report index 0 for all of them,
   # silently collapsing the NODES filter and handing RELAY_CMD to the whole fleet.
-  idx=$(ls "$PWD/${d}devnet/shares"/pgw-*.keypackage 2>/dev/null | sed -E 's/.*pgw-([0-9]+)\.keypackage/\1/' | head -1) || true
+  idx=$(ls "$SOCKBASE/${d}devnet/shares"/pgw-*.keypackage 2>/dev/null | sed -E 's/.*pgw-([0-9]+)\.keypackage/\1/' | head -1) || true
   [ -n "$idx" ] || { echo "skip ${d%/}: no pgw share (did dkg run here?)"; continue; }
   if [ "$NODES" != "all" ]; then
     case ",$NODES," in
@@ -166,7 +168,7 @@ for d in beldex-127.0.0.1-*/; do
 
   echo "start ${d%/}: committee index $idx${node_relay:+  (relays mints)}"
   BRIDGE_SIGNER_GENESIS_HASH="$BRIDGE_SIGNER_GENESIS_HASH" \
-  BRIDGE_SIGNER_MINT_BUS_ENDPOINT="ipc://$PWD/beldex-127.0.0.1-19191/devnet/beldexd.sock" \
+  BRIDGE_SIGNER_MINT_BUS_ENDPOINT="ipc://$SOCKBASE/beldex-127.0.0.1-19191/devnet/beldexd.sock" \
   BRIDGE_SIGNER_RELAY_CMD="$node_relay" \
   BRIDGE_SIGNER_RELAY_STAGGER_MS="$RELAY_STAGGER_MS" \
   BRIDGE_SIGNER_SERVE_LIVE=1 \

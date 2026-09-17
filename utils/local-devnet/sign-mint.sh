@@ -31,6 +31,8 @@ if [ "${#PREIMAGE}" -ne 384 ] && [ "${FORCE_PREIMAGE:-0}" != "1" ]; then
 fi
 
 cd testdata
+. ../sockbase.sh   # we are in testdata/; the helper lives one level up
+sockbase_init || exit 1
 
 SIGNER="${SIGNER:-$(git rev-parse --show-toplevel)/bridge/signer/target/debug/beldex-bridge-signer}"
 [ -x "$SIGNER" ] || { echo "build first: cargo build --features live-dkg,live-pevm-dkg"; exit 1; }
@@ -51,8 +53,8 @@ sleep 1
 rm -f sign-*.log
 
 for d in beldex-127.0.0.1-*/; do
-  sock="$PWD/${d}devnet/beldexd.sock"; key="$PWD/${d}devnet/key_ed25519"
-  share="$PWD/${d}devnet/shares"
+  sock="$SOCKBASE/${d}devnet/beldexd.sock"; key="$SOCKBASE/${d}devnet/key_ed25519"
+  share="$SOCKBASE/${d}devnet/shares"
   [ -S "$sock" ] && [ -f "$key" ] || continue
   BRIDGE_SIGNER_BELDEXD_RPC_URL="http://127.0.0.1:19191" \
   BRIDGE_SIGNER_OXENMQ_ENDPOINT="ipc://$sock" \

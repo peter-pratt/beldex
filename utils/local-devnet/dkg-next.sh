@@ -62,6 +62,8 @@ if [ "$SUBDIR" = "shares" ]; then
 fi
 
 cd testdata
+. ../sockbase.sh   # we are in testdata/; the helper lives one level up
+sockbase_init || exit 1
 
 # --- locate the signer binary ---------------------------------------------------------------
 # Absolute, and resolved AFTER `cd testdata` — same reasoning as sign-pevm.sh.
@@ -119,9 +121,9 @@ ANY32=$(printf '11%.0s' {1..32})
 
 PIDS=""
 for d in beldex-127.0.0.1-*/; do
-  sock="$PWD/${d}devnet/beldexd.sock"
-  key="$PWD/${d}devnet/key_ed25519"
-  share="$PWD/${d}devnet/$SUBDIR"
+  sock="$SOCKBASE/${d}devnet/beldexd.sock"
+  key="$SOCKBASE/${d}devnet/key_ed25519"
+  share="$SOCKBASE/${d}devnet/$SUBDIR"
   # Same participant filter as sign-mint.sh: no live socket or no ed25519 identity means
   # the node cannot join the authenticated mesh.
   [ -S "$sock" ] && [ -f "$key" ] || continue
