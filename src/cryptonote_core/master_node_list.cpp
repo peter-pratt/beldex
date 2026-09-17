@@ -2054,9 +2054,12 @@ namespace master_nodes
           if (state.height % cryptonote::bridge_epoch_blocks(nettype) != 0)
             continue; // not an epoch boundary: leave bridge quorum unset (nullptr)
 
-          // Candidate seats: active MNs that opted into the bridge set, are
-          // seated (not merely queued) and not exiting. sort_and_filter yields a
-          // deterministic (pubkey-sorted) order so every node agrees.
+          // Candidate seats: active MNs that opted into the bridge set and are
+          // seated (not merely queued). An EXITING seat is still a candidate: it
+          // holds the only share that can sign under the current key, so it must
+          // stay selectable until the rotation that retires that key completes.
+          // sort_and_filter yields a deterministic (pubkey-sorted) order so every
+          // node agrees.
           std::vector<pubkey_and_mninfo> seats =
               sort_and_filter(state.master_nodes_infos,
                               [](const master_node_info &info) { return info.is_bridge_seated(); },

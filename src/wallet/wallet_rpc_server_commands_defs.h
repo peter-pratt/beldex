@@ -2383,6 +2383,80 @@ gateway is thereafter operated via the owner key.)";
   };
 
   BELDEX_RPC_DOC_INTROSPECT
+  // Re-point an existing gateway at a new owner key (HF22).
+  struct GATEWAY_UPDATE_DESCRIPTOR : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("gateway_update_descriptor"); }
+
+    static constexpr const char *description =
+R"(Build an update_gateway_address transaction that re-points an existing gateway at a
+new owner key. Pays only the ordinary network fee from this wallet (the 100 BDX
+registration fee is charged on registration only).
+
+The transaction is returned UNSIGNED and is NEVER relayed: a descriptor update must
+be authorised by the gateway's CURRENT owner, which for a bridge reserve is the
+committee's threshold key that no single node holds. Hand `hash_to_sign` to the
+outgoing committee, then relay the result with `gateway_submit_descriptor_update`.
+
+`bridge_reserve` must be set for a gateway that already carries the flag: it is
+sticky and consensus rejects an update that would clear it.)";
+
+    struct request
+    {
+      std::string        gateway_id;       // 64-char hex id of the gateway to re-point.
+      std::string        owner_key_type;   // New owner key type: "schnorr" (native), "eth" (secp256k1), or "eddsa".
+      std::string        owner_key;        // Hex NEW owner key (64 for schnorr/eddsa, 66 for eth-compressed).
+      std::string        meta_info;        // (Optional) descriptor meta string.
+      bool               bridge_reserve;   // (Optional) Carry the STICKY Sovereign Bridge reserve flag forward. Required if the gateway already has it. Defaults to false.
+
+      uint32_t           account_index;    // (Optional) Pay the fee from this account index. (Defaults to 0)
+      std::set<uint32_t> subaddr_indices;  // (Optional) Pay the fee from this set of subaddresses. (Defaults to 0)
+      uint32_t           priority;         // Set a priority for the transaction. Accepted values are: 0-4.
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response
+    {
+      std::string tx_metadata;  // Relay metadata for the unsigned tx. Pass back to gateway_submit_descriptor_update.
+      std::string tx_blob;      // Hex of the unsigned tx, for inspection.
+      std::string hash_to_sign; // 64-char hex digest the CURRENT owner key must sign.
+      uint64_t    fee;          // Network fee in atomic units, paid by this wallet.
+
+      KV_MAP_SERIALIZABLE
+    };
+  };
+
+  BELDEX_RPC_DOC_INTROSPECT
+  // Attach an owner signature to a descriptor update and relay it (HF22).
+  struct GATEWAY_SUBMIT_DESCRIPTOR_UPDATE : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("gateway_submit_descriptor_update"); }
+
+    static constexpr const char *description =
+R"(Attach the current owner's signature over `hash_to_sign` to the transaction returned
+by `gateway_update_descriptor`, and relay it. The wallet holds no owner secret: the
+signature is produced elsewhere (for a bridge reserve, by the committee's threshold
+signing session) and merely injected here.)";
+
+    struct request
+    {
+      std::string tx_metadata;    // Relay metadata from gateway_update_descriptor.
+      std::string signature;      // Hex owner signature over hash_to_sign (128 for schnorr/eddsa, 130 for eth).
+      std::string signature_type; // "schnorr" (native), "eth" (secp256k1), or "eddsa". Must match the CURRENT owner key type.
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response
+    {
+      std::string tx_hash; // Publicly searchable transaction hash.
+
+      KV_MAP_SERIALIZABLE
+    };
+  };
+
+  BELDEX_RPC_DOC_INTROSPECT
   // Renew an active belnet BNS registration
   struct BNS_RENEW_MAPPING : RESTRICTED
   {
@@ -2768,6 +2842,8 @@ This command is only required if the open wallet is one of the owners of a BNS r
     SET_LOG_CATEGORIES,
     BNS_BUY_MAPPING,
     GATEWAY_REGISTER_ADDRESS,
+    GATEWAY_UPDATE_DESCRIPTOR,
+    GATEWAY_SUBMIT_DESCRIPTOR_UPDATE,
     BNS_UPDATE_MAPPING,
     BNS_RENEW_MAPPING,
     BNS_MAKE_UPDATE_SIGNATURE,

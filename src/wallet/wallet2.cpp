@@ -9286,6 +9286,39 @@ std::vector<wallet2::pending_tx> wallet2::bns_create_buy_mapping_tx(bns::mapping
   return result;
 }
 
+// The owner key must be valid for whichever of the three types was supplied.
+// This MUST match consensus (master_nodes::is_valid_gateway_owner_key): the
+// native schnorr key requires prime-order main-subgroup membership, not just a
+// decodable point, or the daemon rejects the built tx ("invalid owner key").
+// Shared by the register and update descriptor-op builders.
+static bool gateway_owner_key_is_buildable(const cryptonote::gateway_owner_key_v& owner_key,
+                                           std::string *reason)
+{
+  const bool owner_ok = std::visit([](const auto& k) -> bool {
+    using T = std::decay_t<decltype(k)>;
+    if constexpr (std::is_same_v<T, crypto::public_key>)          return crypto::check_key_in_main_subgroup(k);
+    else if constexpr (std::is_same_v<T, crypto::eth_public_key>) return crypto::check_eth_public_key(k);
+    else                                                          return crypto::check_eddsa_public_key(k);
+  }, owner_key);
+  if (owner_ok)
+    return true;
+  if (reason)
+  {
+    const char* type_hint = std::visit([](const auto& k) -> const char* {
+      using T = std::decay_t<decltype(k)>;
+      if constexpr (std::is_same_v<T, crypto::public_key>)
+        return "schnorr owner key must be a canonical ed25519 point in the prime-order "
+               "main subgroup (a normal Beldex public key); a random 32-byte value is not valid";
+      else if constexpr (std::is_same_v<T, crypto::eth_public_key>)
+        return "eth owner key must be a valid 33-byte compressed secp256k1 point";
+      else
+        return "eddsa owner key must be a valid canonical RFC-8032 ed25519 point";
+    }, owner_key);
+    *reason = std::string("invalid gateway owner key: ") + type_hint;
+  }
+  return false;
+}
+
 std::vector<wallet2::pending_tx> wallet2::create_gateway_register_tx(const crypto::secret_key& gateway_skey,
                                                                     const cryptonote::gateway_owner_key_v& owner_key,
                                                                     const std::string& meta_info,
@@ -9316,34 +9349,8 @@ std::vector<wallet2::pending_tx> wallet2::create_gateway_register_tx(const crypt
     return {};
   }
 
-  // The owner key must be valid for whichever of the three types was supplied.
-  // This MUST match consensus (master_nodes::is_valid_gateway_owner_key): the
-  // native schnorr key requires prime-order main-subgroup membership, not just a
-  // decodable point, or the daemon rejects the built tx ("invalid owner key").
-  const bool owner_ok = std::visit([](const auto& k) -> bool {
-    using T = std::decay_t<decltype(k)>;
-    if constexpr (std::is_same_v<T, crypto::public_key>)          return crypto::check_key_in_main_subgroup(k);
-    else if constexpr (std::is_same_v<T, crypto::eth_public_key>) return crypto::check_eth_public_key(k);
-    else                                                          return crypto::check_eddsa_public_key(k);
-  }, owner_key);
-  if (!owner_ok)
-  {
-    if (reason)
-    {
-      const char* type_hint = std::visit([](const auto& k) -> const char* {
-        using T = std::decay_t<decltype(k)>;
-        if constexpr (std::is_same_v<T, crypto::public_key>)
-          return "schnorr owner key must be a canonical ed25519 point in the prime-order "
-                 "main subgroup (a normal Beldex public key); a random 32-byte value is not valid";
-        else if constexpr (std::is_same_v<T, crypto::eth_public_key>)
-          return "eth owner key must be a valid 33-byte compressed secp256k1 point";
-        else
-          return "eddsa owner key must be a valid canonical RFC-8032 ed25519 point";
-      }, owner_key);
-      *reason = std::string("invalid gateway owner key: ") + type_hint;
-    }
+  if (!gateway_owner_key_is_buildable(owner_key, reason))
     return {};
-  }
 
   cryptonote::tx_extra_gateway_descriptor_operation op{};
   op.op_type              = cryptonote::gateway_descriptor_op_type::register_address;
@@ -9388,6 +9395,68 @@ std::vector<wallet2::pending_tx> wallet2::create_gateway_register_tx(const crypt
     }
   }
   return ptx_vector;
+}
+
+std::vector<wallet2::pending_tx> wallet2::create_gateway_update_tx(const crypto::public_key& gateway_id,
+                                                                  const cryptonote::gateway_owner_key_v& owner_key,
+                                                                  const std::string& meta_info,
+                                                                  std::string *reason,
+                                                                  uint32_t priority,
+                                                                  uint32_t account_index,
+                                                                  std::set<uint32_t> subaddr_indices,
+                                                                  bool bridge_reserve)
+{
+  auto hf_version = get_hard_fork_version();
+  if (!hf_version)
+  {
+    if (reason) *reason = ERR_MSG_NETWORK_VERSION_QUERY_FAILED;
+    return {};
+  }
+  if (*hf_version < hf::hf22_gateway_addresses)
+  {
+    if (reason) *reason = "gateway addresses are only available from hardfork 22";
+    return {};
+  }
+  if (!crypto::check_key(gateway_id))
+  {
+    if (reason) *reason = "invalid gateway id: not a valid public key";
+    return {};
+  }
+  if (!gateway_owner_key_is_buildable(owner_key, reason))
+    return {};
+
+  cryptonote::tx_extra_gateway_descriptor_operation op{};
+  op.op_type              = cryptonote::gateway_descriptor_op_type::update_address;
+  op.address_id           = gateway_id;
+  op.descriptor.owner_key = owner_key;
+  op.descriptor.meta_info = meta_info;
+  if (bridge_reserve)
+  {
+    // STICKY on the existing descriptor: consensus rejects an update that would
+    // clear it, so a reserve gateway must carry it forward on every re-point.
+    op.descriptor.version = 1;
+    op.descriptor.flags |= cryptonote::GATEWAY_FLAG_BRIDGE_RESERVE;
+  }
+
+  std::vector<uint8_t> extra;
+  cryptonote::add_gateway_descriptor_operation_to_tx_extra(extra, op);
+
+  // No burn: the registration fee is charged only on the register branch.
+  beldex_construct_tx_params tx_params =
+      wallet2::construct_params(*hf_version, txtype::update_gateway_address, priority, 0 /*burn_fixed*/);
+
+  // Deliberately returned WITHOUT a gateway_ownership_proof — the current owner is
+  // the committee's threshold key, so the proof is produced off-box and attached
+  // with cryptonote::attach_gateway_ownership_proof once the committee has signed
+  // gateway_ownership_message() over the final prefix.
+  return create_transactions_2({} /*dsts*/,
+                               cryptonote::TX_OUTPUT_DECOYS,
+                               0 /*unlock_at_block*/,
+                               priority,
+                               extra,
+                               account_index,
+                               subaddr_indices,
+                               tx_params);
 }
 
 std::optional<bns::mapping_years> wallet2::bns_validate_years(std::string_view map_years, std::string *reason)

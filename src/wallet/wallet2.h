@@ -1479,6 +1479,24 @@ private:
     // (HF23 §3.6). Irreversible; only for an actual bridge reserve gateway.
     std::vector<pending_tx> create_gateway_register_tx(const crypto::secret_key& gateway_skey, const cryptonote::gateway_owner_key_v& owner_key, const std::string& meta_info, std::string *reason, uint32_t priority = 0, uint32_t account_index = 0, std::set<uint32_t> subaddr_indices = {}, bool bridge_reserve = false);
 
+    // Gateway descriptor UPDATE (HF22): re-point an existing gateway at a new
+    // owner key. Unlike a registration this pays no registration fee (consensus
+    // charges it only on the register branch, which requires the gateway not to
+    // exist) — the cost is the ordinary network fee, paid by this wallet, with the
+    // change returning to it.
+    //
+    // No proof is attached here. A registration can self-sign because the gateway
+    // secret is one key on disk; an update must satisfy the CURRENT owner, which
+    // for a bridge reserve is the committee's threshold key `Pgw` that no single
+    // node holds. The caller therefore builds the tx, has the outgoing committee
+    // sign `gateway_ownership_message(nettype, tx)`, and attaches the aggregate
+    // with cryptonote::attach_gateway_ownership_proof before relaying. The tx is
+    // invalid on chain until that happens.
+    //
+    // `bridge_reserve` must still be set for a gateway that already carries the
+    // flag: it is STICKY and consensus rejects an update that would clear it.
+    std::vector<pending_tx> create_gateway_update_tx(const crypto::public_key& gateway_id, const cryptonote::gateway_owner_key_v& owner_key, const std::string& meta_info, std::string *reason, uint32_t priority = 0, uint32_t account_index = 0, std::set<uint32_t> subaddr_indices = {}, bool bridge_reserve = false);
+
     // signature: (Optional) If set, use the signature given, otherwise by default derive the signature from the wallet spend key as an ed25519 key.
     //            The signature is derived from the hash of the previous txid blob and previous value blob of the mapping. By default this is signed using the wallet's spend key as an ed25519 keypair.
     std::vector<pending_tx> bns_create_update_mapping_tx(std::string name, std::string const *value_bchat, std::string const *value_wallet, std::string const *value_belnet, std::string const *value_eth_addr, std::string const *owner, std::string const *backup_owner, std::string const *signature, std::string *reason, uint32_t priority = 0, uint32_t account_index = 0, std::set<uint32_t> subaddr_indices = {}, nlohmann::json *response = {});

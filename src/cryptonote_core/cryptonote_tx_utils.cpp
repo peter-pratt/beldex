@@ -849,6 +849,28 @@ namespace cryptonote
     return true;
   }
   //---------------------------------------------------------------
+  bool attach_gateway_ownership_proof(network_type /*nettype*/, transaction& tx,
+                                      const gateway_owner_sig_v& sig)
+  {
+    if (tx.type != txtype::update_gateway_address)
+    {
+      LOG_ERROR("gateway proof attach: tx type is not update_gateway_address");
+      return false;
+    }
+    // Replace any existing ownership proof; keep any other proof kinds. Mirrors
+    // sign_gateway_register_tx, but the signature arrives from the committee
+    // rather than from a local secret.
+    std::vector<gateway_proof_v> proofs;
+    proofs.reserve(tx.gateway_proofs.size() + 1);
+    for (const auto& p : tx.gateway_proofs)
+      if (!std::holds_alternative<gateway_ownership_proof>(p))
+        proofs.push_back(p);
+    proofs.emplace_back(gateway_ownership_proof{sig});
+    tx.gateway_proofs = std::move(proofs);
+    tx.invalidate_hashes();
+    return true;
+  }
+  //---------------------------------------------------------------
   // Gateway → wallet withdrawal (HF22). Spends from a gateway's on-chain balance
   // via a single txin_gateway and pays normal wallet (stealth) outputs, fully
   // scannable by wallet2: per-output one-time keys, v2 ECDH-encoded amounts,

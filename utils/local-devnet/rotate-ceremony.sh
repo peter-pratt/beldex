@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # rotate-ceremony.sh — run the whole H.6 committee rotation, end to end, across both repos.
 #
-#     runlog ./rotate-ceremony.sh              # the full ceremony, steps 1-8
+#     runlog ./rotate-ceremony.sh              # the full ceremony, steps 1-8 (+6b)
 #     runlog ./rotate-ceremony.sh --from 5     # resume after a failure, without re-DKG'ing
 #
 # Every one of the eight steps in ROTATION_RUNBOOK.md already has a script. What did not
@@ -17,6 +17,10 @@
 #     before step 1  the DKG        — 15 minutes of committee time, new key material
 #     before step 5  the activation — an on-chain, irreversible hand-off of the bridge
 #     before step 7  the promotion  — moves the live share trees on every node's disk
+#
+# Step 6b (the gateway handover) is NOT gated: it is the other half of the rotation, not a
+# judgement call. A rotation that moves the mint authority without moving the release
+# authority leaves the bridge issuing wBDX it cannot pay back.
 #
 # The gates ask for a literal "yes". Everything between them is checks and plumbing.
 #
@@ -631,6 +635,40 @@ step6() {
 skip6() { note "step 6 skipped"; }
 
 # ===========================================================================================
+# step 6b — hand the gateway over to the incoming committee.
+#
+# The rotation above moved the MINT authority (Pevm) on the EVM side. It did nothing to the
+# RELEASE authority: consensus checks every gateway withdrawal against the gateway's current
+# owner key, and that is still the OUTGOING committee's Pgw. Left here, the incoming
+# committee can mint but every payout fails with "gateway input signature verification
+# failed" — wBDX keeps being issued while nothing can come back out.
+#
+# This must run BEFORE step 7. The authorisation has to be signed by the outgoing Pgw, and
+# step 7 moves that tree off the path every sign-* script defaults to.
+# ===========================================================================================
+step6b() {
+  banner "6b — hand the gateway to the incoming committee"
+  STEP_TITLE="step 6b, the gateway handover"; FAILED_AT=6
+
+  local vkfile newvk
+  vkfile="$(ls "$TESTDATA"/beldex-127.0.0.1-*/devnet/shares-next/pgw-*.groupvk 2>/dev/null | head -1)"
+  [ -n "$vkfile" ] || fail "no shares-next/pgw-*.groupvk found — step 1's DKG did not write a Pgw key.
+   Without it the gateway cannot be handed over and releases will stop at step 7."
+  newvk="$(od -An -v -tx1 < "$vkfile" | tr -d ' \n')"
+  printf '  incoming Pgw : %s\n' "$newvk"
+
+  # The outgoing tree is still the default (`shares`); do not let a stray SHARE_SUBDIR
+  # point this at shares-next, which would sign with a key the gateway does not accept.
+  SHARE_SUBDIR=shares run_logged "06b-gateway-handover.log" \
+    "$LOCAL/gateway-handover.sh" "$newvk" \
+    || fail "the gateway handover failed — see $WORK/06b-gateway-handover.log.
+   Do NOT run step 7. The outgoing Pgw is still the only key that can authorise this, and
+   promoting the shares now puts it out of reach of every sign-* script."
+  ok "the gateway now answers to the incoming committee's Pgw (address unchanged)"
+}
+skip6b() { note "step 6b skipped"; }
+
+# ===========================================================================================
 # step 7 — promote the share trees.  IRREVERSIBLE ON DISK.
 # ===========================================================================================
 gen_dirs() { ls -d "$TESTDATA"/beldex-127.0.0.1-*/devnet/shares-gen* 2>/dev/null | sed 's#.*/##' | sort -u || true; }
@@ -797,6 +835,11 @@ skip8() { note "step 8 skipped"; }
 for n in 1 2 3 4 5 6 7 8; do
   CURRENT_STEP="$n"
   if [ "$FROM" -le "$n" ]; then "step$n"; else "skip$n"; fi
+  # The gateway handover sits between verification and promotion — it is signed by the
+  # OUTGOING key, which step 7 moves. Resuming --from 7 deliberately skips it.
+  if [ "$n" = 6 ]; then
+    if [ "$FROM" -le 6 ]; then step6b; else skip6b; fi
+  fi
 done
 
 # ===========================================================================================

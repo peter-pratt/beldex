@@ -55,6 +55,8 @@
 #include "rpc/core_rpc_server_commands_defs.h"
 #include "daemonizer/daemonizer.h"
 #include "cryptonote_core/beldex_name_system.h"
+#include "cryptonote_core/gateway_utils.h"
+#include "cryptonote_core/cryptonote_tx_utils.h"
 #include "serialization/boost_std_variant.h"
 
 #undef BELDEX_DEFAULT_LOG_CATEGORY
@@ -3302,6 +3304,35 @@ namespace {
     return res;
   }
 
+  // Parse one of the three supported gateway owner key types. Shared by the
+  // register and update descriptor-op handlers.
+  static cryptonote::gateway_owner_key_v parse_gateway_owner_key(const std::string& type,
+                                                                 const std::string& hex)
+  {
+    if (type == "schnorr" || type == "ed25519")
+    {
+      crypto::public_key pk;
+      if (!tools::hex_to_type(hex, pk))
+        throw wallet_rpc_error{error_code::WRONG_KEY, "Invalid schnorr owner_key (expected 64-char hex)"};
+      return pk;
+    }
+    if (type == "eth")
+    {
+      crypto::eth_public_key pk;
+      if (!tools::hex_to_type(hex, pk))
+        throw wallet_rpc_error{error_code::WRONG_KEY, "Invalid eth owner_key (expected 66-char hex / 33-byte compressed)"};
+      return pk;
+    }
+    if (type == "eddsa")
+    {
+      crypto::eddsa_public_key pk;
+      if (!tools::hex_to_type(hex, pk))
+        throw wallet_rpc_error{error_code::WRONG_KEY, "Invalid eddsa owner_key (expected 64-char hex)"};
+      return pk;
+    }
+    throw wallet_rpc_error{error_code::WRONG_KEY, "owner_key_type must be one of: schnorr, eth, eddsa"};
+  }
+
   GATEWAY_REGISTER_ADDRESS::response wallet_rpc_server::invoke(GATEWAY_REGISTER_ADDRESS::request&& req)
   {
     require_open();
@@ -3313,30 +3344,7 @@ namespace {
     if (!tools::hex_to_type(req.gateway_secret, gateway_skey))
       throw wallet_rpc_error{error_code::WRONG_KEY, "Invalid gateway_secret (expected 64-char hex)"};
 
-    cryptonote::gateway_owner_key_v owner_key;
-    if (req.owner_key_type == "schnorr" || req.owner_key_type == "ed25519")
-    {
-      crypto::public_key pk;
-      if (!tools::hex_to_type(req.owner_key, pk))
-        throw wallet_rpc_error{error_code::WRONG_KEY, "Invalid schnorr owner_key (expected 64-char hex)"};
-      owner_key = pk;
-    }
-    else if (req.owner_key_type == "eth")
-    {
-      crypto::eth_public_key pk;
-      if (!tools::hex_to_type(req.owner_key, pk))
-        throw wallet_rpc_error{error_code::WRONG_KEY, "Invalid eth owner_key (expected 66-char hex / 33-byte compressed)"};
-      owner_key = pk;
-    }
-    else if (req.owner_key_type == "eddsa")
-    {
-      crypto::eddsa_public_key pk;
-      if (!tools::hex_to_type(req.owner_key, pk))
-        throw wallet_rpc_error{error_code::WRONG_KEY, "Invalid eddsa owner_key (expected 64-char hex)"};
-      owner_key = pk;
-    }
-    else
-      throw wallet_rpc_error{error_code::WRONG_KEY, "owner_key_type must be one of: schnorr, eth, eddsa"};
+    cryptonote::gateway_owner_key_v owner_key = parse_gateway_owner_key(req.owner_key_type, req.owner_key);
 
     std::string reason;
     std::vector<wallet2::pending_tx> ptx_vector =
@@ -3363,6 +3371,103 @@ namespace {
                            res.tx_metadata,
                            res.spent_key_images);
 
+    return res;
+  }
+
+  GATEWAY_UPDATE_DESCRIPTOR::response wallet_rpc_server::invoke(GATEWAY_UPDATE_DESCRIPTOR::request&& req)
+  {
+    require_open();
+    GATEWAY_UPDATE_DESCRIPTOR::response res{};
+
+    crypto::public_key gateway_id;
+    if (!tools::hex_to_type(req.gateway_id, gateway_id))
+      throw wallet_rpc_error{error_code::WRONG_KEY, "Invalid gateway_id (expected 64-char hex)"};
+
+    cryptonote::gateway_owner_key_v owner_key = parse_gateway_owner_key(req.owner_key_type, req.owner_key);
+
+    std::string reason;
+    std::vector<wallet2::pending_tx> ptx_vector =
+        m_wallet->create_gateway_update_tx(gateway_id, owner_key, req.meta_info, &reason,
+                                           req.priority, req.account_index, req.subaddr_indices,
+                                           req.bridge_reserve);
+    if (ptx_vector.empty())
+      throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, "Failed to create gateway update transaction: " + reason};
+    // A descriptor op carries no destination, so it never splits; more than one tx
+    // would mean two competing updates racing the same descriptor.
+    if (ptx_vector.size() != 1)
+      throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, "Gateway update unexpectedly split into multiple transactions"};
+
+    const auto& ptx = ptx_vector.front();
+    // The digest binds the FINAL prefix (which carries the update op's address_id and
+    // new owner key), so it is only meaningful now that construction is complete.
+    res.hash_to_sign = tools::type_to_hex(cryptonote::gateway_ownership_message(m_wallet->nettype(), ptx.tx));
+    res.tx_metadata  = ptx_to_string(ptx);
+    res.tx_blob      = oxenc::to_hex(cryptonote::tx_to_blob(ptx.tx));
+    res.fee          = ptx.fee;
+    return res;
+  }
+
+  GATEWAY_SUBMIT_DESCRIPTOR_UPDATE::response wallet_rpc_server::invoke(GATEWAY_SUBMIT_DESCRIPTOR_UPDATE::request&& req)
+  {
+    require_open();
+    GATEWAY_SUBMIT_DESCRIPTOR_UPDATE::response res{};
+
+    if (!oxenc::is_hex(req.tx_metadata))
+      throw wallet_rpc_error{error_code::BAD_HEX, "Failed to parse tx_metadata hex."};
+
+    wallet::pending_tx ptx;
+    try
+    {
+      std::istringstream iss(oxenc::from_hex(req.tx_metadata));
+      boost::archive::portable_binary_iarchive ar(iss);
+      ar >> ptx;
+    }
+    catch (...)
+    {
+      throw wallet_rpc_error{error_code::BAD_TX_METADATA, "Failed to parse tx metadata."};
+    }
+
+    cryptonote::gateway_owner_sig_v sig;
+    if (req.signature_type == "schnorr" || req.signature_type == "ed25519")
+    {
+      crypto::signature s;
+      if (!tools::hex_to_type(req.signature, s))
+        throw wallet_rpc_error{error_code::WRONG_SIGNATURE, "Invalid schnorr signature (expected 128-char hex)"};
+      sig = s;
+    }
+    else if (req.signature_type == "eth")
+    {
+      crypto::eth_signature s;
+      if (!tools::hex_to_type(req.signature, s))
+        throw wallet_rpc_error{error_code::WRONG_SIGNATURE, "Invalid eth signature (expected 130-char hex)"};
+      sig = s;
+    }
+    else if (req.signature_type == "eddsa")
+    {
+      crypto::eddsa_signature s;
+      if (!tools::hex_to_type(req.signature, s))
+        throw wallet_rpc_error{error_code::WRONG_SIGNATURE, "Invalid eddsa signature (expected 128-char hex)"};
+      sig = s;
+    }
+    else
+      throw wallet_rpc_error{error_code::WRONG_SIGNATURE, "signature_type must be one of: schnorr, eth, eddsa"};
+
+    if (!cryptonote::attach_gateway_ownership_proof(m_wallet->nettype(), ptx.tx, sig))
+      throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, "Transaction is not an update_gateway_address tx"};
+
+    try
+    {
+      m_wallet->commit_tx(ptx, false /*flash*/);
+    }
+    catch (const std::exception &e)
+    {
+      // The daemon rejects a bad proof here, so surface its reason rather than a
+      // generic failure: a wrong-key signature is the likeliest mistake.
+      throw wallet_rpc_error{error_code::GENERIC_TRANSFER_ERROR,
+                             std::string("Failed to commit gateway update tx: ") + e.what()};
+    }
+
+    res.tx_hash = tools::type_to_hex(cryptonote::get_transaction_hash(ptx.tx));
     return res;
   }
 

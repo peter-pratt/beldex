@@ -287,6 +287,17 @@ namespace cryptonote
   // (vin/vout/extra) is final. Returns false on a type/key mismatch.
   bool sign_gateway_register_tx(network_type nettype, transaction& tx,
                                 const crypto::secret_key& gateway_skey);
+
+  // Attach an ownership proof that was produced OUTSIDE this process to an
+  // update_gateway_address tx. Registration can sign itself because the gateway
+  // secret is a single key on disk; a descriptor update cannot, because the owner
+  // it must satisfy is the bridge committee's threshold key `Pgw` and no one node
+  // holds it. The caller builds the tx, hands `gateway_ownership_message(nettype,
+  // tx)` to the committee, and attaches the aggregate signature here. Like the
+  // register path this runs AFTER the prefix is final; gateway_proofs is prunable
+  // and outside the prefix, so attaching does not disturb the change output.
+  bool attach_gateway_ownership_proof(network_type nettype, transaction& tx,
+                                      const gateway_owner_sig_v& sig);
   struct gateway_wallet_destination
   {
     account_public_address addr; // main address only (v1: no subaddresses)
