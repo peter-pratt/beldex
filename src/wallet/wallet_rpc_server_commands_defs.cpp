@@ -1204,6 +1204,7 @@ KV_SERIALIZE_MAP_CODE_BEGIN(GATEWAY_REGISTER_ADDRESS::request)
   KV_SERIALIZE    (owner_key_type);
   KV_SERIALIZE    (owner_key);
   KV_SERIALIZE    (meta_info);
+  KV_SERIALIZE_OPT(bridge_reserve,  false);
   KV_SERIALIZE_OPT(account_index,   (uint32_t)0);
   KV_SERIALIZE    (subaddr_indices);
   KV_SERIALIZE_OPT(priority,        (uint32_t)0);
@@ -1211,6 +1212,38 @@ KV_SERIALIZE_MAP_CODE_BEGIN(GATEWAY_REGISTER_ADDRESS::request)
   KV_SERIALIZE_OPT(do_not_relay,    false)
   KV_SERIALIZE_OPT(get_tx_hex,      false)
   KV_SERIALIZE_OPT(get_tx_metadata, false)
+KV_SERIALIZE_MAP_CODE_END()
+
+
+KV_SERIALIZE_MAP_CODE_BEGIN(GATEWAY_UPDATE_DESCRIPTOR::request)
+  KV_SERIALIZE    (gateway_id);
+  KV_SERIALIZE    (owner_key_type);
+  KV_SERIALIZE    (owner_key);
+  KV_SERIALIZE    (meta_info);
+  KV_SERIALIZE_OPT(bridge_reserve,  false);
+  KV_SERIALIZE_OPT(account_index,   (uint32_t)0);
+  KV_SERIALIZE    (subaddr_indices);
+  KV_SERIALIZE_OPT(priority,        (uint32_t)0);
+KV_SERIALIZE_MAP_CODE_END()
+
+
+KV_SERIALIZE_MAP_CODE_BEGIN(GATEWAY_UPDATE_DESCRIPTOR::response)
+  KV_SERIALIZE(tx_metadata)
+  KV_SERIALIZE(tx_blob)
+  KV_SERIALIZE(hash_to_sign)
+  KV_SERIALIZE(fee)
+KV_SERIALIZE_MAP_CODE_END()
+
+
+KV_SERIALIZE_MAP_CODE_BEGIN(GATEWAY_SUBMIT_DESCRIPTOR_UPDATE::request)
+  KV_SERIALIZE    (tx_metadata);
+  KV_SERIALIZE    (signature);
+  KV_SERIALIZE_OPT(signature_type, std::string("schnorr"));
+KV_SERIALIZE_MAP_CODE_END()
+
+
+KV_SERIALIZE_MAP_CODE_BEGIN(GATEWAY_SUBMIT_DESCRIPTOR_UPDATE::response)
+  KV_SERIALIZE(tx_hash)
 KV_SERIALIZE_MAP_CODE_END()
 
 
