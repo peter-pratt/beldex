@@ -337,6 +337,12 @@ impl<C: JsonRpcClient> EvmWatcher<C> {
     /// endpoint that does not simply returns nothing and the watcher falls back to
     /// confirmation depth. An error is treated the same as absence — a finality source
     /// that is briefly unreachable must not make events look settled.
+    ///
+    /// Genesis counts as absence too. A dev chain (anvil) answers the tag but always
+    /// names block 0, which is not a finality claim — genesis is final on every chain, so
+    /// the answer carries no information. Read literally it pins the finalised head below
+    /// every real event and nothing ever settles, which is how it presented: the watcher
+    /// held a burn at `pending=1` forever while the tip moved past it.
     fn finalized_height(&self) -> Option<u64> {
         let v = self
             .client
@@ -345,7 +351,10 @@ impl<C: JsonRpcClient> EvmWatcher<C> {
         if v.is_null() {
             return None;
         }
-        v.get("number").and_then(Value::as_str).and_then(hex_to_u64)
+        v.get("number")
+            .and_then(Value::as_str)
+            .and_then(hex_to_u64)
+            .filter(|h| *h > 0)
     }
 
     /// The current canonical block hash at `height`, or `None` if that height is not
@@ -987,6 +996,29 @@ mod tests {
         w.client.finalized.set(Some(100));
         let u = w.advance().unwrap();
         assert_eq!(u.finalized.len(), 1, "settles once the chain calls it final");
+        assert_eq!(u.finalized[0].amount, 500);
+    }
+
+    /// A dev chain answers the `finalized` tag but always names genesis. That is not a
+    /// finality claim — genesis is final everywhere — so it must fall back to confirmation
+    /// depth. Taken literally it pinned the finalised head under every real event and the
+    /// watcher held burns pending forever, which is exactly what a devnet burn did.
+    #[test]
+    fn a_genesis_finalized_head_falls_back_to_confirmation_depth() {
+        let node = MockNode {
+            tip: Cell::new(9),
+            logs: RefCell::new(vec![burn_log(7, [0xAA; 32], [0x01; 32], 500, b"bxAlice")]),
+            hashes: RefCell::new([(7u64, [0xAA; 32])].into_iter().collect()),
+            finalized: Cell::new(Some(0)), // anvil: always block 0
+        };
+        let mut w = EvmWatcher::new(node, ChainId(1), [0x22; 20], 1, 7);
+
+        let u = w.advance().unwrap();
+        assert_eq!(
+            u.finalized.len(),
+            1,
+            "genesis carries no finality information; depth must decide"
+        );
         assert_eq!(u.finalized[0].amount, 500);
     }
 
