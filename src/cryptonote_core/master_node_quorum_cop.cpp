@@ -498,6 +498,17 @@ namespace master_nodes
           LOG_ERROR("Unhandled quorum type with value: " << (int)type);
         } break;
 
+        case quorum_type::bridge:
+        {
+          // Nothing to police. The bridge committee is not a voting quorum: it signs with
+          // threshold keys off-chain, and misbehaviour is caught by the bridge's own slash
+          // path, not by obligations votes. It is listed here only because
+          // max_quorum_type_for_hf returns it from HF23 on, which puts it in this loop.
+          //
+          // Without this case it falls to `default`, which LOG_ERRORs once per block for the
+          // life of the chain — and trips the assert above in any build with assertions on.
+        } break;
+
         case quorum_type::obligations:
         {
 
