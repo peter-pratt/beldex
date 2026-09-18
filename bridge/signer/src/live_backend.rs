@@ -66,13 +66,19 @@ pub fn mint_relay_payload_json(ev: &MintEvent, contract: [u8; 20], sig: &[u8]) -
     format!(
         concat!(
             r#"{{"kind":"mint","contract":"{}","chain_id":{},"to":"{}","#,
-            r#""amount":"{}","beldex_txid":"{}","sig":"{}"}}"#
+            r#""amount":"{}","beldex_txid":"{}","output_index":{},"sig":"{}"}}"#
         ),
         hexs(&contract),
         ev.dst_chain.0,
         hexs(&ev.to),
         ev.amount,
         hexs(&ev.beldex_txid),
+        // The signature covers `output_index` (it is the 7th word of the preimage), so a
+        // payload without it is only redeemable when the gateway output happens to sit at
+        // index 0. A transfer that pays change — almost every one — puts it at 1, and the
+        // relayer's default of 0 then rebuilds a different digest and the contract rejects
+        // the mint as BadSigner.
+        ev.output_index,
         hexs(sig),
     )
 }
@@ -469,4 +475,25 @@ mod tests {
             assert_eq!(b.handle_release(&ev), ExecOutcome::Retry);
         }
     }
+
+    /// The signature is over a preimage whose 7th word is the output index, so the payload
+    /// MUST carry it. Omitting it let the relayer default to 0 and rebuild a different
+    /// digest, which the contract rejected as BadSigner for every deposit whose gateway
+    /// output was not the first — i.e. every transfer that paid change.
+    #[test]
+    fn mint_payload_carries_the_signed_output_index() {
+        let ev = MintEvent {
+            beldex_txid: [0xab; 32],
+            output_index: 1,
+            dst_chain: ChainId(1),
+            to: [0x11; 20],
+            amount: 1000,
+        };
+        let json = mint_relay_payload_json(&ev, [0x22; 20], &[0xcc; 65]);
+        assert!(
+            json.contains(r#""output_index":1"#),
+            "output index missing from the relay payload: {json}"
+        );
+    }
+
 }
