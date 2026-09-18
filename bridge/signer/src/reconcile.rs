@@ -392,3 +392,95 @@ mod tests {
         assert_ne!(s, [0u8; 4]);
     }
 }
+
+#[cfg(test)]
+mod late_settlement_tests {
+    //! A duty is settled by WHICHEVER member submits. `observe_reconciled` answers only for
+    //! a duty the orchestrator has never seen, so a member that queued a duty before another
+    //! member finished it can never learn that from this path — it reports `Known` and the
+    //! caller has to re-ask the chain itself.
+
+    use super::*;
+    use crate::chain_registry::ChainId;
+    use crate::orchestrator::{Duty, Orchestrator};
+    use crate::watch::ReleaseEvent;
+
+    struct Settled(bool);
+    impl DutyReconciler for Settled {
+        fn is_settled(&mut self, _d: &Duty) -> Option<bool> {
+            Some(self.0)
+        }
+    }
+
+    fn release() -> Duty {
+        Duty::Release(ReleaseEvent {
+            evm_txid: [0xe1; 32],
+            log_index: 1,
+            chain: ChainId(31337),
+            amount: 10_000_000_000,
+            beldex_recipient: b"bxAlice".to_vec(),
+        })
+    }
+
+    #[test]
+    fn a_duty_that_settles_after_it_was_queued_is_not_caught_by_observe() {
+        let mut orch = Orchestrator::new();
+
+        // First sighting: not yet released, so it is queued for work.
+        assert_eq!(
+            observe_reconciled(&mut orch, &mut Settled(false), release()),
+            ObserveOutcome::Queued
+        );
+
+        // Another member submits; the chain now says settled. Re-observing does NOT notice —
+        // the duty is already tracked, so the reconciler is never consulted again.
+        assert_eq!(
+            observe_reconciled(&mut orch, &mut Settled(true), release()),
+            ObserveOutcome::Known,
+            "observe short-circuits on a known duty; the serve loop must re-check queued \
+             duties against the chain itself or they reopen sessions forever"
+        );
+        assert!(
+            orch.status(&release().key()) != Some(crate::orchestrator::DutyStatus::Done),
+            "still not Done — nothing in this path can retire it"
+        );
+
+        // Which is what the serve loop's periodic re-check does.
+        assert_eq!(Settled(true).is_settled(&release()), Some(true));
+        orch.mark_done(&release().key());
+        assert_eq!(
+            orch.status(&release().key()),
+            Some(crate::orchestrator::DutyStatus::Done)
+        );
+    }
+}
+
+#[cfg(test)]
+mod sweep_settlement_tests {
+    //! The release outbox ends a record's life on the DISCHARGED answer from consensus,
+    //! not on the wording of a submit error.
+    //!
+    //! Re-submitting a release that has already been mined fails on its INPUT — the gateway
+    //! output it spends no longer exists — so the daemon answers with a spent-output error
+    //! and the replay guard's "already-discharged" phrasing never appears. A sweep that
+    //! matched on that phrasing kept re-sending a delivered release for the full twelve
+    //! hours and then filed it as undelivered, while consensus had recorded it all along.
+
+    /// The submit errors a mined release actually produces, none of which say "discharged".
+    const MINED_RELEASE_SUBMIT_ERRORS: &[&str] = &[
+        "gateway_submit_transfer: rpc error {\"code\":-32602,\"message\":\"Invalid params\"}",
+        "double spend",
+        "gateway input already spent",
+        "Failed to parse tx from blob",
+    ];
+
+    #[test]
+    fn a_mined_release_is_not_recognisable_from_its_submit_error() {
+        for e in MINED_RELEASE_SUBMIT_ERRORS {
+            assert!(
+                !e.to_lowercase().contains("discharged"),
+                "{e:?} would have to be matched by name; ask gateway_release_ref_status instead"
+            );
+        }
+    }
+}

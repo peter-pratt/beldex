@@ -1040,24 +1040,32 @@ fn run_relay_watch_standalone() -> Result<(), String> {
     println!("  each mint payload → `{cmd}`");
     println!("  (this process holds NO bridge key; the gas key lives in the relay command)");
     let mut count = 0u64;
-    // Process-local dedup by beldex_txid: the daemon replays its retained backlog to a new
-    // subscriber (so an outage is caught up), and reconnections can re-deliver — skip what
-    // this process already handled instead of re-running gas estimation on it. The
-    // contract's replay guard remains the real idempotency authority.
+    // Process-local dedup by (beldex_txid, output_index): the daemon replays its retained
+    // backlog to a new subscriber (so an outage is caught up), and reconnections can
+    // re-deliver — skip what this process already handled instead of re-running gas
+    // estimation on it. The contract's replay guard remains the real idempotency authority.
+    //
+    // The output index is part of the key because one Beldex transaction can pay several
+    // gateway outputs, each its own mint. Keying on the txid alone would drop every output
+    // after the first for the life of this process.
     let mut handled: std::collections::HashSet<String> = std::collections::HashSet::new();
     let per_sub_timeout = Duration::from_millis(5000 / subs.len().max(1) as u64);
     loop {
         for sub in subs.iter_mut() {
             match sub.poll(per_sub_timeout) {
                 Ok(Some(payload)) => {
-                    let txid = payload
-                        .split(r#""beldex_txid":""#)
-                        .nth(1)
-                        .and_then(|s| s.split('"').next())
-                        .unwrap_or("")
-                        .to_string();
-                    if !txid.is_empty() && !handled.insert(txid.clone()) {
-                        println!("(skip: txid {txid} already handled this session)");
+                    let field = |name: &str, quoted: bool| {
+                        let pat = if quoted { format!(r#""{name}":""#) } else { format!(r#""{name}":"#) };
+                        payload.split(&pat).nth(1).map(|s| {
+                            let end = if quoted { '"' } else { ',' };
+                            s.split(end).next().unwrap_or("").trim_end_matches('}').to_string()
+                        })
+                    };
+                    let txid = field("beldex_txid", true).unwrap_or_default();
+                    let idx = field("output_index", false).unwrap_or_else(|| "0".into());
+                    let key = format!("{txid}:{idx}");
+                    if !txid.is_empty() && !handled.insert(key.clone()) {
+                        println!("(skip: {key} already handled this session)");
                         continue;
                     }
                     count += 1;
@@ -1382,6 +1390,52 @@ fn build_live_signers(cfg: &Config) -> Result<LiveSigners, String> {
 /// submit). Enabled by `--features serve-live` + `BRIDGE_SIGNER_SERVE_LIVE=1`.
 #[cfg(feature = "serve-live")]
 #[allow(clippy::too_many_arguments)]
+/// Split a failed release build into "retry" and "give up".
+///
+/// Treating every failure as transient retries a permanently impossible duty forever: a burn
+/// naming an address the daemon cannot parse re-opens a session every few seconds, for as long
+/// as the process runs, and hammers the daemon building a withdrawal it will always refuse.
+///
+/// The daemon answers a malformed request with the JSON-RPC "invalid params" code, which is a
+/// statement about the request itself and cannot become true later. Everything else — a
+/// transport failure, a timeout, an internal error — is a statement about right now, so it
+/// keeps retrying. The asymmetry is deliberate: a wrong "transient" costs some retries, a
+/// wrong "unactionable" drops a payable release.
+///
+/// The burn is discharged on the EVM side either way, so an unactionable release means the
+/// user has lost their funds. That must not disappear into a counter — it is logged here,
+/// where the recipient and the burn reference are both in hand.
+fn classify_release_build_error(
+    ev: &beldex_bridge_signer::watch::ReleaseEvent,
+    recipient: &str,
+    e: String,
+) -> beldex_bridge_signer::coordinator::BuildError {
+    // The error text is produced by this crate's own JSON-RPC client, which embeds the
+    // daemon's error object verbatim: `<method>: rpc error {"code":-1,"message":"..."}`.
+    //
+    // Match the MESSAGE, not the code. The daemon returns ERROR_WRONG_PARAM (-1) both for a
+    // request that can never work and for "insufficient gateway balance for withdrawal +
+    // fee", which is about right now and must keep retrying — abandoning that one would drop
+    // a payable release and the user's burn is already discharged.
+    //
+    // The destination is also the ONLY field here that comes from outside: the burn carries
+    // it, a user typed it. Every other parameter this call sends is built by the signer, so
+    // the daemon rejecting one of those is a bug in us, and looping loudly on it is the right
+    // outcome rather than silently dropping the duty.
+    if e.contains("invalid destination address") {
+        eprintln!(
+            "!! UNROUTABLE RELEASE — burn {}:{} of {} atomic units names an address the daemon \
+             cannot use ({recipient:?}); the wBDX is already burned and this release can never \
+             be paid. Abandoning it. Daemon said: {e}",
+            hex(&ev.evm_txid),
+            ev.log_index,
+            ev.amount,
+        );
+        return beldex_bridge_signer::coordinator::BuildError::Unactionable(e);
+    }
+    beldex_bridge_signer::coordinator::BuildError::Transient(e)
+}
+
 fn run_serve_live<B, C>(
     cfg: &Config,
     src: &mut beldex_bridge_signer::service::WatcherEventSource<B, C>,
@@ -1402,8 +1456,8 @@ where
     use beldex_bridge_signer::evm_watcher::HttpJsonRpc;
     use beldex_bridge_signer::orchestrator::{Duty, EventSource, ExecOutcome};
     use beldex_bridge_signer::reconcile::{
-        observe_reconciled, DualReconciler, EvmMintReconciler, GatewayReleaseReconciler,
-        ObserveOutcome,
+        observe_reconciled, DualReconciler, DutyReconciler, EvmMintReconciler,
+        GatewayReleaseReconciler, ObserveOutcome,
     };
     use beldex_bridge_signer::release_policy::{DualPolicy, ReleasePolicy, ReleaseProposal};
     use beldex_bridge_signer::transport::Leg;
@@ -1488,7 +1542,7 @@ where
         build_rpc
             .borrow_mut()
             .create_release(&build_gw, &recipient, amount, release_fee, ev.chain.0, &ev.evm_txid, ev.log_index)
-            .map_err(BuildError::Transient)
+            .map_err(|e| classify_release_build_error(ev, &recipient, e))
     };
 
     // Member-side inspection: this node's OWN daemon reads the proposed withdrawal.
@@ -1593,6 +1647,25 @@ where
     println!("  signed releases kept in: {release_outbox_dir}");
     // The completion closure takes ownership; the retry sweep needs its own handle.
     let outbox_dir_for_sweep = release_outbox_dir.clone();
+    // The sweep's own reconciler: the outbox holds raw records, not duties, so it needs a
+    // way to ask consensus "is this burn discharged?" independently of the duty pipeline.
+    let mut sweep_reconciler =
+        GatewayReleaseReconciler::new(beldexd_rpc.to_string(), release_gateway.clone());
+    // A stored record carries only what identifies the burn; `is_settled` looks at the
+    // chain, tx id and log index alone, so the remaining fields are immaterial here.
+    let rec_duty = |rec: &beldex_bridge_signer::release_outbox::ReleaseRecord| {
+        let mut evm_txid = [0u8; 32];
+        if let Some(b) = config::parse_hex32(&rec.evm_txid) {
+            evm_txid = b;
+        }
+        Duty::Release(beldex_bridge_signer::watch::ReleaseEvent {
+            evm_txid,
+            log_index: rec.log_index,
+            chain: beldex_bridge_signer::chain_registry::ChainId(rec.chain_id),
+            amount: 0,
+            beldex_recipient: Vec::new(),
+        })
+    };
 
     let relay_cmd = std::env::var("BRIDGE_SIGNER_RELAY_CMD").ok().filter(|s| !s.trim().is_empty());
     let relay_stagger_ms: u64 = std::env::var("BRIDGE_SIGNER_RELAY_STAGGER_MS")
@@ -1764,6 +1837,10 @@ where
     // would repeat before a block could even exist.
     let release_retry_ticks =
         std::cmp::max(1, beldex_bridge_signer::release_outbox::RETRY_INTERVAL_SECS / poll_secs.max(1));
+    // Re-check queued duties against the chain about once a minute: often enough that a
+    // member which missed a completion stops within a round or two, rare enough that it is
+    // one extra RPC per duty per minute rather than per tick.
+    let reconcile_recheck_ticks = std::cmp::max(1, 60 / poll_secs.max(1));
 
     let mut ticks = 0u64;
     loop {
@@ -1784,8 +1861,27 @@ where
             }
         }
 
+        // Re-ask the chain about duties still queued. Reconciliation on first sighting is
+        // not enough: a duty is settled by WHICHEVER member submits, and the members that
+        // did not submit have no other way to learn it happened. If they also missed the
+        // signature aggregate they cannot take the straggler path either, so their sessions
+        // time out and reopen for a release that is already on chain — forever, each round
+        // asking its own daemon to build and decode a withdrawal that will never be sent.
+        // Left alone on a 20-member committee that is 19 nodes spinning on every completed
+        // release for the life of the process.
+        if reconcile_on && ticks % reconcile_recheck_ticks == 0 {
+            let queued: Vec<Duty> = orch.ready().into_iter().cloned().collect();
+            for d in queued {
+                if reconciler.is_settled(&d) == Some(true) {
+                    orch.mark_done(&d.key());
+                    println!("reconciled late: duty settled on-chain by another member");
+                }
+            }
+        }
+
         // Ingest the watchers (re-emission is safe — the orchestrator dedups, and a duty is
-        // reconciled against chain state at most once per process).
+        // reconciled against chain state at most once per SIGHTING; the re-check above
+        // covers duties that settle after they were queued).
         let mut ingest = |orch: &mut beldex_bridge_signer::orchestrator::Orchestrator, d: Duty| {
             if reconcile_on {
                 if observe_reconciled(orch, &mut reconciler, d) == ObserveOutcome::AlreadySettled {
@@ -1902,37 +1998,32 @@ where
                     );
                     continue;
                 }
+                // ASK consensus whether this burn is already discharged, rather than
+                // inferring it from a submit error. Re-submitting a release that has been
+                // mined fails on its INPUT — the gateway output it spends is gone — so the
+                // daemon answers with a spent-output error and the replay guard's
+                // "already-discharged" wording never appears. Matching on that wording left
+                // a delivered release retrying for the full twelve hours and then marked
+                // undelivered, while consensus had recorded it from the first block.
+                if sweep_reconciler.is_settled(&rec_duty(&rec)) == Some(true) {
+                    println!(
+                        "release settled on chain (burn {} log {}) — no longer tracked",
+                        rec.evm_txid, rec.log_index
+                    );
+                    outbox::remove(&outbox_dir_for_sweep, &rec);
+                    continue;
+                }
+
                 let mut sig = [0u8; 64];
                 let Some(bytes) = config::parse_hex64(&rec.signature) else {
                     continue;
                 };
                 sig.copy_from_slice(&bytes);
-                match rpc.borrow_mut().submit_transfer(&rec.tx_blob, &sig) {
-                    Ok(_) => {
-                        rec.attempts += 1;
-                        let _ = outbox::save(&outbox_dir_for_sweep, &rec);
-                    }
-                    Err(e) => {
-                        // Only "discharged" means it is ON CHAIN — that is the consensus
-                        // replay guard ("gateway release replays an already-discharged burn
-                        // ref"), which is recorded when the release is mined. A bare
-                        // "already known / already in mempool" means it is merely queued,
-                        // and dropping the record then would leave nothing to re-send if it
-                        // is later evicted. Keeping a record too long costs one redundant
-                        // re-send; dropping it early costs the user their payout.
-                        let el = e.to_lowercase();
-                        if el.contains("discharged") {
-                            println!(
-                                "release settled on chain (burn {} log {}) — no longer tracked",
-                                rec.evm_txid, rec.log_index
-                            );
-                            outbox::remove(&outbox_dir_for_sweep, &rec);
-                        } else {
-                            rec.attempts += 1;
-                            let _ = outbox::save(&outbox_dir_for_sweep, &rec);
-                        }
-                    }
-                }
+                // Not discharged: re-send. Either answer only bumps the attempt count —
+                // the discharged check above is what ends the record's life.
+                let _ = rpc.borrow_mut().submit_transfer(&rec.tx_blob, &sig);
+                rec.attempts += 1;
+                let _ = outbox::save(&outbox_dir_for_sweep, &rec);
             }
         }
 
@@ -2189,5 +2280,54 @@ mod secret_file_tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"short", "content fully replaced");
         assert!(!std::path::Path::new(&format!("{path}.tmp")).exists(), "no temp file left");
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// A burn naming an address the daemon cannot parse can never be paid, so retrying it
+    /// forever only re-opens a session every few seconds for the life of the process. A
+    /// daemon that is merely unreachable must still be retried.
+    #[test]
+    fn only_a_rejected_request_gives_up_on_a_release() {
+        use beldex_bridge_signer::coordinator::BuildError;
+        use beldex_bridge_signer::chain_registry::ChainId;
+        use beldex_bridge_signer::watch::ReleaseEvent;
+
+        let ev = ReleaseEvent {
+            evm_txid: [0xd1; 32],
+            log_index: 1,
+            chain: ChainId(31337),
+            amount: 1_000_000_000,
+            beldex_recipient: b"not-a-real-beldex-address".to_vec(),
+        };
+
+        // The daemon's real answer for an address it cannot parse (core_rpc_server.cpp,
+        // ERROR_WRONG_PARAM). Captured verbatim from a devnet burn to a junk address.
+        let permanent = r#"gateway_create_transfer: rpc error {"code":-1,"message":"invalid destination address: not-a-real-beldex-address"}"#;
+        assert!(
+            matches!(
+                classify_release_build_error(&ev, "not-a-real-beldex-address", permanent.into()),
+                BuildError::Unactionable(_)
+            ),
+            "an address the daemon cannot parse can never become payable"
+        );
+
+        for transient in [
+            "http://127.0.0.1:19191: Connection refused",
+            r#"gateway_create_transfer: rpc error {"code":-32603,"message":"Internal error"}"#,
+            "timed out",
+            // Same error CODE as the address case, but this one can come good once a
+            // deposit lands — classifying it by code would strand a payable release.
+            r#"gateway_create_transfer: rpc error {"code":-1,"message":"insufficient gateway balance for withdrawal + fee"}"#,
+            // Signer-built parameters: the daemon refusing one is our bug, not the user's,
+            // and must stay loud rather than silently dropping the duty.
+            r#"gateway_create_transfer: rpc error {"code":-1,"message":"ref_evm_txid must be 64-char hex"}"#,
+        ] {
+            assert!(
+                matches!(
+                    classify_release_build_error(&ev, "bxAlice", transient.into()),
+                    BuildError::Transient(_)
+                ),
+                "{transient} is about right now, not about the request"
+            );
+        }
     }
 }

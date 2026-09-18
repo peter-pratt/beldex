@@ -135,7 +135,15 @@ fn path_for(dir: &str, chain_id: u64, evm_txid: &str, log_index: u32) -> PathBuf
 pub fn save(dir: &str, rec: &ReleaseRecord) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("create {dir}: {e}"))?;
     let path = path_for(dir, rec.chain_id, &rec.evm_txid, rec.log_index);
-    let tmp = path.with_extension("tmp");
+    // The scratch name must be unique per WRITE, not derived from the record. Every
+    // finalizing member signs the SAME release, and members can share one outbox
+    // directory; with a shared scratch name they each truncate the previous writer's
+    // file and all but one rename fails with ENOENT. That looked like a missing
+    // directory and made the losers refuse to submit a release they had already signed.
+    // The pid separates members, the counter separates writes inside one member.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}-{seq}.tmp", std::process::id()));
     {
         let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create {tmp:?}: {e}"))?;
         f.write_all(rec.to_json().as_bytes()).map_err(|e| format!("write: {e}"))?;
@@ -273,6 +281,35 @@ mod tests {
         }
         let got: Vec<u64> = load_all(&dir).iter().map(|(_, r)| r.first_seen).collect();
         assert_eq!(got, vec![1000, 2000, 3000]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every finalizing member signs the SAME release, and members may share one outbox
+    /// directory. Concurrent saves of one record must all succeed: a writer whose save
+    /// fails refuses to submit a release it has already signed, so a scratch-file
+    /// collision here silently costs the payout its fastest submitter.
+    #[test]
+    fn concurrent_saves_of_one_release_all_succeed() {
+        let dir = tmpdir("concurrent");
+        let errs: Vec<String> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..8)
+                .map(|_| {
+                    let d = dir.clone();
+                    sc.spawn(move || {
+                        let mut bad = Vec::new();
+                        for _ in 0..25 {
+                            if let Err(e) = save(&d, &rec(1000)) {
+                                bad.push(e);
+                            }
+                        }
+                        bad
+                    })
+                })
+                .collect();
+            hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        });
+        assert!(errs.is_empty(), "concurrent saves failed: {errs:?}");
+        assert_eq!(load_all(&dir).len(), 1, "one burn is still one record");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

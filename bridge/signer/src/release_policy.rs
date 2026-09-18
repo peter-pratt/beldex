@@ -220,6 +220,20 @@ where
     }
 }
 
+/// Could these bytes be a Beldex address at all?
+///
+/// Deliberately a shape test, not a validation: it must be cheap enough for the
+/// `actionable` path and must never reject something the daemon would have accepted. Beldex
+/// addresses are base58, so any byte outside that alphabet — or a non-UTF-8 recipient — is
+/// proof the daemon cannot use it. `0`, `O`, `I` and `l` are excluded from base58 precisely
+/// because they are easy to confuse, which is also how a mistyped address usually fails.
+fn is_possible_beldex_address(recipient: &[u8]) -> bool {
+    const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    !recipient.is_empty()
+        && std::str::from_utf8(recipient).is_ok()
+        && recipient.iter().all(|c| BASE58.contains(c))
+}
+
 impl<Build, Inspect> ProposalPolicy for ReleasePolicy<Build, Inspect>
 where
     Build: FnMut(&ReleaseEvent) -> Result<BuiltRelease, BuildError>,
@@ -231,10 +245,25 @@ where
                 // Over-cap burns are permanently unactionable under this policy (a cap raise
                 // is a new policy → new process lifecycle); everything else is workable.
                 if ev.amount > self.per_tx_cap {
-                    Err(BuildError::Unactionable("burn exceeds the per-tx release cap".into()))
-                } else {
-                    Ok(())
+                    return Err(BuildError::Unactionable("burn exceeds the per-tx release cap".into()));
                 }
+                // A recipient the daemon can never decode is permanently unactionable, and it
+                // has to be judged HERE rather than in `build`. Only the leader builds, so a
+                // leader-side give-up leaves every other member holding a session open for a
+                // proposal that will never arrive — they time out, reopen, and repeat for the
+                // life of the process. This check runs on every node, so they all retire the
+                // duty together.
+                //
+                // Shape only, because this must stay cheap and side-effect-free: a character
+                // outside the base58 alphabet cannot appear in any Beldex address, on any
+                // network, so rejecting it can never strand a payable release. A recipient
+                // that is base58-clean but fails the daemon's checksum still reaches `build`.
+                if !is_possible_beldex_address(&ev.beldex_recipient) {
+                    return Err(BuildError::Unactionable(
+                        "burn recipient is not a possible Beldex address".into(),
+                    ));
+                }
+                Ok(())
             }
             Duty::Mint(_) => Err(BuildError::Unactionable(
                 "the release policy does not handle mints (use DualPolicy)".into(),
@@ -621,5 +650,34 @@ mod tests {
         }
         assert!(sigs.iter().all(|s| s == &sigs[0]), "one agreed hash → one agreed aggregate");
         assert!(nodes.iter().all(|nd| nd.coord.live_count() == 0));
+    }
+}
+
+#[cfg(test)]
+mod recipient_shape_tests {
+    use super::is_possible_beldex_address;
+
+    /// Every member must reach the same verdict without asking anything, or the ones that
+    /// are not the leader keep a session open for a proposal that can never be built.
+    #[test]
+    fn a_recipient_outside_base58_can_never_be_an_address() {
+        // The address a real devnet wallet prints.
+        assert!(is_possible_beldex_address(
+            b"59sr6Ez6CQKJ7Uq3akAAS7K9jebF1VHnjZtTLXuzjCX5fsiWMsaap2h6uUu4tZUJo4jSxQ8vtGKUvKwpkZB2WKJSQfeRnhJ"
+        ));
+        // A gateway address, which uses the same alphabet.
+        assert!(is_possible_beldex_address(b"gwDJoycVAGzXhAvMFpv47MLgotmPg5bt71JtCNsPkW5E4h9HuboBt2"));
+
+        // The devnet burn that exposed this: hyphens are not base58.
+        assert!(!is_possible_beldex_address(b"not-a-real-beldex-address"));
+        assert!(!is_possible_beldex_address(b""));
+        assert!(!is_possible_beldex_address(&[0xff, 0xfe]));
+        // base58 omits these four precisely because they are confusable, and a mistyped
+        // address is exactly how they show up.
+        for c in [b'0', b'O', b'I', b'l'] {
+            let mut a = b"59sr6Ez6CQKJ".to_vec();
+            a.push(c);
+            assert!(!is_possible_beldex_address(&a), "{} should be rejected", c as char);
+        }
     }
 }
