@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# dkg-next.sh — run a FRESH Pevm (secp256k1/CGGMP21) DKG across the live devnet
-# committee, into a SEPARATE share tree, to produce the successor key for an H.6
-# rotation.
+# dkg-next.sh — run a FRESH DUAL DKG (Pgw + Pevm) across the live devnet committee,
+# into a SEPARATE share tree, to produce the successor keys for an H.6 rotation.
+#
+# BOTH legs, because a rotation replaces the COMMITTEE, and the committee holds two keys:
+# Pevm mints on the EVM side and Pgw spends the gateway. Generating only Pevm leaves the
+# departing members holding shares of a gateway key that still controls the reserve, and
+# leaves the incoming committee unable to pay a release once the old shares are retired.
 #
 #   runlog ./dkg-next.sh [keygen-number]
 #
@@ -90,10 +94,25 @@ if strings "$SIGNER" 2>/dev/null | grep -q 'the Pevm leg needs a build with'; th
   exit 1
 fi
 
+# Which key(s) to generate. `both` is the ceremony's path — a rotation replaces the
+# committee, and the committee holds two keys. `pgw` alone exists to repair a successor tree
+# that was built before this script generated both: the Pevm shares there are already
+# committed to on chain, so regenerating them would point the contract at a key nobody holds.
+# The legs derive independent execution ids, so adding one later is a fresh run, not a reuse.
+DKG_LEG="${DKG_LEG:-both}"
+case "$DKG_LEG" in
+  both|pgw|pevm) ;;
+  *) echo "!! DKG_LEG must be both|pgw|pevm (got '$DKG_LEG')" >&2; exit 1 ;;
+esac
+
 # --- refuse to clobber an existing successor tree ----------------------------------------------
 # `|| true`: a no-match glob makes `ls` exit non-zero; under pipefail+set -e that kills
 # the script silently in this assignment. `wc -l` still prints 0, so the count is right.
 EXISTING="$(ls beldex-127.0.0.1-*/devnet/"$SUBDIR"/pevm-*.keyshare 2>/dev/null | wc -l | tr -d ' ' || true)"
+# DKG_LEG=pgw writes no Pevm material, so existing Pevm shares are not at risk — that is the
+# whole point of the repair path, and tripping here would block the only way to complete a
+# successor tree whose Pevm half is already on chain.
+[ "$DKG_LEG" = "pgw" ] && EXISTING=0
 if [ "$EXISTING" -ne 0 ] && [ "${ALLOW_CLOBBER:-0}" != "1" ]; then
   echo "!! $SUBDIR already holds $EXISTING keyshare(s)."
   echo "   If a rotation is mid-flight, these are the shares it is rotating TO — replacing"
@@ -107,6 +126,7 @@ THRESHOLD="${BRIDGE_SIGNER_COMMITTEE_THRESHOLD:-4}"
 echo "  signer     : $SIGNER"
 echo "  target     : devnet/$SUBDIR  (the CURRENT key in devnet/shares is untouched)"
 echo "  keygen     : $KEYGEN"
+echo "  legs       : $DKG_LEG"
 echo "  threshold  : $THRESHOLD"
 echo ""
 
@@ -134,7 +154,7 @@ for d in beldex-127.0.0.1-*/; do
   BRIDGE_SIGNER_BRIDGE_EPOCH_BLOCKS=120 BRIDGE_SIGNER_COMMITTEE_THRESHOLD="$THRESHOLD" \
   BRIDGE_SIGNER_MN_KEY_FILE="$key" BRIDGE_SIGNER_MESH_PORT_BASE=6000 \
   BRIDGE_SIGNER_MESH_USE_CURVE=false BRIDGE_SIGNER_SHARE_DIR="$share" \
-  BRIDGE_SIGNER_DKG_LEG=pevm BRIDGE_SIGNER_DKG_KEYGEN="$KEYGEN" \
+  BRIDGE_SIGNER_DKG_LEG="$DKG_LEG" BRIDGE_SIGNER_DKG_KEYGEN="$KEYGEN" \
   BRIDGE_SIGNER_DKG_TIMEOUT_SECS="${BRIDGE_SIGNER_DKG_TIMEOUT_SECS:-900}" \
     "$SIGNER" dkg > "dkg-next-${d%/}.log" 2>&1 &
   PIDS="$PIDS $!"
@@ -194,10 +214,18 @@ if [ -n "$OTHERFAIL" ]; then
 fi
 
 NEW="$(ls beldex-127.0.0.1-*/devnet/"$SUBDIR"/pevm-*.keyshare 2>/dev/null | wc -l | tr -d ' ' || true)"
+NEWGW="$(ls beldex-127.0.0.1-*/devnet/"$SUBDIR"/pgw-*.groupvk 2>/dev/null | wc -l | tr -d ' ' || true)"
 echo ""
-echo "  keyshares written : $NEW"
+echo "  Pevm keyshares written : $NEW"
+echo "  Pgw  keyshares written : $NEWGW"
 if [ "$NEW" -eq 0 ]; then
-  echo "!! the DKG produced no shares — check testdata/dkg-next-*.log" >&2
+  echo "!! the DKG produced no Pevm shares — check testdata/dkg-next-*.log" >&2
+  exit 1
+fi
+if [ "$NEWGW" -eq 0 ]; then
+  echo "!! the DKG produced no Pgw shares — check testdata/dkg-next-*.log" >&2
+  echo "   The gateway hand-off (ceremony step 6b) needs a successor Pgw; without it the" >&2
+  echo "   incoming committee can mint but can never pay a release." >&2
   exit 1
 fi
 
