@@ -73,12 +73,20 @@ echo
 echo "== 2/3  threshold-sign it with the OUTGOING Pgw (${SHARE_SUBDIR:-shares})"
 # sign-pgw prints "Pgw signature : <128 hex>" and libsodium-verifies it before returning,
 # so a wrong share tree fails here rather than as an opaque consensus rejection later.
-BRIDGE_SIGNER_SIGN_DIGEST="$DIGEST" \
-BRIDGE_SIGNER_SIGN_LEG=pgw \
-  ./sign-pevm.sh raw "0x$DIGEST" >/dev/null 2>&1 || true
-SIG=$(grep -h 'Pgw signature' "${LOG_PREFIX:-pgw}-sign-"*.log 2>/dev/null \
-      | awk '{print $NF}' | sort -u | head -1)
-[ -n "$SIG" ] || { echo "!! no Pgw signature produced — is the outgoing share tree present?" >&2; exit 1; }
+# `pgw` is its own kind: sign-pevm.sh pins the leg per kind, so passing the leg through the
+# environment was silently overridden and produced a Pevm signature over the wrong curve.
+# Output is NOT discarded — when this failed, swallowing it left nothing to diagnose from.
+./sign-pevm.sh pgw "0x$DIGEST" || {
+  echo "!! the outgoing committee could not sign the hand-over." >&2
+  echo "   The gateway still answers to the OLD key, so releases keep working; do not run" >&2
+  echo "   the share promotion until this succeeds." >&2
+  exit 1
+}
+# sign-pevm.sh logs under the kind name, inside testdata/.
+SIG=$(grep -h 'Pgw signature' testdata/pgw-sign-*.log 2>/dev/null \
+      | sed 's/.*: *//' | tr -d ' \r' | sort -u | head -1)
+[ -n "$SIG" ] || { echo "!! no Pgw signature in testdata/pgw-sign-*.log" >&2; exit 1; }
+[ "${#SIG}" -eq 128 ] || { echo "!! Pgw signature is ${#SIG} hex chars, expected 128" >&2; exit 1; }
 echo "   signature : $SIG"
 
 echo

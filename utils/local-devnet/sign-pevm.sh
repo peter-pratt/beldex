@@ -4,8 +4,9 @@
 #
 #   ./sign-pevm.sh <kind> <0x-preimage>
 #
-#     kind = mint    expects the 192-byte / 6-word mint tuple
-#            rotate  expects the 160-byte / 5-word rotation tuple
+#     kind = mint    expects the 224-byte / 7-word mint tuple
+#            rotate  expects the 224-byte / 7-word rotation tuple, or the
+#                    160-byte / 5-word activation tuple
 #            raw     no length check (set FORCE_PREIMAGE=1 to mean the same thing)
 #
 # This is the generalised form of sign-mint.sh. The environment block, the signer-binary
@@ -51,13 +52,37 @@ KIND="${1:-}"
 PREIMAGE="${2:-}"
 
 case "$KIND" in
-  mint)   WANT_HEX=384; WHAT="192-byte ABI-encoded mint tuple (6 words)" ;;
-  rotate) WANT_HEX=320; WHAT="160-byte ABI-encoded rotation tuple (5 words)" ;;
+  # 7 words: MINT_TAG, chainid, contract, to, amount, beldexTxid, outputIndex. The output
+  # index joined the tuple when deposits became keyed per gateway output rather than per
+  # transaction, so a gate still expecting six words rejects a correctly built preimage.
+  mint)   WANT_HEX=448; WHAT="224-byte ABI-encoded mint tuple (7 words)" ;;
+  # Two different tuples are signed under this kind, so the gate accepts either length:
+  #   rotateSigner     — 7 words: TAG, chainid, contract, newKeyEpoch, newSigner, nonce, deadline
+  #   activateRotation — 5 words: TAG, chainid, contract, pendingKeyEpoch, pendingSigner
+  # The nonce and deadline are what make a rotation authorization single-use; activation
+  # carries neither, because the pending rotation it activates is already pinned on chain.
+  rotate) WANT_HEX="448 320"; WHAT="ABI-encoded rotation tuple (7 words / 224B) or activation tuple (5 words / 160B)" ;;
   raw)    WANT_HEX=0;   WHAT="arbitrary preimage" ;;
+  # The Pgw leg signs a DIGEST, not a preimage: the gateway hand-off message is the
+  # gateway_ownership_message the daemon computed over the already-built transaction, so
+  # there is nothing for the signer to hash. 32 bytes, and ed25519 rather than secp256k1.
+  pgw)    WANT_HEX=64;  WHAT="32-byte gateway digest" ;;
   *)
     echo "usage: $0 <mint|rotate|raw> 0x<preimage>" >&2
     exit 1 ;;
 esac
+
+# The two legs take their input through different variables: Pevm is handed a PREIMAGE it
+# keccaks itself, Pgw is handed the finished DIGEST.
+if [ "$KIND" = "pgw" ]; then
+  SIGN_LEG=pgw
+  SIGN_INPUT_VAR=BRIDGE_SIGNER_SIGN_DIGEST
+else
+  SIGN_LEG=pevm
+  SIGN_INPUT_VAR=BRIDGE_SIGNER_SIGN_PREIMAGE
+fi
+# Exported rather than written as an assignment prefix: the variable NAME is chosen at run
+# time, and `$VAR=value cmd` is parsed as a command called "VAR=value", not an assignment.
 
 if [ -z "$PREIMAGE" ]; then
   echo "usage: $0 $KIND 0x<preimage>" >&2
@@ -68,6 +93,7 @@ fi
 # BRIDGE_SIGNER_SIGN_PREIMAGE, and that is the form known to work. Do the same.
 PREIMAGE="${PREIMAGE#0x}"
 PREIMAGE="${PREIMAGE#0X}"
+export "$SIGN_INPUT_VAR=$PREIMAGE"
 
 case "$PREIMAGE" in
   *[!0-9a-fA-F]*) echo "!! the preimage contains non-hex characters" >&2; exit 1 ;;
@@ -77,7 +103,12 @@ if [ $(( ${#PREIMAGE} % 2 )) -ne 0 ]; then
   exit 1
 fi
 
-if [ "$WANT_HEX" -ne 0 ] && [ "${#PREIMAGE}" -ne "$WANT_HEX" ] && [ "${FORCE_PREIMAGE:-0}" != "1" ]; then
+len_ok=0
+for want in $WANT_HEX; do
+  [ "$want" = "0" ] && len_ok=1
+  [ "${#PREIMAGE}" -eq "$want" ] && len_ok=1
+done
+if [ "$len_ok" -ne 1 ] && [ "${FORCE_PREIMAGE:-0}" != "1" ]; then
   echo "!! expected the $WHAT — $WANT_HEX hex chars, got ${#PREIMAGE} ($(( ${#PREIMAGE} / 2 )) bytes)"
   echo ""
   if [ "${#PREIMAGE}" -eq 64 ]; then
@@ -183,14 +214,18 @@ for d in beldex-127.0.0.1-*/; do
   # Same filter as sign-mint.sh: a node without a live socket and an ed25519 identity
   # cannot join the authenticated mesh, so it is not a participant.
   [ -S "$sock" ] && [ -f "$key" ] || continue
-  ls "$share"/pevm-*.keyshare >/dev/null 2>&1 || continue
+  if [ "$KIND" = "pgw" ]; then
+    ls "$share"/pgw-*.keypackage >/dev/null 2>&1 || continue
+  else
+    ls "$share"/pevm-*.keyshare >/dev/null 2>&1 || continue
+  fi
   BRIDGE_SIGNER_BELDEXD_RPC_URL="http://127.0.0.1:19191" \
   BRIDGE_SIGNER_OXENMQ_ENDPOINT="ipc://$sock" \
   BRIDGE_SIGNER_GATEWAY_ID="$ANY32" BRIDGE_SIGNER_SELF_MN_PUBKEY="$ANY32" \
   BRIDGE_SIGNER_BRIDGE_EPOCH_BLOCKS=120 BRIDGE_SIGNER_COMMITTEE_THRESHOLD="$THRESHOLD" \
   BRIDGE_SIGNER_MN_KEY_FILE="$key" BRIDGE_SIGNER_MESH_PORT_BASE=6000 \
   BRIDGE_SIGNER_MESH_USE_CURVE=false BRIDGE_SIGNER_SHARE_DIR="$share" \
-  BRIDGE_SIGNER_SIGN_LEG=pevm BRIDGE_SIGNER_SIGN_PREIMAGE="$PREIMAGE" \
+  BRIDGE_SIGNER_SIGN_LEG="$SIGN_LEG" \
   BRIDGE_SIGNER_SIGN_TIMEOUT_SECS="${BRIDGE_SIGNER_SIGN_TIMEOUT_SECS:-600}" \
     "$SIGNER" sign > "${PREFIX}-sign-${d%/}.log" 2>&1 &
   PIDS="$PIDS $!"
@@ -207,23 +242,36 @@ fi
 for p in $PIDS; do wait "$p" || true; done
 
 # --- results ------------------------------------------------------------------------------------
-if grep -qh 'no BRIDGE_SIGNER_SIGN_PREIMAGE set' "${PREFIX}-sign-"*.log 2>/dev/null; then
+if [ "$KIND" != "pgw" ] && grep -qh 'no BRIDGE_SIGNER_SIGN_PREIMAGE set' "${PREFIX}-sign-"*.log 2>/dev/null; then
   echo "!! the signer fell back to its built-in demo preimage — the env var did not reach it." >&2
   echo "   Nothing signed here is bound to the values you prepared. Stopping." >&2
   exit 1
 fi
 
 echo "── per-node results ──────────────────────────────────────────────────"
-grep -h 'ecrecover\|wBDX signer\|over digest' "${PREFIX}-sign-"*.log 2>/dev/null | sort | uniq -c || true
+grep -h 'ecrecover\|wBDX signer\|over digest\|Pgw signature\|owner_key\|libsodium' "${PREFIX}-sign-"*.log 2>/dev/null | sort | uniq -c || true
 
 # `|| true` inside the substitution: with pipefail, a grep that matches nothing fails the
 # whole pipeline and `set -e` would take the script down on a legitimately-zero count.
 NOK="$(grep -hc 'ecrecover.*VERIFIED' "${PREFIX}-sign-"*.log 2>/dev/null | awk '{s+=$1} END {print s+0}' || true)"
 echo ""
-echo "signers that ecrecover'd to the wBDX address: ${NOK:-0} (expect $THRESHOLD)"
+# The two legs report success differently: Pevm ecrecovers to an Ethereum address, Pgw is
+# verified by libsodium against the group key. Counting ecrecovers for a Pgw run reports
+# zero and fails a round that in fact succeeded.
+if [ "$KIND" = "pgw" ]; then
+  NOK="$(grep -hc 'libsodium   : VERIFIED' "${PREFIX}-sign-"*.log 2>/dev/null | paste -sd+ | bc 2>/dev/null || echo 0)"
+  echo "signers whose signature libsodium accepted: ${NOK:-0} (expect $THRESHOLD)"
+else
+  echo "signers that ecrecover'd to the wBDX address: ${NOK:-0} (expect $THRESHOLD)"
+fi
 
+if [ "$KIND" = "pgw" ]; then
+  SIGS="$(grep -h '^Pgw signature :' "${PREFIX}-sign-"*.log 2>/dev/null \
+          | sed 's/^Pgw signature :[[:space:]]*//' | tr -d ' \r' | sort -u || true)"
+else
 SIGS="$(grep -h '^Pevm signature:' "${PREFIX}-sign-"*.log 2>/dev/null \
         | sed 's/^Pevm signature:[[:space:]]*//' | tr -d ' \r' | sort -u || true)"
+fi
 NDISTINCT="$(printf '%s\n' "$SIGS" | grep -c . || true)"
 if [ "$NDISTINCT" -eq 0 ]; then
   echo "!! no signature produced — check testdata/${PREFIX}-sign-*.log" >&2
@@ -235,5 +283,9 @@ if [ "$NDISTINCT" -ne 1 ]; then
 fi
 
 echo ""
-echo "  Pevm signature: $SIGS"
+if [ "$KIND" = "pgw" ]; then
+  echo "  Pgw signature : $SIGS"
+else
+  echo "  Pevm signature: $SIGS"
+fi
 echo "  logs: utils/local-devnet/testdata/${PREFIX}-sign-*.log"
