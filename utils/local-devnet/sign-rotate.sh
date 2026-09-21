@@ -3,8 +3,9 @@
 #
 #   runlog ./sign-rotate.sh 0x<preimage-from-03-rotate-prep.sh>
 #
-# The preimage is abi.encode(ROTATE_TAG, chainid, wBDX, newKeyEpoch, newSigner) — 5 words,
-# 160 bytes. Signed by the key that is CURRENTLY in the contract, over its existing
+# The preimage is abi.encode(ROTATE_TAG, chainid, wBDX, newKeyEpoch, newSigner, nonce,
+# deadline) — 7 words, 224 bytes. The nonce makes the authorization single-use and the
+# deadline expires it. Signed by the key that is CURRENTLY in the contract, over its existing
 # shares; that is what makes the hand-off self-authorizing rather than an admin action.
 #
 # ─── getting a successor key first ───────────────────────────────────────────────────

@@ -19,11 +19,12 @@ PREIMAGE="${1:-}"
 PREIMAGE="${PREIMAGE#0x}"
 case "$PREIMAGE" in *[!0-9a-fA-F]*) echo "preimage must be hex"; exit 1 ;; esac
 [ $(( ${#PREIMAGE} % 2 )) -eq 0 ] || { echo "preimage hex must be even-length"; exit 1; }
-# The mint tuple abi.encodes to exactly 6 words = 192 bytes. A 32-byte argument is
+# The mint tuple abi.encodes to exactly 7 words = 224 bytes (the output index joined it
+# when deposits became keyed per gateway output). A 32-byte argument is
 # almost always the *digest* (or a tx hash) pasted by mistake — the signer keccaks
 # whatever it gets, so signing a digest produces keccak(digest) and the mint fails.
-if [ "${#PREIMAGE}" -ne 384 ] && [ "${FORCE_PREIMAGE:-0}" != "1" ]; then
-  echo "!! expected the 192-byte ABI-encoded mint tuple (384 hex chars), got $(( ${#PREIMAGE} / 2 )) bytes"
+if [ "${#PREIMAGE}" -ne 448 ] && [ "${FORCE_PREIMAGE:-0}" != "1" ]; then
+  echo "!! expected the 224-byte ABI-encoded mint tuple (448 hex chars), got $(( ${#PREIMAGE} / 2 )) bytes"
   echo "   use the 'preimage :' line from bridge-contract/devnet/01-deploy.sh"
   echo "   (or PREIMAGE=... from bridge-contract/devnet/mint.env)"
   echo "   override with FORCE_PREIMAGE=1 if you really mean it"

@@ -5,8 +5,8 @@
 #     runlog ./rotate-ceremony.sh --from 5     # resume after a failure, without re-DKG'ing
 #
 # Every one of the eight steps in ROTATION_RUNBOOK.md already has a script. What did not
-# exist until now is the ceremony: the thing that runs them in order, carries the 320- and
-# 384-character preimages between the two repos without a human retyping them, and leaves
+# exist until now is the ceremony: the thing that runs them in order, carries the 448- and
+# 448-character preimages between the two repos without a human retyping them, and leaves
 # one transcript behind. Both defects this project has hit in the rotation path so far —
 # the `mv` onto a non-existent shares dir, and the zsh no-match glob — happened at those
 # hand-run seams, not inside the bridge.
@@ -298,6 +298,15 @@ elif [ "$GEN_FROM_ARCHIVES" = "$GEN_FROM_CHAIN" ]; then
   KEYGEN="$GEN_FROM_CHAIN"
   ok "next DKG generation is $KEYGEN (archives and keyEpoch agree)"
   note "archives: ${ARCH_NAMES:-none} -> live generation $(( GEN_FROM_ARCHIVES - 1 ))"
+elif [ "$FROM" -ge 6 ] && [ "$GEN_FROM_CHAIN" -eq $(( GEN_FROM_ARCHIVES + 1 )) ]; then
+  # Mid-ceremony, and the two sources are SUPPOSED to disagree here. keyEpoch is bumped by
+  # the activation in step 5; the archive is only written by the promotion in step 7. Between
+  # those two steps the chain is exactly one generation ahead, which is the state every
+  # `--from 6` and `--from 7` resume starts in. The generation in flight is the archives'
+  # next free one — the number the shares-next tree was built under.
+  KEYGEN="$GEN_FROM_ARCHIVES"
+  ok "next DKG generation is $KEYGEN (rotation activated, shares not yet promoted)"
+  note "archives: ${ARCH_NAMES:-none}; chain keyEpoch $GEN_FROM_CHAIN is one ahead, as expected mid-ceremony"
 else
   fail "cannot derive the DKG generation number: the share archives say the next free one is
    $GEN_FROM_ARCHIVES (archives: ${ARCH_NAMES:-none}), the chain's keyEpoch $CUR_EPOCH says $GEN_FROM_CHAIN.
@@ -485,10 +494,16 @@ load_rotate_env() {
   NEW_KEY_EPOCH="$(envget "$f" NEW_KEY_EPOCH)"
   OUTGOING="$(lc "$(envget "$f" OUTGOING_SIGNER)")"
   ROTATE_TIMELOCK="$(envget "$f" ROTATE_TIMELOCK)"
+  ACTIVATE_PREIMAGE="$(envget "$f" ACTIVATE_PREIMAGE)"
+  ACTIVATE_DIGEST="$(envget "$f" ACTIVATE_DIGEST)"
   [ -n "$ROTATE_PREIMAGE" ] && [ -n "$NEW_SIGNER" ] || fail "$f is missing ROTATE_PREIMAGE or NEW_SIGNER"
-  [ "${#ROTATE_PREIMAGE}" -eq 322 ] \
-    || fail "the rotation preimage in $f is $(( ${#ROTATE_PREIMAGE} - 2 )) hex chars, expected 320
-   (5 ABI words / 160 bytes). Re-run step 3."
+  [ -n "$ACTIVATE_PREIMAGE" ] || fail "$f is missing ACTIVATE_PREIMAGE — re-run step 3."
+  # 7 ABI words: ROTATE_TAG, chainid, contract, newKeyEpoch, newSigner, nonce, deadline.
+  # The last two arrived with single-use rotation authorizations; a check still expecting
+  # five words rejects a preimage 03-rotate-prep.sh built correctly.
+  [ "${#ROTATE_PREIMAGE}" -eq 450 ] \
+    || fail "the rotation preimage in $f is $(( ${#ROTATE_PREIMAGE} - 2 )) hex chars, expected 448
+   (7 ABI words / 224 bytes). Re-run step 3."
 }
 
 step3() {
@@ -501,7 +516,7 @@ step3() {
   load_rotate_env
   [ "$NEW_SIGNER" = "$SUCCESSOR" ] \
     || fail "rotate.env names $NEW_SIGNER as the successor, but step 2 probed $SUCCESSOR."
-  ok "preimage : 320 hex chars, digest $ROTATE_DIGEST"
+  ok "preimage : 448 hex chars, digest $ROTATE_DIGEST"
   ok "epoch    : $CUR_EPOCH -> $NEW_KEY_EPOCH, challenge window ${ROTATE_TIMELOCK}s"
   state_put ROTATE_DIGEST "$ROTATE_DIGEST"
   state_put NEW_KEY_EPOCH "$NEW_KEY_EPOCH"
@@ -548,6 +563,43 @@ step4() {
    Only the key currently in the contract can authorise its own replacement."
   ok "signed by the outgoing key $signed_by, over $ROTATE_DIGEST"
 }
+# ===========================================================================================
+# step 4b — the INCOMING committee proves it can sign.
+#
+# activateRotation takes the incoming committee's signature as well, so the contract never
+# retires the old key until the new one has demonstrably signed something (H.6.2b). Without
+# it the hand-off can land on a key nobody can use, and the bridge is dead with no way back
+# that does not reach for the admin break-glass.
+#
+# Signed with shares-next, and deliberately NOT gated: it is a signature over a throwaway
+# message with a key that is not in the contract yet, so it moves nothing and risks nothing.
+# The gate that matters is step 5, which submits both signatures.
+# ===========================================================================================
+step4b() {
+  banner "4b — the incoming committee signs the activation"
+  STEP_TITLE="step 4b, the activation signature"; FAILED_AT=4
+
+  ( export SHARE_SUBDIR=shares-next ACTIVATE=1
+    unset SHARE_GLOB
+    run_logged "04b-sign-activate.log" "$LOCAL/sign-rotate.sh" "$ACTIVATE_PREIMAGE" ) \
+    || fail "the incoming committee failed to sign the activation — see
+   $WORK/04b-sign-activate.log. Nothing on chain has moved, and both share trees are intact.
+   A committee that cannot sign here must NOT be rotated to."
+
+  local signed_by
+  signed_by="$(scrape_signer activate)"
+  [ -n "$signed_by" ] || fail "activate-sign-*.log has no 'wBDX signer' line"
+  # The mirror of step 4's check: this one must be signed by the INCOMING key. Signing it
+  # with the live tree would prove the outgoing committee is alive, which nobody doubts,
+  # and the contract would reject it.
+  [ "$signed_by" = "$(lc "$NEW_SIGNER")" ] \
+    || fail "the activation was signed by $signed_by, but it must be signed by the incoming
+   committee $NEW_SIGNER. SHARE_SUBDIR did not reach the signer as shares-next.
+   Nothing has been submitted; re-run from step 4."
+  ok "signed by the incoming key $signed_by, over $ACTIVATE_DIGEST"
+}
+skip4b() { note "step 4b skipped"; }
+
 skip4() {
   ls "$TESTDATA"/rotate-sign-*.log >/dev/null 2>&1 \
     || fail "step 4 was skipped but there are no rotate-sign-*.log files in $TESTDATA.
@@ -762,8 +814,11 @@ step8() {
     # into one that SUCCEEDED must not: that txid is spent, and 05-mint-prep.sh would refuse
     # the whole step rather than let leg B mint twice.
     txid="$(state_get HANDOFF_TXID)"
+    # The replay guard is keyed per gateway OUTPUT, so ask about keccak(txid, 0) — the bare
+    # txid reads false for a deposit that was minted and the step then fails on Replay().
     if [ -n "$txid" ] \
-       && [ "$(onchain 'processedDeposits(bytes32)(bool)' "$txid")" = "true" ]; then
+       && [ "$(onchain 'processedDeposits(bytes32)(bool)' \
+                "$(cast keccak "$(cast abi-encode 'f(bytes32,uint32)' "$txid" 0)")")" = "true" ]; then
       note "the txid from the last run is already spent — drawing a fresh one"
       txid=""
     fi
@@ -786,9 +841,11 @@ step8() {
   digest="$(envget "$BRIDGE/devnet/mint2.env" DIGEST)"
   live="$(lc "$(envget "$BRIDGE/devnet/mint2.env" LIVE_SIGNER)")"
   retired="$(lc "$(envget "$BRIDGE/devnet/mint2.env" RETIRED_SIGNER)")"
-  [ "${#preimage}" -eq 386 ] \
-    || fail "the mint preimage is $(( ${#preimage} - 2 )) hex chars, expected 384 (6 ABI words)"
-  ok "one preimage, 384 hex chars, digest $digest"
+  # 450 = 448 hex chars + the "0x" prefix. 7 ABI words: MINT_TAG, chainid, contract, to,
+  # amount, beldexTxid, outputIndex.
+  [ "${#preimage}" -eq 450 ] \
+    || fail "the mint preimage is $(( ${#preimage} - 2 )) hex chars, expected 448 (7 ABI words)"
+  ok "one preimage, 448 hex chars, digest $digest"
 
   # Both committees sign the SAME preimage. That is the whole point: same tag, chain id,
   # contract, recipient, amount and txid, so the only variable between the accepted and the
@@ -837,6 +894,11 @@ for n in 1 2 3 4 5 6 7 8; do
   if [ "$FROM" -le "$n" ]; then "step$n"; else "skip$n"; fi
   # The gateway handover sits between verification and promotion — it is signed by the
   # OUTGOING key, which step 7 moves. Resuming --from 7 deliberately skips it.
+  # The incoming committee's liveness signature belongs with step 4's: both are inputs to
+  # the single submission step 5 makes, and neither touches the chain.
+  if [ "$n" = 4 ]; then
+    if [ "$FROM" -le 4 ]; then step4b; else skip4b; fi
+  fi
   if [ "$n" = 6 ]; then
     if [ "$FROM" -le 6 ]; then step6b; else skip6b; fi
   fi
