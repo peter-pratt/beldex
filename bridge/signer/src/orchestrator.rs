@@ -201,6 +201,21 @@ impl Orchestrator {
             .collect()
     }
 
+    /// Every duty not yet `Done`, `Pending` and `InFlight` alike, in the same deterministic
+    /// order as [`ready`](Self::ready).
+    ///
+    /// For re-asking the chain whether work has been settled by somebody else. `ready` is not
+    /// enough for that: a duty whose session keeps timing out and reopening is `InFlight`
+    /// almost continuously, passing through `Pending` for a single tick between the two, so a
+    /// periodic sweep over `ready` alone would almost never see it.
+    pub fn outstanding(&self) -> Vec<&Duty> {
+        self.duties
+            .values()
+            .filter(|e| e.status != DutyStatus::Done)
+            .map(|e| &e.duty)
+            .collect()
+    }
+
     /// `(pending, in_flight, done)` counts — for the heartbeat / health surface.
     pub fn counts(&self) -> (usize, usize, usize) {
         let mut c = (0, 0, 0);
@@ -499,5 +514,40 @@ mod tests {
         let rep2 = tick(&mut o, &mut src, &mut exec);
         assert_eq!(rep2.submitted + rep2.retried + rep2.abandoned, 0);
         assert_eq!(exec.executed.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod outstanding_tests {
+    use super::*;
+
+    fn d(n: u8) -> Duty {
+        Duty::Release(crate::watch::ReleaseEvent {
+            evm_txid: [n; 32],
+            log_index: 1,
+            chain: crate::chain_registry::ChainId(31337),
+            amount: 1,
+            beldex_recipient: b"bxAlice".to_vec(),
+        })
+    }
+
+    /// A duty whose session keeps timing out and reopening sits `InFlight` almost
+    /// continuously, so a settlement sweep driven by `ready` would step over it nearly every
+    /// time and the member would reopen sessions for work already finished elsewhere.
+    #[test]
+    fn outstanding_sees_in_flight_work_that_ready_hides() {
+        let mut o = Orchestrator::new();
+        o.observe(d(1));
+        o.observe(d(2));
+        o.mark_in_flight(&d(1).key());
+
+        assert_eq!(o.ready().len(), 1, "ready only reports the queued one");
+        assert_eq!(o.outstanding().len(), 2, "outstanding reports both");
+
+        o.mark_done(&d(1).key());
+        assert_eq!(o.outstanding().len(), 1, "a finished duty drops out");
+        // And it cannot be resurrected by a late session timeout.
+        assert!(!o.requeue(&d(1).key()));
+        assert_eq!(o.status(&d(1).key()), Some(DutyStatus::Done));
     }
 }

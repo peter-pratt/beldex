@@ -1861,7 +1861,9 @@ where
             }
         }
 
-        // Re-ask the chain about duties still queued. Reconciliation on first sighting is
+        // Re-ask the chain about every duty not yet done — in flight as well as queued, since
+        // a session that keeps timing out and reopening is almost never in the queued state.
+        // Reconciliation on first sighting is
         // not enough: a duty is settled by WHICHEVER member submits, and the members that
         // did not submit have no other way to learn it happened. If they also missed the
         // signature aggregate they cannot take the straggler path either, so their sessions
@@ -1870,7 +1872,7 @@ where
         // Left alone on a 20-member committee that is 19 nodes spinning on every completed
         // release for the life of the process.
         if reconcile_on && ticks % reconcile_recheck_ticks == 0 {
-            let queued: Vec<Duty> = orch.ready().into_iter().cloned().collect();
+            let queued: Vec<Duty> = orch.outstanding().into_iter().cloned().collect();
             for d in queued {
                 if reconciler.is_settled(&d) == Some(true) {
                     orch.mark_done(&d.key());
