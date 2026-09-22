@@ -4407,12 +4407,23 @@ namespace cryptonote::rpc {
       if (bs.seated) ++seated; else ++queued;
       if (std::find(ops.begin(), ops.end(), e.info->operator_address) == ops.end())
         ops.push_back(e.info->operator_address);
+      // The exit fields. Nothing logs a successful unbond and the seat deliberately stays
+      // seated afterwards, so without these an operator cannot tell an accepted leave
+      // request from one consensus silently refused — both look identical from outside.
+      // `serving_key_epoch` is the baseline `observed_key_epoch` must pass before the bond
+      // can be released, so the two together say exactly what a pending exit is waiting on.
+      auto serving = json::array();
+      for (const auto &ce : bs.serving_key_epoch)
+        serving.push_back(json{{"chain_id", ce.chain_id}, {"key_epoch", ce.key_epoch}});
       seats.push_back(json{
           {"master_node_pubkey", tools::type_to_hex(e.pubkey)},
           {"seated", bs.seated},
           {"bond", bs.bond_amount},
           {"signer_ed25519", tools::type_to_hex(bs.signer_ed25519)},
-          {"registration_height", bs.registration_height}});
+          {"registration_height", bs.registration_height},
+          {"requested_unbond_height", bs.requested_unbond_height},
+          {"bond_unlock_height", bs.bond_unlock_height},
+          {"serving_key_epoch", std::move(serving)}});
     }
     cmd.response["seats"]              = std::move(seats);
     cmd.response["seated_count"]       = seated;
@@ -4421,6 +4432,14 @@ namespace cryptonote::rpc {
     cmd.response["activation_floor"]   = cryptonote::bridge_activation_floor(nettype());
     cmd.response["seat_cap"]           = cryptonote::BRIDGE_SEAT_CAP;
     cmd.response["active"]             = (ops.size() >= cryptonote::bridge_activation_floor(nettype()));
+    // The per-chain key epoch this chain has observed, from mined rotation acknowledgements.
+    // A departing seat's bond is gated on this having moved past the baseline taken when it
+    // asked to leave, so without it an operator cannot tell a bond that is merely waiting
+    // from one whose acknowledgement never landed.
+    auto observed = json::array();
+    for (const auto &ce : m_core.get_master_node_list().get_observed_key_epoch())
+      observed.push_back(json{{"chain_id", ce.chain_id}, {"key_epoch", ce.key_epoch}});
+    cmd.response["observed_key_epoch"] = std::move(observed);
     cmd.response["status"]             = STATUS_OK;
   }
 

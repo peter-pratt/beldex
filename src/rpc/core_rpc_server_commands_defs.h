@@ -3043,6 +3043,16 @@ namespace cryptonote::rpc {
   /// - `activation_floor` -- distinct-operator floor for the bridge to activate.
   /// - `seat_cap` -- hard seat cap.
   /// - `active` -- whether the bridge is above the activation floor.
+  /// - each seat also carries `requested_unbond_height` (0 = active, else the height the
+  ///   exit was asked for), `bond_unlock_height` (when the bond becomes spendable) and
+  ///   `serving_key_epoch` (the per-chain baseline `observed_key_epoch` must pass first).
+  ///   A successful unbond logs nothing and leaves the seat seated, so these are the only
+  ///   way to tell an accepted leave request from a silently refused one.
+  /// - `observed_key_epoch` -- per-chain {chain_id, key_epoch} this chain has observed,
+  ///   advanced only by mined rotation acknowledgements. A departing seat's bond is gated
+  ///   on this having moved past the baseline taken when it asked to leave, so it is what
+  ///   distinguishes a bond that is merely waiting from one whose acknowledgement never
+  ///   landed.
   /// - `status` -- Generic RPC error code. "OK" is the success value.
   struct BRIDGE_GET_SEATS : PUBLIC
   {

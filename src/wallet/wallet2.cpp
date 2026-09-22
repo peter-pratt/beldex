@@ -10478,8 +10478,13 @@ void wallet2::transfer_selected_rct(std::vector<cryptonote::tx_destination_entry
   // throw if total amount overflows uint64_t
   for(auto& dt: dsts)
   {
+    // A zero-amount destination is the dummy that becomes the change output on a tx that
+    // carries its payload in tx_extra and moves no value. bridge_registration covers the
+    // registration, which DOES move the bond, as well as the unbond, slash and rotation-ack
+    // commands, which do not — so the registration simply never reaches here with a zero.
     THROW_WALLET_EXCEPTION_IF(0 == dt.amount && tx_params.tx_type != txtype::beldex_name_system && tx_params.tx_type != txtype::coin_burn
-                              && tx_params.tx_type != txtype::register_gateway_address && tx_params.tx_type != txtype::update_gateway_address, error::zero_destination);
+                              && tx_params.tx_type != txtype::register_gateway_address && tx_params.tx_type != txtype::update_gateway_address
+                              && tx_params.tx_type != txtype::bridge_registration, error::zero_destination);
     needed_money += dt.amount;
     LOG_PRINT_L2("transfer: adding " << print_money(dt.amount) << ", for a total of " << print_money (needed_money));
     THROW_WALLET_EXCEPTION_IF(needed_money < dt.amount, error::tx_sum_overflow, dsts, fee, m_nettype);
@@ -11461,6 +11466,18 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
     dsts.emplace_back(0, account_public_address{} /*address*/, false /*is_subaddress*/); // dummy dest -> change output
   }
 
+  // Bridge COMMAND txs (HF23): unbond, slash and rotation-ack carry their whole payload in
+  // tx_extra and move no value — the wallet is only a fee-paying courier. They share the
+  // bridge_registration type with the registration itself, which DOES move the bond, so the
+  // test is an empty destination list rather than the type alone. Without a dummy the tx is
+  // built with nothing to send and fails as "Destination amount is zero", which blocks a
+  // member from ever requesting to leave and blocks the acknowledgement that unlocks bonds.
+  bool const is_bridge_cmd_tx = (tx_params.tx_type == txtype::bridge_registration && dsts.empty());
+  if (is_bridge_cmd_tx)
+  {
+    dsts.emplace_back(0, account_public_address{} /*address*/, false /*is_subaddress*/); // dummy dest -> change output
+  }
+
   if(m_light_wallet) {
     // Populate m_transfers
     light_wallet_get_unspent_outs();
@@ -11610,7 +11627,7 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
   needed_money = 0;
   for(auto& dt: dsts)
   {
-    THROW_WALLET_EXCEPTION_IF(0 == dt.amount && !(is_bns_tx || is_burn_tx || is_gateway_op_tx), error::zero_destination);
+    THROW_WALLET_EXCEPTION_IF(0 == dt.amount && !(is_bns_tx || is_burn_tx || is_gateway_op_tx || is_bridge_cmd_tx), error::zero_destination);
     needed_money += dt.amount;
     LOG_PRINT_L2("transfer: adding " << print_money(dt.amount) << ", for a total of " << print_money (needed_money));
     THROW_WALLET_EXCEPTION_IF(needed_money < dt.amount, error::tx_sum_overflow, dsts, 0, m_nettype);
@@ -11618,7 +11635,7 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
 
 
   // throw if attempting a transaction with no money
-  THROW_WALLET_EXCEPTION_IF(needed_money == 0 && !(is_bns_tx || is_burn_tx || is_gateway_op_tx), error::zero_destination);
+  THROW_WALLET_EXCEPTION_IF(needed_money == 0 && !(is_bns_tx || is_burn_tx || is_gateway_op_tx || is_bridge_cmd_tx), error::zero_destination);
 
   std::map<uint32_t, std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> unlocked_balance_per_subaddr = unlocked_balance_per_subaddress(subaddr_account, false);
   std::map<uint32_t, uint64_t> balance_per_subaddr = balance_per_subaddress(subaddr_account, false);

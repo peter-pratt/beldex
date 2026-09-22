@@ -536,6 +536,18 @@ namespace master_nodes
     void validate_miner_tx(const cryptonote::miner_tx_info& info) const;
     void alt_block_add(const cryptonote::block_add_info& info);
     payout get_block_leader() const { std::lock_guard lock{m_mn_mutex}; return m_state.get_block_leader(); }
+
+    /// HF23 H.6.3: the per-chain wBDX key epoch this chain has *observed*, as advanced by
+    /// mined rotation acknowledgements. A departing operator's bond is not released until
+    /// this has moved past the baseline recorded when it asked to leave, so it is the one
+    /// value that says whether bond release is currently possible — and it was previously
+    /// readable only from inside consensus, which left operators no way to tell a pending
+    /// unbond from a stuck one.
+    std::vector<bridge_chain_epoch> get_observed_key_epoch() const
+    {
+      std::lock_guard lock{m_mn_mutex};
+      return m_state.observed_key_epoch;
+    }
     bool is_master_node(const crypto::public_key& pubkey, bool require_active = true) const;
     bool is_key_image_locked(crypto::key_image const &check_image, uint64_t *unlock_height = nullptr, master_node_info::contribution_t *the_locked_contribution = nullptr) const;
     uint64_t height() const { return m_state.height; }

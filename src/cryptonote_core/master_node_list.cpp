@@ -2354,11 +2354,12 @@ namespace master_nodes
       return false;
     }
 
-    // Enter the unbonding state: the seat immediately stops being committee-
-    // eligible for future epochs (refresh_bridge_seats excludes exiting seats),
-    // but the bond stays locked — and the operator slashable — until
-    // bond_unlock_height. The ≥30-day window spans many epochs, so the operator
-    // remains accountable for any current-epoch duty it is still performing.
+    // Enter the unbonding state: the seat is no longer promoted or re-seated
+    // (refresh_bridge_seats skips exiting seats when filling slots), but it keeps the
+    // seat it already holds and stays committee-eligible — see the note below. The bond
+    // stays locked, and the operator slashable, until bond_unlock_height. The ≥30-day
+    // window spans many epochs, so the operator remains accountable for every duty it
+    // performs while it is still serving.
     auto &info = duplicate_info(iter->second);
     info.bridge_seat.requested_unbond_height = block_height;
     info.bridge_seat.bond_unlock_height      = block_height + cryptonote::bridge_bond_unlock_blocks(nettype);
@@ -2544,24 +2545,47 @@ namespace master_nodes
     // entirely (bond returned, seat freed for the queue head to fill). Runs each
     // block after tx processing; deterministic and reorg-safe via the master-node
     // state_history snapshot mechanism (no explicit inverse-rewind needed).
+    // Two independent milestones, and conflating them costs one way or the other.
+    //
+    //   STOP SERVING once the key this seat holds a share of has been retired. That is the
+    //   only reason a departing seat is kept on the committee at all: dropping it while its
+    //   key is still live would remove signers from under a key that can still be asked to
+    //   sign, and with enough seats leaving at once nothing could reach threshold — not even
+    //   to authorise the rotation that would fix it. After the rotation that reason is gone,
+    //   and holding the seat any longer only keeps a departing operator signing and blocks
+    //   the queue head from its slot for the rest of the unbonding period.
+    //
+    //   RELEASE THE BOND only once the ≥30-day window has ALSO elapsed. The window is the
+    //   slashing horizon: the operator stays accountable for the duties it performed, long
+    //   after it has stopped performing them.
+    std::vector<crypto::public_key> to_unseat;
     std::vector<crypto::public_key> to_release;
     for (const auto &[pk, info] : master_nodes_infos)
     {
       const auto &bs = info->bridge_seat;
       // A forfeited (slashed) bond is never released — its unlock height is
       // UINT64_MAX, so the comparison below can never hold, but skip it explicitly
-      // so the intent is not accidental (Phase F).
-      if (bs.is_forfeited())
+      // so the intent is not accidental (Phase F). It is still unseated: a forfeited
+      // seat must stop serving, it simply never gets its bond back.
+      if (!bs.registered || bs.requested_unbond_height == 0)
         continue;
-      if (bs.registered && bs.requested_unbond_height != 0 && block_height >= bs.bond_unlock_height
-          && rotation_completed_for(observed_key_epoch, bs.serving_key_epoch))
+      const bool key_retired = rotation_completed_for(observed_key_epoch, bs.serving_key_epoch);
+      if (bs.seated && key_retired)
+        to_unseat.push_back(pk);
+      if (!bs.is_forfeited() && key_retired && block_height >= bs.bond_unlock_height)
         to_release.push_back(pk);
+    }
+    for (const auto &pk : to_unseat)
+    {
+      // Seat only: `registered` stays true, so the bond's key images remain locked and the
+      // operator remains slashable until the window closes.
+      auto iter = master_nodes_infos.find(pk);
+      duplicate_info(iter->second).bridge_seat.seated = false;
     }
     for (const auto &pk : to_release)
     {
-      // Resetting to the unregistered default also clears `seated` — the seat stops
-      // serving at exactly the moment its key is retired and its bond is released, so
-      // there is never a gap where it is unseated but its share still signs.
+      // Resetting to the unregistered default clears `registered`, which is what takes the
+      // bond's key images out of `is_key_image_locked` and makes them spendable again.
       auto iter = master_nodes_infos.find(pk);
       duplicate_info(iter->second).bridge_seat = master_node_info::bridge_seat_info{}; // reset to unregistered default
     }

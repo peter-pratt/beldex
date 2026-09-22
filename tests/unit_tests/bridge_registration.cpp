@@ -151,12 +151,22 @@ TEST(BridgeRegistration, exiting_seat_keeps_serving_until_its_key_retires)
       << "an exiting seat must STILL serve — it holds the only usable share";
   EXPECT_TRUE(bs.is_exiting_seat()) << "and is recognisable as on its way out";
 
-  // Its key is retired and the bond released: the seat resets, and only now does it
-  // stop serving. There is never a moment where it is unseated but still holds a
-  // live share.
+  // Its key is retired. The seat stops serving AT THAT POINT — the reason to keep it was
+  // that it held the only usable share, and that reason is gone. It stays `registered`,
+  // so the bond's key images are still locked and the operator is still slashable for the
+  // rest of the ≥30-day window.
+  bs.seated = false;
+  EXPECT_FALSE(bs.is_active_seat()) << "a seat whose key has retired stops serving";
+  EXPECT_FALSE(bs.is_exiting_seat()) << "and is no longer an exiting SEAT — it holds none";
+  EXPECT_TRUE(bs.registered)
+      << "but it is still registered: the bond stays locked and slashable until the window "
+         "closes, which is a separate milestone from standing down";
+
+  // The window closes and the bond is released: the seat resets completely.
   bs = master_nodes::master_node_info::bridge_seat_info{};
   EXPECT_FALSE(bs.is_active_seat()) << "released seats stop serving";
   EXPECT_FALSE(bs.is_exiting_seat());
+  EXPECT_FALSE(bs.registered) << "and only now do the bond's key images become spendable";
 }
 
 // --- the bond waits for the gateway key too, not just the wBDX keys -----------

@@ -185,8 +185,18 @@ impl OmqCommitteeClient {
         sock.set_linger(0).map_err(|e| format!("set_linger: {e}"))?;
         sock.connect(&self.endpoint)
             .map_err(|e| format!("connect {}: {e}", self.endpoint))?;
+        // request parts: command, correlation tag, data — the tag is NOT optional. Without
+        // it the daemon takes the first data part as the tag, the handler sees zero data
+        // parts and never runs, and the DEALER gets back a REPLY whose only part is the tag
+        // it was handed: the submission JSON, echoed. That reads exactly like a success,
+        // which is how this went unnoticed — the acknowledgement never reached consensus,
+        // so `observed_key_epoch` never advanced and no departed member's bond could unlock.
         sock.send_multipart(
-            [b"bridge.rotation_ack".as_slice(), submission_json.as_bytes()],
+            [
+                b"bridge.rotation_ack".as_slice(),
+                b"bridgesig-rotation-ack".as_slice(),
+                submission_json.as_bytes(),
+            ],
             0,
         )
         .map_err(|e| format!("send: {e}"))?;
@@ -197,10 +207,23 @@ impl OmqCommitteeClient {
             return Err(format!("timeout after {ms}ms submitting to {}", self.endpoint));
         }
         let reply = sock.recv_multipart(0).map_err(|e| format!("recv: {e}"))?;
-        if reply.len() < 2 || reply[0] != b"REPLY" {
+        // [ REPLY, tag, status, data... ] — the same shape the committee and mint calls
+        // parse. Reading part 1 returns the correlation tag, so the caller logs
+        // "bridgesig-rotation-ack" where the tx_extra should be; and skipping the status
+        // reports a rejected acknowledgement as an accepted one, which is the difference
+        // between a bond that unlocks and one that never does.
+        if reply.len() < 3 || reply[0] != b"REPLY" {
             return Err(format!("unexpected {}-part reply", reply.len()));
         }
-        Ok(String::from_utf8_lossy(&reply[1]).into_owned())
+        let status = String::from_utf8_lossy(&reply[2]).into_owned();
+        if status != "200" {
+            let body = reply.get(3).map(|d| String::from_utf8_lossy(d).into_owned());
+            return Err(format!(
+                "daemon returned status {status}{}",
+                body.map(|b| format!(": {b}")).unwrap_or_default()
+            ));
+        }
+        Ok(reply.get(3).map(|d| String::from_utf8_lossy(d).into_owned()).unwrap_or_default())
     }
 }
 
@@ -337,5 +360,68 @@ mod tests {
             view.size(),
             view.threshold
         );
+    }
+}
+
+#[cfg(test)]
+mod omq_request_shape_tests {
+    //! Every OMQ request is [command, correlation tag, data…]. Omitting the tag does not
+    //! fail: the first data part silently becomes the tag, the handler sees no data and
+    //! never runs, and the reply carries that part straight back — which reads as success.
+    //! The rotation acknowledgement shipped that way, so it never reached consensus and no
+    //! departed member's bond could ever unlock.
+
+    /// Built the same way the senders build them, so a missing tag shows up here.
+    fn parts(cmd: &[u8], tag: &[u8], data: &[&[u8]]) -> Vec<Vec<u8>> {
+        let mut v = vec![cmd.to_vec(), tag.to_vec()];
+        v.extend(data.iter().map(|d| d.to_vec()));
+        v
+    }
+
+    /// Replies are [ REPLY, tag, status, data… ]. Two separate mistakes hide in that shape:
+    /// taking part 1 hands back the correlation tag instead of the payload, and skipping
+    /// part 2 reports a rejected call as a successful one.
+    #[test]
+    fn a_reply_body_is_part_three_and_the_status_is_part_two() {
+        let reply: Vec<Vec<u8>> = vec![
+            b"REPLY".to_vec(),
+            b"bridgesig-rotation-ack".to_vec(),
+            b"200".to_vec(),
+            b"{\"rotation_hex\":\"deadbeef\"}".to_vec(),
+        ];
+        assert_eq!(&reply[2], b"200", "the status is part two");
+        let body = String::from_utf8_lossy(&reply[3]).into_owned();
+        assert!(body.contains("rotation_hex"), "the payload is part three");
+        assert!(
+            !String::from_utf8_lossy(&reply[1]).contains("rotation_hex"),
+            "part one is the tag — logging it loses the tx_extra the operator must broadcast"
+        );
+
+        // A rejection carries a non-200 status and must never read as success.
+        let bad: Vec<Vec<u8>> = vec![
+            b"REPLY".to_vec(),
+            b"bridgesig-rotation-ack".to_vec(),
+            b"400".to_vec(),
+            b"bridge.rotation_ack: malformed ack".to_vec(),
+        ];
+        assert_ne!(&bad[2], b"200", "a non-200 status must be surfaced, not ignored");
+    }
+
+    #[test]
+    fn a_request_carries_its_tag_before_its_data() {
+        for (cmd, tag) in [
+            (&b"bridge.committee"[..], &b"bridgesig-committee"[..]),
+            (&b"bridge.mint_payload"[..], &b"bridgesig-mint"[..]),
+            (&b"bridge.rotation_ack"[..], &b"bridgesig-rotation-ack"[..]),
+        ] {
+            let p = parts(cmd, tag, &[b"{\"some\":\"payload\"}"]);
+            assert_eq!(p[0], cmd, "part 0 is the command");
+            assert_eq!(p[1], tag, "part 1 is the correlation tag, never the payload");
+            assert_eq!(p.len(), 3, "exactly one data part follows the tag");
+            assert_ne!(
+                p[1], b"{\"some\":\"payload\"}".to_vec(),
+                "the payload must not land in the tag slot"
+            );
+        }
     }
 }
