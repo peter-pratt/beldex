@@ -3013,7 +3013,29 @@ namespace cryptonote::rpc {
   void core_rpc_server::invoke(GET_MASTER_NODE_BLACKLISTED_KEY_IMAGES& get_master_node_blacklisted_key_images, rpc_context context)
   {
     PERF_TIMER(on_get_master_node_blacklisted_key_images);
-    auto &blacklist = m_core.get_master_node_blacklisted_key_images();
+    auto blacklist = m_core.get_master_node_blacklisted_key_images();
+
+    // HF23: a bridge bond's key images are locked by `is_key_image_locked` for as long as the
+    // seat stays registered, but nothing advertised that lock. The blacklist held in state only
+    // gains these entries when a node is DEREGISTERED -- that path exists to stop an operator
+    // reclaiming the bond early, not to describe a bond that is simply doing its job. A wallet
+    // asking what it may spend was therefore told the bond was available: it counted the 100,000
+    // BDX as unlocked, offered it to the operator, and built transactions consensus then rejected
+    // with "Key image is locked by master node".
+    //
+    // Report the live bond locks alongside the consensus ones, so the answer matches what
+    // consensus will accept. This is view-only: the blacklist in state is untouched, so nothing
+    // here changes what any node validates. `bond_unlock_height` stays 0 until an exit is
+    // requested, which is the truthful answer -- no unlock is scheduled yet.
+    for (const auto &e : m_core.get_master_node_list_state({}))
+    {
+      const auto &bs = e.info->bridge_seat;
+      if (!bs.registered)
+        continue;
+      for (const auto &c : bs.bond_contributions)
+        blacklist.emplace_back(master_nodes::key_image_blacklist_entry::version_t::version_1_serialize_amount,
+                               c.key_image, bs.bond_unlock_height, c.amount);
+    }
 
     get_master_node_blacklisted_key_images.response["status"] = STATUS_OK;
     get_master_node_blacklisted_key_images.response["blacklist"] = blacklist;
