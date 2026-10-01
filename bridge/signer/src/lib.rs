@@ -129,6 +129,11 @@ pub mod reconcile;
 #[cfg(feature = "tss-integration")]
 pub mod ffi;
 
+/// Group-key check for combined signatures, own or announced by a peer, before the
+/// coordinator stores or submits them. Needs k256 + libsodium (`tss-integration`).
+#[cfg(feature = "tss-integration")]
+pub mod aggregate_signature;
+
 /// Gateway bridge-memo decryption (signer side): reproduces `beldexd`'s
 /// `decrypt_gateway_bridge_memo` (Monero DH `generate_key_derivation` + the
 /// `GW_BRIDGE_MEMO_MASK` single-block mask) so the signer recovers a

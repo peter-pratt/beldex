@@ -189,7 +189,8 @@ struct LiveSession {
     acked: bool,
     /// This node NACKed the current attempt's proposal (never signs / never submits).
     nacked: bool,
-    /// The combined signature (own signing result, or captured off a `Signature` broadcast).
+    /// The combined signature: this node's own signing result, or a `Signature` broadcast
+    /// that verified under the group key against this node's own accepted proposal.
     signature: Option<Vec<u8>>,
     dist_acked: bool,
     /// Ticks spent in the current stage (for the timeout → retry rotation).
@@ -209,8 +210,8 @@ pub struct StepReport {
     pub completed: usize,
     pub requeued: usize,
     pub abandoned: usize,
-    /// Duties recorded Done via straggler catch-up (the committee's aggregate was observed,
-    /// but this node was not part of the finalizing quorum and did not submit).
+    /// Always 0. A peer's announcement no longer settles a duty on its own: a verified
+    /// aggregate goes through `complete`, and anything else waits for reconciliation.
     pub resolved: usize,
 }
 
@@ -225,6 +226,10 @@ pub struct StepReport {
 /// leg's submission — the **accepted proposal** is passed because a release submitter needs
 /// the proposed unsigned tx blob (decoded from it), not just the aggregate (emit the mint
 /// `RelayPayload`; `gateway_submit_transfer` a release).
+///
+/// `verify(leg, message, signature)` checks an aggregate against the group key this node
+/// loaded itself. Mesh authentication only proves which member sent a `Signature`, not that
+/// the bytes are a threshold signature, so nothing is stored or acted on until this passes.
 pub struct Coordinator<P, Sign, Complete>
 where
     P: ProposalPolicy,
@@ -234,6 +239,7 @@ where
     pub committee: CommitteeView,
     pub self_index: u16,
     pub policy: P,
+    verify: Box<dyn Fn(Leg, &[u8], &[u8]) -> bool>,
     pub sign: Sign,
     pub complete: Complete,
     /// Ticks a session may sit in one stage before `on_timeout` rotates the leader.
@@ -259,17 +265,22 @@ where
     Sign: FnMut(Leg, &[u8], &[u16], u32) -> Result<Vec<u8>, String>,
     Complete: FnMut(&Duty, &[u8], &[u8]) -> ExecOutcome,
 {
-    pub fn new(
+    pub fn new<V>(
         committee: CommitteeView,
         self_index: u16,
         policy: P,
+        verify: V,
         sign: Sign,
         complete: Complete,
-    ) -> Self {
+    ) -> Self
+    where
+        V: Fn(Leg, &[u8], &[u8]) -> bool + 'static,
+    {
         Coordinator {
             committee,
             self_index,
             policy,
+            verify: Box::new(verify),
             sign,
             complete,
             stage_timeout_ticks: 10,
@@ -341,11 +352,25 @@ where
                 );
                 continue;
             }
-            // Capture distributed signature bytes so non-signers can complete too.
+            // A distributed aggregate lets members outside the signing set complete too, but
+            // only once it verifies against the proposal this node accepted itself. Never
+            // handed to the raw dispatcher: unverified bytes must not advance the session.
             if let SessionMsg::Signature(bytes) = &msg.body {
-                if live.signature.is_none() && msg.attempt == live.session.attempt() {
-                    live.signature = Some(bytes.clone());
+                if live.signature.is_none()
+                    && live.acked
+                    && !live.nacked
+                    && msg.attempt == live.session.attempt()
+                    && usize::from(msg.from) < self.committee.members.len()
+                {
+                    if let Some(proposal) = &live.proposal {
+                        let message = self.policy.signing_message(&live.duty, proposal);
+                        if (self.verify)(live.duty.leg(), &message, bytes) {
+                            live.signature = Some(bytes.clone());
+                            let _ = live.session.signature_ready(bytes.clone());
+                        }
+                    }
                 }
+                continue;
             }
             // Everything else feeds the engine; stale/out-of-stage messages drop benignly.
             let _ = apply(&mut live.session, &msg);
@@ -479,16 +504,12 @@ where
 
             match live.session.stage() {
                 Stage::Consensus => {
-                    // Straggler catch-up: the committee's aggregate `Signature` was captured
-                    // while this node was still in Consensus (it missed the proposal round —
-                    // e.g. it observed the duty a tick late and the quorum moved on without
-                    // it). The duty is handled; retrying into a below-threshold minority can
-                    // never succeed. Record Done — without submitting, since this node never
-                    // verified the payload (C.5).
+                    // Straggler catch-up: a verified aggregate arrived before this node saw
+                    // enough ACKs to leave Consensus. It accepted the proposal itself, so it
+                    // completes like any signer rather than recording Done unsubmitted.
                     if live.signature.is_some() {
-                        orch.mark_done(&live.duty.key());
+                        Self::complete_verified(&mut self.complete, live, orch, report);
                         finished.push(*sk);
-                        report.resolved += 1;
                         continue;
                     }
                     if live.session.is_leader() && !live.nacked {
@@ -549,7 +570,7 @@ where
                                 let message = self.policy.signing_message(&live.duty, &p);
                                 let attempt = live.session.attempt();
                                 match (self.sign)(live.duty.leg(), &message, &signers, attempt) {
-                                    Ok(sig) => {
+                                    Ok(sig) if (self.verify)(live.duty.leg(), &message, &sig) => {
                                         live.signature = Some(sig.clone());
                                         report.signed += 1;
                                         // The first canonical signer distributes; it is always a
@@ -566,7 +587,9 @@ where
                                         }
                                         let _ = live.session.signature_ready(sig);
                                     }
-                                    Err(_) => {} // transient — the stage timeout drives the retry
+                                    // Transient, or an aggregate that does not verify under the
+                                    // group key: the stage timeout drives the retry.
+                                    Ok(_) | Err(_) => {}
                                 }
                             }
                         }
@@ -582,32 +605,7 @@ where
                     }
                 }
                 Stage::Finalize => {
-                    let key = live.duty.key();
-                    if live.nacked || !live.acked || live.proposal.is_none() || live.signature.is_none() {
-                        // This node disputed — or never independently verified — the payload
-                        // (C.5): the committee handled the duty; record Done locally without
-                        // submitting anything.
-                        orch.mark_done(&key);
-                        finished.push(*sk);
-                        continue;
-                    }
-                    let sig = live.signature.clone().unwrap();
-                    let proposal = live.proposal.clone().unwrap();
-                    match (self.complete)(&live.duty, &proposal, &sig) {
-                        ExecOutcome::Submitted => {
-                            let _ = live.session.finalize();
-                            orch.mark_done(&key);
-                            report.completed += 1;
-                        }
-                        ExecOutcome::Retry => {
-                            orch.requeue(&key);
-                            report.requeued += 1;
-                        }
-                        ExecOutcome::Abandon => {
-                            orch.mark_done(&key);
-                            report.abandoned += 1;
-                        }
-                    }
+                    Self::complete_verified(&mut self.complete, live, orch, report);
                     finished.push(*sk);
                 }
                 Stage::Finalized | Stage::Aborted => {
@@ -616,21 +614,20 @@ where
             }
 
             // Timeout bookkeeping: a session stuck in one stage rotates its leader — unless
-            // the committee's aggregate already exists (captured `Signature`), in which case
-            // the duty is done and a retry could only churn: resolve instead. (Covers a
-            // straggler stranded in Distribute after its peers finalized — their
-            // DistributeAcks were dropped while it was still behind.)
-            if live.session.stage() == live.last_stage {
+            // it already holds a verified aggregate, in which case a retry could only churn:
+            // complete instead. (Covers a straggler stranded in Distribute after its peers
+            // finalized — their DistributeAcks were dropped while it was still behind.) A
+            // session an arm already completed this step is skipped so it never submits twice.
+            if finished.contains(sk) {
+                // completed above; only the Aborted requeue below still applies
+            } else if live.session.stage() == live.last_stage {
                 live.ticks_in_stage += 1;
                 if live.ticks_in_stage >= self.stage_timeout_ticks
                     && !live.session.stage().is_terminal()
                 {
                     if live.signature.is_some() {
-                        orch.mark_done(&live.duty.key());
-                        if !finished.contains(sk) {
-                            finished.push(*sk);
-                        }
-                        report.resolved += 1;
+                        Self::complete_verified(&mut self.complete, live, orch, report);
+                        finished.push(*sk);
                     } else {
                         let _ = live.session.on_timeout();
                         live.ticks_in_stage = 0;
@@ -653,6 +650,39 @@ where
 
         for sk in finished {
             self.live.remove(&sk);
+        }
+    }
+
+    /// Hand a verified aggregate to `complete`. Done is recorded only when the leg reports
+    /// the payload durably handed off; a node that never accepted the proposal itself has
+    /// nothing to submit and leaves the duty to on-chain reconciliation.
+    fn complete_verified(
+        complete: &mut Complete,
+        live: &mut LiveSession,
+        orch: &mut Orchestrator,
+        report: &mut StepReport,
+    ) {
+        let key = live.duty.key();
+        let outcome = match (&live.proposal, &live.signature) {
+            (Some(proposal), Some(sig)) if live.acked && !live.nacked => {
+                complete(&live.duty, proposal, sig)
+            }
+            _ => ExecOutcome::Retry,
+        };
+        match outcome {
+            ExecOutcome::Submitted => {
+                let _ = live.session.finalize();
+                orch.mark_done(&key);
+                report.completed += 1;
+            }
+            ExecOutcome::Retry => {
+                orch.requeue(&key);
+                report.requeued += 1;
+            }
+            ExecOutcome::Abandon => {
+                orch.mark_done(&key);
+                report.abandoned += 1;
+            }
         }
     }
 
@@ -854,6 +884,11 @@ pub(crate) mod test_support {
         sig.extend_from_slice(&d);
         Ok(sig)
     }
+
+    /// The group-key check matching [`mock_sign`]: accepts exactly what it would produce.
+    pub(crate) fn mock_verify(leg: Leg, message: &[u8], sig: &[u8]) -> bool {
+        mock_sign(leg, message, &[0], 0).map(|s| s == sig).unwrap_or(false)
+    }
 }
 
 // ============================================================================
@@ -862,7 +897,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{committee, mock_sign, Bus, NodeNet};
+    use super::test_support::{committee, mock_sign, mock_verify, Bus, NodeNet};
     use super::*;
     use crate::chain_registry::ChainId;
     use crate::watch::MintEvent;
@@ -943,6 +978,7 @@ mod tests {
             committee(n, t),
             index as u16,
             MintPolicy { contracts: contracts() },
+            mock_verify,
             mock_sign as fn(Leg, &[u8], &[u16], u32) -> Result<Vec<u8>, String>,
             Box::new(move |d: &Duty, _proposal: &[u8], sig: &[u8]| {
                 log.borrow_mut().push((d.key(), sig.to_vec()));
@@ -959,6 +995,70 @@ mod tests {
             for &i in live {
                 let node = &mut nodes[i];
                 node.coord.step(&mut node.orch, &mut node.net);
+            }
+        }
+    }
+
+    #[test]
+    fn forged_signature_announcements_never_settle_a_duty() {
+        // Any authenticated member can put bytes in a `Signature`. Empty, malformed or
+        // wrong-key aggregates, plus forged DistributeAcks, must neither complete nor
+        // record Done — before the fix the straggler and timeout paths did both.
+        for forged in [vec![], vec![0u8; 64], vec![0xab; 65]] {
+            let bus = Bus::new(6);
+            let mut node = make_node(6, 4, 0, &bus);
+            node.orch.observe(Duty::Mint(mint_ev(1000)));
+            node.coord.step(&mut node.orch, &mut node.net);
+            let live = node.coord.live.values().next().expect("session opened");
+            let mut msg = TestCoordinator::msg_for(&live.session, 1, SessionMsg::Signature(forged));
+            bus.node(1).send_to(0, &msg).unwrap();
+            msg.body = SessionMsg::DistributeAck;
+            for from in 1..6u16 {
+                msg.from = from;
+                bus.node(from as usize).send_to(0, &msg).unwrap();
+            }
+            for _ in 0..30 {
+                let r = node.coord.step(&mut node.orch, &mut node.net);
+                assert_eq!(r.completed + r.resolved, 0);
+            }
+            assert!(node.completions.borrow().is_empty(), "nothing may be submitted");
+            assert_eq!(node.orch.counts().2, 0, "a forged announcement must not record Done");
+        }
+    }
+
+    #[test]
+    fn a_verified_announcement_completes_through_the_leg() {
+        // A straggler that accepted the proposal and then receives the real aggregate
+        // submits it like any signer, and records Done only on the leg's say-so.
+        for outcome in [ExecOutcome::Retry, ExecOutcome::Submitted] {
+            let bus = Bus::new(6);
+            let mut node = make_node(6, 4, 0, &bus);
+            let log = node.completions.clone();
+            node.coord.complete = Box::new(move |d: &Duty, _p: &[u8], sig: &[u8]| {
+                log.borrow_mut().push((d.key(), sig.to_vec()));
+                outcome
+            });
+            let duty = Duty::Mint(mint_ev(1000));
+            node.orch.observe(duty.clone());
+            node.coord.step(&mut node.orch, &mut node.net);
+            let proposal = node.coord.policy.build(&duty).unwrap();
+            let live = node.coord.live.values().next().unwrap();
+            let leader = live.session.leader() as u16;
+            let propose =
+                TestCoordinator::msg_for(&live.session, leader, SessionMsg::Propose(proposal.clone()));
+            let message = node.coord.policy.signing_message(&duty, &proposal);
+            let aggregate = mock_sign(duty.leg(), &message, &[0], 0).unwrap();
+            let announce = TestCoordinator::msg_for(&live.session, 1, SessionMsg::Signature(aggregate));
+            if leader != 0 {
+                bus.node(leader as usize).send_to(0, &propose).unwrap();
+                node.coord.step(&mut node.orch, &mut node.net);
+            }
+            bus.node(1).send_to(0, &announce).unwrap();
+            node.coord.step(&mut node.orch, &mut node.net);
+            assert_eq!(node.completions.borrow().len(), 1, "the aggregate reached `complete`");
+            match outcome {
+                ExecOutcome::Submitted => assert_eq!(node.orch.counts(), (0, 0, 1)),
+                _ => assert_eq!(node.orch.counts().2, 0, "a failed hand-off is retried"),
             }
         }
     }
@@ -1014,8 +1114,9 @@ mod tests {
             0,
             "a NACKer must not submit a payload it disputed"
         );
-        // The dissenter still records the duty handled (Done) — no infinite retry.
-        assert_eq!(nodes[5].orch.counts(), (0, 0, 1));
+        // The dissenter cannot check the aggregate against a proposal it rejected, so it
+        // does not record Done on the peers' word; settlement reconciliation retires it.
+        assert_eq!(nodes[5].orch.counts().2, 0);
     }
 
     #[test]
@@ -1102,6 +1203,7 @@ mod tests {
                     committee(n, t),
                     i as u16,
                     MintPolicy { contracts: contracts() },
+                    |_l: Leg, m: &[u8], sig: &[u8]| sha256(m).as_slice() == sig,
                     Box::new(move |_l: Leg, m: &[u8], s: &[u16], a: u32| {
                         log.borrow_mut().push((i, s.to_vec(), a));
                         Ok(sha256(m).to_vec())

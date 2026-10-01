@@ -351,7 +351,7 @@ impl<M: ProposalPolicy, R: ProposalPolicy> ProposalPolicy for DualPolicy<M, R> {
 mod tests {
     use super::*;
     use crate::chain_registry::ChainId;
-    use crate::coordinator::test_support::{committee, mock_sign, Bus};
+    use crate::coordinator::test_support::{committee, mock_sign, mock_verify, Bus};
     use crate::coordinator::{sha256, Coordinator, MintPolicy};
     use crate::orchestrator::{DutyKey, ExecOutcome, Orchestrator};
     use crate::transport::Leg;
@@ -610,6 +610,7 @@ mod tests {
             committee(n, t),
             index as u16,
             policy(),
+            mock_verify,
             mock_sign as fn(Leg, &[u8], &[u16], u32) -> Result<Vec<u8>, String>,
             Box::new(move |d: &Duty, proposal: &[u8], sig: &[u8]| {
                 // The submitter path decodes the accepted proposal for the blob — prove

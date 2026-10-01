@@ -220,7 +220,10 @@ pub fn apply(session: &mut Session, wire: &WireMsg) -> Result<(), DispatchError>
         SessionMsg::Ack => session.on_ack(from),
         SessionMsg::Nack(reason) => session.on_nack(from, *reason),
         SessionMsg::Round(bytes) => session.on_round_message(from, bytes.clone()),
-        SessionMsg::Signature(bytes) => session.signature_ready(bytes.clone()),
+        // Mesh authentication names the sender, not a valid aggregate. Only the
+        // coordinator, after checking the bytes under the group key, may advance the
+        // engine with `signature_ready`.
+        SessionMsg::Signature(_) => Ok(()),
         SessionMsg::DistributeAck => session.on_distribute_ack(from),
         // Not a session message. It rides the same mesh for authentication and for the
         // grouping `payload_hash` gives, but it belongs to the rotation-ack collector,
@@ -465,9 +468,15 @@ mod tests {
         }
         assert!(bus.sessions.iter().all(|s| s.has_threshold_round_messages()));
 
-        // The aggregator (leader) broadcasts the combined signature -> Distribute.
+        // A raw Signature frame never advances the engine, even from the leader: that
+        // takes the coordinator's group-key check, which then calls `signature_ready`.
         let leader = bus.sessions[0].leader() as u16;
+        bus.broadcast(leader, SessionMsg::Signature(vec![]), 0);
         bus.broadcast(leader, SessionMsg::Signature(vec![0xab; 64]), 0);
+        assert!(bus.all_at(Stage::Sign));
+        for s in &mut bus.sessions {
+            s.signature_ready(vec![0xab; 64]).unwrap();
+        }
         assert!(bus.all_at(Stage::Distribute));
 
         // Every member acknowledges receipt -> Finalize, then finalizes locally.

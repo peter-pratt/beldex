@@ -1246,14 +1246,31 @@ impl LiveSigners {
                 let enc = vk.to_encoded_point(false);
                 let h = Keccak256::digest(&enc.as_bytes()[1..]);
                 if h[12..] == expected {
+                    // Emit the low-s form `rec` was found for: the raw (r, s) with this `v`
+                    // would recover another key, and the contract rejects a high s anyway.
                     let mut out = [0u8; 65];
-                    out[..64].copy_from_slice(&rs[..]);
+                    out[..64].copy_from_slice(&k_sig.to_bytes());
                     out[64] = 27 + rec;
                     return Ok(out);
                 }
             }
         }
         Err("Pevm aggregate did not ecrecover to the wBDX signer".into())
+    }
+
+    /// The wBDX signer address of this node's `Pevm` group key, read from its own share.
+    fn pevm_address(&self) -> Result<[u8; 20], String> {
+        use cggmp21::key_share::AnyKeyShare;
+        let share: cggmp21::KeyShare<
+            cggmp21::supported_curves::Secp256k1,
+            cggmp21::security_level::SecurityLevel128,
+        > = serde_json::from_slice(&self.pevm_key_share)
+            .map_err(|e| format!("deserialize Pevm key share: {e}"))?;
+        let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(
+            share.shared_public_key().to_bytes(true).as_ref(),
+        )
+        .map_err(|e| format!("Pevm group key invalid: {e}"))?;
+        Ok(beldex_bridge_signer::aggregate_signature::eth_address(&vk))
     }
 }
 
@@ -1781,7 +1798,20 @@ where
         }
     };
 
-    let mut coord = Coordinator::new(committee, self_index, policy, sign, complete);
+    // Aggregates — this node's own and any a peer announces — are checked against the group
+    // keys loaded from this node's shares before they are stored or submitted.
+    let verifier = beldex_bridge_signer::aggregate_signature::AggregateVerifier {
+        pevm_address: ls.pevm_address()?,
+        pgw_group_vk: ls.pgw_group_vk,
+    };
+    let mut coord = Coordinator::new(
+        committee,
+        self_index,
+        policy,
+        move |leg, message, signature| verifier.verify(leg, message, signature),
+        sign,
+        complete,
+    );
     if let Some(t) = std::env::var("BRIDGE_SIGNER_STAGE_TIMEOUT_TICKS").ok().and_then(|s| s.parse().ok()) {
         coord.stage_timeout_ticks = t;
     }
