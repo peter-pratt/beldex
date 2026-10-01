@@ -477,6 +477,61 @@ bool verify_bridge_rotation_evidence(const tx_extra_bridge_rotation_ack& ack,
   return true;
 }
 
+bool verify_gateway_release_unlocks(const transaction& tx, std::string& reason)
+{
+  const bool unlocked =
+      tx.version == txversion::v4_tx_types && tx.type == txtype::standard &&
+      !tx.vout.empty() && tx.unlock_time == 0 &&
+      tx.output_unlock_times.size() == tx.vout.size() &&
+      std::all_of(tx.output_unlock_times.begin(), tx.output_unlock_times.end(),
+                  [](uint64_t t) { return t == 0; });
+  if (!unlocked)
+    reason = "a bridge release must be a standard v4 tx whose outputs are all unlocked";
+  return unlocked;
+}
+
+bool verify_gateway_release_tx_key(const transaction& tx, const crypto::secret_key& tx_key,
+                                   std::string& reason)
+{
+  // secret_key_to_public_key refuses a non-canonical scalar. Zero is canonical but makes
+  // the "secret" public, so it is refused here.
+  crypto::public_key derived{};
+  if (tx_key == crypto::null_skey || !crypto::secret_key_to_public_key(tx_key, derived))
+  {
+    reason = "invalid disclosed release tx secret key";
+    return false;
+  }
+  std::vector<tx_extra_field> fields;
+  if (!parse_tx_extra(tx.extra, fields))
+  {
+    reason = "malformed release tx extra";
+    return false;
+  }
+  size_t pub_keys = 0;
+  for (const auto& f : fields)
+  {
+    if (const auto* k = std::get_if<tx_extra_pub_key>(&f))
+    {
+      if (++pub_keys > 1 || k->pub_key != derived)
+      {
+        reason = "release tx public key is ambiguous or not the disclosed key's";
+        return false;
+      }
+    }
+    else if (std::holds_alternative<tx_extra_additional_pub_keys>(f))
+    {
+      reason = "release tx carries additional public keys";
+      return false;
+    }
+  }
+  if (pub_keys != 1)
+  {
+    reason = "release tx has no public key";
+    return false;
+  }
+  return true;
+}
+
 bool summarize_gateway_withdraw(network_type nettype, const transaction& tx,
                                 gateway_withdraw_summary& out, std::string& reason)
 {

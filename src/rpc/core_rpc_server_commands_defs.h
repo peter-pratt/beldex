@@ -2827,6 +2827,9 @@ namespace cryptonote::rpc {
   /// - `source_gateway_id`, `total_debit`, `fee`, `hash_to_sign`, `to_wallet`.
   /// - `release_ref_count` -- number of release refs the blob carries.
   /// - `release_ref` -- {version, chain_id, evm_txid, log_index} of the first, if any.
+  /// - `release_unlocks_verified` -- standard v4 tx, every output unlocked (iff tx_key+address given).
+  /// - `tx_key_matches_public_key` -- the tx's one public key is `tx_key`'s (iff tx_key+address given).
+  /// - `release_unlocks_reason`, `tx_key_reason` -- why, when either of the above is false.
   /// - `dest_all_outputs_match` -- every stealth output pays `address` (iff tx_key+address given).
   /// - `dest_amount` -- Σ decoded amounts paid to `address`.
   /// - `status` -- Generic RPC error code. "OK" is the success value.

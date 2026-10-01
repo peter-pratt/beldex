@@ -4116,6 +4116,15 @@ namespace cryptonote::rpc {
       crypto::secret_key tx_key{};
       if (!tools::hex_to_type(req.tx_key, tx_key))
         throw rpc_error{ERROR_WRONG_PARAM, "tx_key must be 64-char hex"};
+      // Reported, not thrown: a false here is a bad proposal the signer rejects, while a
+      // missing field means an older daemon and the signer abstains.
+      std::string why;
+      const bool unlocked = cryptonote::verify_gateway_release_unlocks(tx, why);
+      cmd.response["release_unlocks_verified"] = unlocked;
+      if (!unlocked) cmd.response["release_unlocks_reason"] = why;
+      const bool key_ok = cryptonote::verify_gateway_release_tx_key(tx, tx_key, why);
+      cmd.response["tx_key_matches_public_key"] = key_ok;
+      if (!key_ok) cmd.response["tx_key_reason"] = why;
       cryptonote::address_parse_info ainfo{};
       if (!cryptonote::get_account_address_from_str(ainfo, nettype, req.address) || ainfo.is_subaddress)
         throw rpc_error{ERROR_WRONG_PARAM, "invalid (or subaddress) expected recipient address"};

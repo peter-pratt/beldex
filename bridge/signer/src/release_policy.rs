@@ -135,6 +135,11 @@ pub struct ReleaseTxView {
     /// The release ref the blob itself carries, which is what consensus records as
     /// discharged. `None` unless the blob carries exactly one well-formed version-0 ref.
     pub release_ref: Option<ReleaseRef>,
+    /// The recipient can actually use the payout: every output unlocked, and the tx's
+    /// public key is the disclosed key's, so the wallet derives the same outputs the
+    /// inspection opened. Without this a correct destination and amount can still pay
+    /// money locked for decades, or money the recipient's wallet never finds.
+    pub payout_spendable: bool,
 }
 
 /// The burn a withdrawal discharges, as carried in its `tx_extra_gateway_release_ref`.
@@ -219,6 +224,10 @@ where
         // payout and close the other one unpaid.
         let expected = ReleaseRef { chain_id: ev.chain.0, evm_txid: ev.evm_txid, log_index: ev.log_index };
         if view.release_ref != Some(expected) {
+            return reject;
+        }
+        // R2 (usable): paying the recipient means paying something it can spend.
+        if !view.payout_spendable {
             return reject;
         }
         // R2: pays the burn's recipient.
@@ -441,6 +450,7 @@ mod tests {
             hash_to_sign: sha256(blob),
             // As the live inspector reports it: exactly one ref, or none at all.
             release_ref: if refs.len() == 1 { Some(refs[0]) } else { None },
+            payout_spendable: true,
         })
     }
 
@@ -606,6 +616,15 @@ mod tests {
             p.hash_to_sign = sha256(&blob);
             p.unsigned_tx_blob = blob;
             assert_eq!(policy().verify(&duty, &p.encode()), reject, "R6 refs {refs:?}");
+        }
+        // R2 (usable): the daemon found the payout locked, or not findable by the wallet.
+        {
+            fn unusable(p: &ReleaseProposal, d: &[u8]) -> Result<ReleaseTxView, String> {
+                Ok(ReleaseTxView { payout_spendable: false, ..toy_inspect(p, d)? })
+            }
+            let mut pol = policy();
+            pol.inspect = unusable;
+            assert_eq!(pol.verify(&duty, &proposal_for(&ev).encode()), reject, "R2 unusable payout");
         }
         // R4: over the per-tx cap (as verify; the actionability screen catches it earlier).
         {

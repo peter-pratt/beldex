@@ -180,6 +180,21 @@ struct gateway_withdraw_summary
   crypto::hash       hash_to_sign{};     // recomputed from the blob, NOT trusted from the daemon
 };
 
+// Checks on a bridge release beyond "every output pays the recipient this much".
+// Signing policy for automatic payouts, not consensus: locked transfers stay valid
+// elsewhere.
+//
+// verify_gateway_release_unlocks: a standard v4 tx whose outputs all unlock at once.
+// A payout locked for years still opens to the right recipient and amount.
+//
+// verify_gateway_release_tx_key: the tx's single public key is the disclosed secret's.
+// Outputs are checked by deriving them from the disclosed secret; a wallet finds them by
+// deriving from the public key in tx extra. If the two differ the check passes and the
+// recipient's wallet never sees the payment.
+bool verify_gateway_release_unlocks(const transaction& tx, std::string& reason);
+bool verify_gateway_release_tx_key(const transaction& tx, const crypto::secret_key& tx_key,
+                                   std::string& reason);
+
 // Decode an unsigned withdrawal tx into the facts above and recompute
 // hash_to_sign locally. The signer compares the summary against its intent and
 // signs `summary.hash_to_sign` — never a bare hash handed over by the daemon.

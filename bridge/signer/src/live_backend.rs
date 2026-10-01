@@ -202,6 +202,7 @@ impl HttpGatewayRpc {
         let hash_to_sign =
             hex32(&get_str("hash_to_sign").ok_or("decode: missing hash_to_sign")?)?;
         let release_ref = decoded_release_ref(&r)?;
+        let payout_spendable = decoded_payout_spendable(&r)?;
         Ok(crate::release_policy::ReleaseTxView {
             source_gateway,
             dest,
@@ -209,6 +210,7 @@ impl HttpGatewayRpc {
             fee,
             hash_to_sign,
             release_ref,
+            payout_spendable,
         })
     }
 }
@@ -245,9 +247,25 @@ fn decoded_release_ref(
     Ok(parsed)
 }
 
+/// Whether the daemon found the payout usable by its recipient: every output unlocked, and
+/// the tx public key the disclosed key's. Each must be reported as a boolean; a daemon that
+/// leaves either out predates the checks, and is an error so the member abstains.
+#[cfg(feature = "autonomy")]
+fn decoded_payout_spendable(r: &serde_json::Value) -> Result<bool, String> {
+    let mut ok = true;
+    for field in ["release_unlocks_verified", "tx_key_matches_public_key"] {
+        let v = r
+            .get(field)
+            .and_then(|v| v.as_bool())
+            .ok_or_else(|| format!("decode: missing {field} (daemon too old to check the payout?)"))?;
+        ok &= v;
+    }
+    Ok(ok)
+}
+
 #[cfg(all(test, feature = "autonomy"))]
 mod release_ref_tests {
-    use super::decoded_release_ref;
+    use super::{decoded_payout_spendable, decoded_release_ref};
     use crate::release_policy::ReleaseRef;
     use serde_json::json;
 
@@ -283,6 +301,21 @@ mod release_ref_tests {
         let old = json!({
             "release_ref": { "version": 0, "chain_id": 1, "evm_txid": txid, "log_index": 3 } });
         assert!(decoded_release_ref(&old).is_err());
+    }
+
+    #[test]
+    fn a_payout_is_spendable_only_when_the_daemon_says_both_checks_passed() {
+        let both = |u: serde_json::Value, k: serde_json::Value| {
+            json!({ "release_unlocks_verified": u, "tx_key_matches_public_key": k })
+        };
+        assert_eq!(decoded_payout_spendable(&both(json!(true), json!(true))), Ok(true));
+        assert_eq!(decoded_payout_spendable(&both(json!(false), json!(true))), Ok(false));
+        assert_eq!(decoded_payout_spendable(&both(json!(true), json!(false))), Ok(false));
+        for bad in [json!("true"), json!(1), serde_json::Value::Null] {
+            assert!(decoded_payout_spendable(&both(bad.clone(), json!(true))).is_err());
+            assert!(decoded_payout_spendable(&both(json!(true), bad)).is_err());
+        }
+        assert!(decoded_payout_spendable(&json!({})).is_err(), "older daemon");
     }
 }
 
