@@ -13,7 +13,8 @@
 //! * **R1 — burn provenance.** The proposal's `(chain_id, evm_txid, log_index)` names exactly
 //!   the burn this member's own EVM watcher finalized (the duty it opened this session for).
 //! * **R2 — destination.** The tx pays the burn's `beldex_recipient` — nothing else.
-//! * **R3 — amount + fee.** Output amount `== burn_amount − fee`, and `fee ≤ max_fee`.
+//! * **R3 — amount + fee.** Output amount `== burn_amount − fee`, where `fee` is exactly the
+//!   redemption fee the burn's wBDX contract declares, and the burn exceeds it.
 //! * **R4 — source + policy.** The tx spends the configured release gateway, and the amount is
 //!   within the per-tx cap (the A.3 window caps + freeze are re-enforced at L1 submit).
 //! * **R5 — hash binds the blob.** The proposed `hash_to_sign` is the `gateway_input_message`
@@ -33,6 +34,7 @@ use crate::coordinator::{BuildError, ProposalPolicy, ProposalVerdict};
 use crate::orchestrator::Duty;
 use crate::session::NackReason;
 use crate::watch::ReleaseEvent;
+use std::collections::BTreeMap;
 
 // ============================================================================
 // Proposal codec
@@ -48,7 +50,7 @@ pub struct ReleaseProposal {
     pub chain_id: u64,
     pub evm_txid: [u8; 32],
     pub log_index: u32,
-    /// The withdrawal fee the leader chose (bounded by the verifier's `max_fee`).
+    /// The withdrawal fee: the burn's contract's `redemptionFee` (R3).
     pub fee: u64,
     /// `gateway_input_message` of the blob — the 32 bytes `Pgw` signs. Never trusted as
     /// stated: re-derived from the blob by every verifier (R5).
@@ -181,8 +183,10 @@ where
     pub inspect: Inspect,
     /// The committee's release gateway (R4).
     pub release_gateway: String,
-    /// Fee policy ceiling (R3).
-    pub max_fee: u64,
+    /// Chain id → the `redemptionFee` that chain's wBDX contract declares (R3). Every
+    /// release for a burn on that chain pays exactly this fee, so the payout the contract
+    /// promised when it accepted the burn is the payout the committee signs.
+    pub fees: BTreeMap<u64, u64>,
     /// Per-tx amount cap (R4); the window caps are enforced at L1 submit.
     pub per_tx_cap: u128,
 }
@@ -201,9 +205,9 @@ where
         if p.chain_id != ev.chain.0 || p.evm_txid != ev.evm_txid || p.log_index != ev.log_index {
             return reject;
         }
-        // R3 precondition: the burn must cover the fee (a fee > burn would underflow into a
-        // nonsense expected amount).
-        if u128::from(p.fee) > ev.amount || p.fee > self.max_fee {
+        // R3 precondition: exactly the contract's fee, and a burn that exceeds it (a fee at
+        // or above the burn would leave nothing, or underflow, to pay).
+        if self.fees.get(&ev.chain.0) != Some(&p.fee) || u128::from(p.fee) >= ev.amount {
             return reject;
         }
 
@@ -272,6 +276,17 @@ where
                 // is a new policy → new process lifecycle); everything else is workable.
                 if ev.amount > self.per_tx_cap {
                     return Err(BuildError::Unactionable("burn exceeds the per-tx release cap".into()));
+                }
+                // The contract refuses such burns now, but one accepted before it did, or on
+                // a chain this node has no fee for, can never be paid under R3.
+                match self.fees.get(&ev.chain.0) {
+                    None => {
+                        return Err(BuildError::Unactionable("no redemption fee for the burn's chain".into()))
+                    }
+                    Some(&fee) if ev.amount <= u128::from(fee) => {
+                        return Err(BuildError::Unactionable("burn does not exceed the redemption fee".into()))
+                    }
+                    Some(_) => {}
                 }
                 // A recipient the daemon can never decode is permanently unactionable, and it
                 // has to be judged HERE rather than in `build`. Only the leader builds, so a
@@ -474,9 +489,14 @@ mod tests {
             build_tx: toy_build as fn(&ReleaseEvent) -> Result<BuiltRelease, BuildError>,
             inspect: toy_inspect as fn(&ReleaseProposal, &[u8]) -> Result<ReleaseTxView, String>,
             release_gateway: GW.to_string(),
-            max_fee: 100,
+            fees: toy_fees(),
             per_tx_cap: 1_000_000,
         }
+    }
+
+    /// The toy chain 1 declares the toy builder's fee.
+    fn toy_fees() -> BTreeMap<u64, u64> {
+        BTreeMap::from([(1, FEE)])
     }
 
     fn burn(amount: u128) -> ReleaseEvent {
@@ -528,6 +548,20 @@ mod tests {
     }
 
     #[test]
+    fn burns_the_contract_fee_would_consume_are_unactionable() {
+        let pol = policy();
+        let unactionable = |ev: ReleaseEvent| {
+            matches!(pol.actionable(&Duty::Release(ev)), Err(BuildError::Unactionable(_)))
+        };
+        assert!(unactionable(burn(u128::from(FEE))), "pays nothing");
+        assert!(unactionable(burn(u128::from(FEE) - 1)), "less than nothing");
+        assert!(!unactionable(burn(u128::from(FEE) + 1)));
+        let mut other_chain = burn(1000);
+        other_chain.chain = ChainId(2);
+        assert!(unactionable(other_chain), "no fee known for the chain");
+    }
+
+    #[test]
     fn every_violation_is_rejected_with_payload_mismatch() {
         let ev = burn(1000);
         let duty = Duty::Release(ev.clone());
@@ -570,9 +604,9 @@ mod tests {
             p.unsigned_tx_blob = blob;
             assert_eq!(policy().verify(&duty, &p.encode()), reject, "R3 amount");
         }
-        // R3: fee above policy.
-        {
-            let fee = 101u64;
+        // R3: any fee but the contract's, above or below it. Blob rebuilt so the amount
+        // still adds up — the fee alone is wrong.
+        for fee in [FEE + 1, FEE - 1, 0] {
             let blob = toy_blob(GW, &ev.beldex_recipient, ev.amount - u128::from(fee), fee);
             let p = ReleaseProposal {
                 fee,
@@ -580,7 +614,7 @@ mod tests {
                 unsigned_tx_blob: blob,
                 ..proposal_for(&ev)
             };
-            assert_eq!(policy().verify(&duty, &p.encode()), reject, "R3 fee > max_fee");
+            assert_eq!(policy().verify(&duty, &p.encode()), reject, "R3 fee {fee}");
         }
         // R4: spends the wrong gateway.
         {
@@ -647,7 +681,7 @@ mod tests {
             inspect: (|_p: &ReleaseProposal, _d: &[u8]| Err("daemon RPC down".to_string()))
                 as fn(&ReleaseProposal, &[u8]) -> Result<ReleaseTxView, String>,
             release_gateway: GW.to_string(),
-            max_fee: 100,
+            fees: toy_fees(),
             per_tx_cap: 1_000_000,
         };
         assert_eq!(

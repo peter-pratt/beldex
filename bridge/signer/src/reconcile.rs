@@ -117,6 +117,44 @@ pub fn processed_deposits_selector() -> [u8; 4] {
     [h[0], h[1], h[2], h[3]]
 }
 
+/// `redemptionFee()` selector.
+#[cfg(all(feature = "evm-watcher", feature = "tss-integration"))]
+pub fn redemption_fee_selector() -> [u8; 4] {
+    use sha3::{Digest, Keccak256};
+    let h = Keccak256::digest(b"redemptionFee()");
+    [h[0], h[1], h[2], h[3]]
+}
+
+/// The native fee a wBDX contract declares for every release of its burns. Releases are
+/// built and verified with exactly this fee, so it must be read, not assumed: an error,
+/// a short answer, zero (not yet configured) or a value past `u64` all fail.
+#[cfg(all(feature = "evm-watcher", feature = "tss-integration"))]
+pub fn read_redemption_fee<C: crate::evm_watcher::JsonRpcClient>(
+    client: &C,
+    contract: &[u8; 20],
+) -> Result<u64, String> {
+    let hexs = |b: &[u8]| -> String { b.iter().map(|x| format!("{x:02x}")).collect() };
+    let params = serde_json::json!([
+        { "to": format!("0x{}", hexs(contract)), "data": format!("0x{}", hexs(&redemption_fee_selector())) },
+        "latest"
+    ]);
+    let raw = client.call("eth_call", params).map_err(|e| format!("redemptionFee(): {e:?}"))?;
+    let word = raw
+        .as_str()
+        .and_then(|s| s.strip_prefix("0x"))
+        .filter(|s| s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit()))
+        .ok_or_else(|| format!("redemptionFee(): not a 32-byte word: {raw}"))?;
+    let (high, low) = word.split_at(48);
+    if high.bytes().any(|c| c != b'0') {
+        return Err(format!("redemptionFee(): {word} does not fit a native amount"));
+    }
+    let fee = u64::from_str_radix(low, 16).map_err(|e| format!("redemptionFee(): {e}"))?;
+    if fee == 0 {
+        return Err("redemptionFee() is 0: the contract's redemption fee is not configured".into());
+    }
+    Ok(fee)
+}
+
 /// The contract's replay-guard key for one deposit. MUST match `WrappedBDX.mint`'s
 /// `depositId` byte-for-byte.
 #[cfg(all(feature = "evm-watcher", feature = "tss-integration"))]
@@ -390,6 +428,35 @@ mod tests {
         assert_eq!(processed_deposits_selector().len(), 4);
         let s = processed_deposits_selector();
         assert_ne!(s, [0u8; 4]);
+    }
+
+    #[cfg(all(feature = "evm-watcher", feature = "tss-integration"))]
+    #[test]
+    fn redemption_fee_is_read_strictly() {
+        use crate::evm_watcher::{JsonRpcClient, RpcError};
+        struct Answer(serde_json::Value);
+        impl JsonRpcClient for Answer {
+            fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
+                assert_eq!(method, "eth_call");
+                assert_eq!(params[0]["data"], "0x458f5815", "cast sig \"redemptionFee()\"");
+                Ok(self.0.clone())
+            }
+        }
+        let word = |v: &str| serde_json::json!(format!("0x{v:0>64}"));
+        let contract = [0x33; 20];
+        assert_eq!(read_redemption_fee(&Answer(word("5f5e100")), &contract), Ok(100_000_000));
+        assert_eq!(read_redemption_fee(&Answer(word("ffffffffffffffff")), &contract), Ok(u64::MAX));
+        for bad in [
+            word("0"),                                 // not configured
+            word("10000000000000000"),                 // past u64
+            serde_json::json!("0x"),                   // no contract at the address
+            serde_json::json!("0x5f5e100"),            // short
+            serde_json::json!(format!("0x{:0>63}", "1")),
+            serde_json::json!(format!("0x{:z>64}", "")), // not hex
+            serde_json::Value::Null,
+        ] {
+            assert!(read_redemption_fee(&Answer(bad.clone()), &contract).is_err(), "{bad}");
+        }
     }
 }
 

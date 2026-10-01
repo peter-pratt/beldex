@@ -57,6 +57,8 @@ if [ -n "$BRIDGE_SIGNER_GENESIS_HASH" ]; then
 else
   echo "!! could not fetch the genesis hash — mint-bus publications will not verify" >&2
 fi
+# Signers take the release fee from the wBDX contract (configureRedemptionFee, set by
+# bridge-contract's devnet/01-deploy.sh). This only cross-checks it: a mismatch stops them.
 RELEASE_FEE="${RELEASE_FEE:-100000000}"
 # Mint hand-off: which node(s) auto-broadcast the signed mint payload, and with what.
 # Releases self-submit from every signer; MINTS need a gas key, which the signer never holds
@@ -190,7 +192,6 @@ for d in beldex-127.0.0.1-*/; do
   BRIDGE_SIGNER_WATCH_POLL_SECS="$POLL_SECS" \
   BRIDGE_SIGNER_RELEASE_GATEWAY="$RELEASE_GATEWAY" \
   BRIDGE_SIGNER_RELEASE_FEE="$RELEASE_FEE" \
-  BRIDGE_SIGNER_RELEASE_MAX_FEE="$RELEASE_FEE" \
     "$SIGNER" serve > "serve-${d%/}.log" 2>&1 &
   PIDS+=("$!:${d%/}")
   started=$((started + 1))

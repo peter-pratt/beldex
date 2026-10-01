@@ -1534,31 +1534,56 @@ where
     let contracts: BTreeMap<u64, [u8; 20]> = configs.iter().map(|c| (c.chain_id, c.contract)).collect();
     let release_gateway =
         std::env::var("BRIDGE_SIGNER_RELEASE_GATEWAY").unwrap_or_else(|_| gateway_id.to_string());
-    let release_fee: u64 =
-        std::env::var("BRIDGE_SIGNER_RELEASE_FEE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let max_fee: u64 = std::env::var("BRIDGE_SIGNER_RELEASE_MAX_FEE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(release_fee);
+    // The release fee is the one each chain's contract declares: the contract only accepts
+    // burns that exceed it, and every member builds and checks releases with exactly it,
+    // so what the contract promised at burn time is what the committee pays. An unset or
+    // unreadable fee is fatal rather than defaulted.
+    let mut fees: BTreeMap<u64, u64> = BTreeMap::new();
+    for c in configs {
+        let fee = beldex_bridge_signer::reconcile::read_redemption_fee(
+            &HttpJsonRpc::new(c.rpc_url.clone()),
+            &c.contract,
+        )
+        .map_err(|e| format!("chain {}: {e}", c.chain_id))?;
+        fees.insert(c.chain_id, fee);
+    }
+    // BRIDGE_SIGNER_RELEASE_FEE no longer chooses the fee; when set it must agree.
+    if let Ok(v) = std::env::var("BRIDGE_SIGNER_RELEASE_FEE") {
+        let expected: u64 = v.parse().map_err(|e| format!("BRIDGE_SIGNER_RELEASE_FEE: {e}"))?;
+        if let Some((chain, fee)) = fees.iter().find(|(_, &f)| f != expected) {
+            return Err(format!(
+                "BRIDGE_SIGNER_RELEASE_FEE={expected} but chain {chain}'s contract declares {fee}"
+            ));
+        }
+    }
+    println!("  release fees from the contracts: {fees:?}");
+    // Default to the native per-withdrawal maximum: consensus refuses anything larger.
+    const GATEWAY_RELEASE_PER_TX_MAX: u128 = 50_000 * 1_000_000_000;
     let per_tx_cap: u128 = std::env::var("BRIDGE_SIGNER_RELEASE_PER_TX_CAP")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(u128::MAX);
+        .unwrap_or(GATEWAY_RELEASE_PER_TX_MAX)
+        .min(GATEWAY_RELEASE_PER_TX_MAX);
 
     // Leader-side release build: gateway_create_transfer + the HF23 replay-guard ref +
     // the disclosed tx key (verifiers open the stealth outputs with it).
     let build_rpc = rpc.clone();
     let build_gw = release_gateway.clone();
+    let build_fees = fees.clone();
     let build_tx = move |ev: &ReleaseEvent| {
         let recipient = String::from_utf8(ev.beldex_recipient.clone())
             .map_err(|_| BuildError::Unactionable("burn recipient is not a utf-8 address".into()))?;
+        let fee = *build_fees
+            .get(&ev.chain.0)
+            .ok_or_else(|| BuildError::Unactionable("no redemption fee for the burn's chain".into()))?;
         let amount = ev
             .amount
-            .checked_sub(u128::from(release_fee))
-            .ok_or_else(|| BuildError::Unactionable("burn amount does not cover the fee".into()))?;
+            .checked_sub(u128::from(fee))
+            .filter(|a| *a > 0)
+            .ok_or_else(|| BuildError::Unactionable("burn amount does not exceed the fee".into()))?;
         build_rpc
             .borrow_mut()
-            .create_release(&build_gw, &recipient, amount, release_fee, ev.chain.0, &ev.evm_txid, ev.log_index)
+            .create_release(&build_gw, &recipient, amount, fee, ev.chain.0, &ev.evm_txid, ev.log_index)
             .map_err(|e| classify_release_build_error(ev, &recipient, e))
     };
 
@@ -1576,7 +1601,7 @@ where
             build_tx,
             inspect,
             release_gateway: release_gateway.clone(),
-            max_fee,
+            fees,
             per_tx_cap,
         },
     };
