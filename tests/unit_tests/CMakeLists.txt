@@ -92,6 +92,7 @@ add_executable(unit_tests
   gateway_address_prefix.cpp
   gateway_withdrawal.cpp
   gateway_bridge.cpp
+  gateway_history.cpp
   bridge_registration.cpp
   gateway_bridge_memo.cpp
   aligned.cpp)
@@ -134,6 +135,7 @@ SET_PROPERTY(SOURCE memwipe.cpp PROPERTY COMPILE_FLAGS -Ofast)
 add_executable(bridge_unit_tests
   bridge_tests_main.cpp
   gateway_bridge.cpp
+  gateway_history.cpp
   bridge_registration.cpp)
 target_link_libraries(bridge_unit_tests
   PRIVATE

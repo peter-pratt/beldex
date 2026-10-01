@@ -68,6 +68,7 @@
 #include "cryptonote_basic/account.h"
 #include "cryptonote_basic/cryptonote_basic_impl.h"
 #include "cryptonote_core/gateway_utils.h"
+#include "rpc/gateway_history.h"
 #include "cryptonote_core/cryptonote_tx_utils.h"
 #include "cryptonote_core/uptime_proof.h"
 #include "net/parse.h"
@@ -4258,99 +4259,17 @@ namespace cryptonote::rpc {
     if (!resolve_gateway_id(nettype, cmd.request.gateway_id, gw_id))
       throw rpc_error{ERROR_WRONG_PARAM, "invalid gateway_id (expected gwB… address or 64-char hex)"};
 
-    // Server-side bounds so a single call can never scan/return unboundedly.
-    constexpr uint64_t DEFAULT_MAX_BLOCKS = 1000, LIMIT_MAX_BLOCKS = 10000;
-    constexpr uint64_t DEFAULT_MAX_EVENTS = 100,  LIMIT_MAX_EVENTS = 1000;
-    const uint64_t max_blocks = std::min(cmd.request.max_blocks ? cmd.request.max_blocks : DEFAULT_MAX_BLOCKS, LIMIT_MAX_BLOCKS);
-    const uint64_t max_events = std::min(cmd.request.max_events ? cmd.request.max_events : DEFAULT_MAX_EVENTS, LIMIT_MAX_EVENTS);
-
-    const uint64_t top = m_core.get_current_blockchain_height();
-    auto& db = m_core.get_blockchain_storage().get_db();
-
-    auto events = json::array();
-    uint64_t h = cmd.request.from_height;
-    uint64_t scanned = 0;
-    for (; h < top && scanned < max_blocks && events.size() < max_events; ++h, ++scanned)
-    {
-      cryptonote::block blk;
-      try { blk = db.get_block_from_height(h); }
-      catch (...) { break; }
-
-      std::vector<cryptonote::transaction> txs;
-      if (!blk.tx_hashes.empty())
-        m_core.get_transactions(blk.tx_hashes, txs);
-
-      for (const auto& tx : txs)
-      {
-        const std::string txid = tools::type_to_hex(cryptonote::get_transaction_hash(tx));
-
-        // Bridge deposit-routing memos (tx_extra_gateway_bridge_memo), keyed by the
-        // gateway output they tag. Memos are sparse and a tx may carry several, so
-        // collect them all rather than taking the first. Surfaced raw (ciphertext +
-        // tx pubkey + output index): the bridge signer holds the gateway view
-        // secret, the daemon does not, so the signer decrypts.
-        std::unordered_map<uint32_t, crypto::hash> bridge_memos;
-        {
-          size_t skip = 0;
-          cryptonote::tx_extra_gateway_bridge_memo bm{};
-          while (cryptonote::get_field_from_tx_extra(tx.extra, bm, skip++))
-            bridge_memos.emplace(bm.output_index, bm.ciphertext);
-        }
-        const crypto::public_key memo_txpub =
-            bridge_memos.empty() ? crypto::public_key{} : cryptonote::get_tx_pub_key_from_extra(tx);
-
-        // deposits (tx_out_gateway to this gateway)
-        for (size_t oi = 0; oi < tx.vout.size(); ++oi)
-        {
-          const auto& o = tx.vout[oi];
-          const auto* g = std::get_if<cryptonote::tx_out_gateway>(&o.target);
-          if (!g || g->gateway_addr != gw_id)
-            continue;
-          json ev{{"height", h}, {"txid", txid}, {"type", "deposit"}, {"amount", g->amount}};
-          // Emitted for every gateway output, not just memoed ones: a tx may carry
-          // several, so the txid alone does not identify a deposit.
-          ev["out_index"] = oi;
-          if (auto it = bridge_memos.find(static_cast<uint32_t>(oi)); it != bridge_memos.end())
-          {
-            ev["enc_memo"]  = tools::type_to_hex(it->second);
-            ev["tx_pubkey"] = tools::type_to_hex(memo_txpub);
-          }
-          events.push_back(std::move(ev));
-        }
-
-        // withdrawals (txin_gateway from this gateway)
-        for (const auto& in : tx.vin)
-          if (const auto* g = std::get_if<cryptonote::txin_gateway>(&in))
-            if (g->gateway_addr == gw_id)
-              events.push_back(json{{"height", h}, {"txid", txid}, {"type", "withdrawal"}, {"amount", g->amount}});
-
-        // descriptor ops (register / update)
-        {
-          cryptonote::tx_extra_gateway_descriptor_operation op{};
-          if (cryptonote::get_field_from_tx_extra(tx.extra, op) && op.address_id == gw_id)
-            events.push_back(json{{"height", h}, {"txid", txid},
-                {"type", op.op_type == cryptonote::gateway_descriptor_op_type::register_address ? "register" : "update"}});
-        }
-        // governance freeze / unfreeze
-        {
-          cryptonote::tx_extra_gateway_freeze op{};
-          if (cryptonote::get_field_from_tx_extra(tx.extra, op) && op.gateway_id == gw_id)
-            events.push_back(json{{"height", h}, {"txid", txid}, {"type", op.freeze ? "freeze" : "unfreeze"}});
-        }
-        // governance re-point
-        {
-          cryptonote::tx_extra_gateway_repoint op{};
-          if (cryptonote::get_field_from_tx_extra(tx.extra, op) && op.gateway_id == gw_id)
-            events.push_back(json{{"height", h}, {"txid", txid}, {"type", "repoint"}});
-        }
-
-        if (events.size() >= max_events) break;
-      }
+    json page;
+    try {
+      page = gateway_history_page(m_core, gw_id, cmd.request.from_height,
+          cmd.request.max_blocks, cmd.request.max_events);
+    } catch (const std::exception& e) {
+      // Never answer with a cursor past data that was not read.
+      throw rpc_error{ERROR_INTERNAL, std::string{"gateway history unavailable: "} + e.what()};
     }
-
-    cmd.response["events"]      = std::move(events);
-    cmd.response["next_height"] = h;   // resume point for the next page
-    cmd.response["top_height"]  = top;
+    cmd.response["events"]      = std::move(page["events"]);
+    cmd.response["next_height"] = page["next_height"];   // resume point for the next page
+    cmd.response["top_height"]  = page["top_height"];
     cmd.response["status"]      = STATUS_OK;
   }
 

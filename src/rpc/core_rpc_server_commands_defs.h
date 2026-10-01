@@ -2966,13 +2966,15 @@ namespace cryptonote::rpc {
   /// state, but the bridge watcher (Phase E) needs the event history. Backed by a
   /// bounded forward block scan (no new DB index): the caller polls forward from
   /// `from_height`, and the response returns `next_height` to resume. The scan is
-  /// capped at `max_blocks` blocks and `max_events` events per call.
+  /// capped at `max_blocks` blocks. `max_events` is checked between blocks, so a page
+  /// always ends on a block boundary and may exceed it to finish its last block.
+  /// Unreadable block data is an error, never a skipped height.
   ///
   /// Inputs:
   /// - `gateway_id` -- gwB… address or 64-char hex id.
   /// - `from_height` -- first height to scan (default 0).
   /// - `max_blocks` -- max blocks to scan this call (default/limit applied server-side).
-  /// - `max_events` -- max events to return this call (default/limit applied server-side).
+  /// - `max_events` -- soft event budget for this call (default/limit applied server-side).
   ///
   /// Output:
   /// - `events` -- list of {height, txid, type, amount, ...}; type ∈
