@@ -455,6 +455,11 @@ private:
   void add_gateway_tx(const crypto::public_key& gateway_addr, uint64_t height, const crypto::hash& tx_hash) override;
   void remove_gateway_tx(const crypto::public_key& gateway_addr, uint64_t height, const crypto::hash& tx_hash) override;
   std::vector<crypto::hash> get_gateway_txs(const crypto::public_key& gateway_addr, uint64_t offset, uint64_t count) const override;
+  void add_gateway_release_ref(const crypto::public_key& gateway_addr, const crypto::hash& ref, uint64_t height) override;
+  void remove_gateway_release_ref(const crypto::public_key& gateway_addr, const crypto::hash& ref) override;
+  bool has_gateway_release_ref(const crypto::public_key& gateway_addr, const crypto::hash& ref) const override;
+  bool gateway_release_refs_complete() const override;
+  void set_gateway_release_refs_complete() override;
 
 private:
   template <typename T,
@@ -497,6 +502,8 @@ private:
 
   MDB_dbi m_gateway_accounts; // HF22: gateway_addr -> serialized gateway_account_data
   MDB_dbi m_gateway_tx_history; // HF22: gateway_addr -> (height||tx_hash) entries (DUPSORT)
+  MDB_dbi m_gateway_release_refs; // HF23: (gateway_addr||ref) -> inclusion height, never pruned
+  bool m_gateway_release_refs_open = false; // false only on a read-only open of an older DB
 
   MDB_dbi m_properties;
 

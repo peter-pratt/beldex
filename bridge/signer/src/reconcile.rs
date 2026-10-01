@@ -201,10 +201,9 @@ impl<C: crate::evm_watcher::JsonRpcClient> DutyReconciler for EvmMintReconciler<
 /// Release leg: the daemon's `gateway_release_ref_status` — has this burn already been
 /// discharged by a release from the bridge gateway?
 ///
-/// **Horizon caveat:** the consensus ref set is pruned below the previous release window, so a
-/// `false` for a burn older than `retained_from_window` means "not retained", not "never
-/// released". This reconciler reports `None` (undetermined) in that case rather than risk
-/// re-releasing an ancient burn — the duty simply stays unworked, which is the safe direction.
+/// The daemon answers from a permanent index of discharged refs, so a `false` means the burn
+/// was never released, however old it is, and consensus refuses a second release of any
+/// burn that was.
 #[cfg(feature = "autonomy")]
 pub struct GatewayReleaseReconciler {
     pub rpc_url: String,

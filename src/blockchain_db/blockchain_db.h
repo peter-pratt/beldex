@@ -1843,6 +1843,19 @@ public:
   // Returns up to `count` tx hashes (height-ascending) starting at `offset`.
   virtual std::vector<crypto::hash> get_gateway_txs(const crypto::public_key& gateway_addr, uint64_t offset, uint64_t count) const = 0;
 
+  // Permanent release-ref index (HF23). Every burn ref a withdrawal from `gateway_addr`
+  // discharged, with its inclusion height. The account's release_ref_windows keep only
+  // the current and previous window for reorg bookkeeping; this set is never pruned, so
+  // a burn can be discharged once for the life of the chain. add/remove are exact
+  // inverses for reorg safety.
+  virtual void add_gateway_release_ref(const crypto::public_key& gateway_addr, const crypto::hash& ref, uint64_t height) = 0;
+  virtual void remove_gateway_release_ref(const crypto::public_key& gateway_addr, const crypto::hash& ref) = 0;
+  virtual bool has_gateway_release_ref(const crypto::public_key& gateway_addr, const crypto::hash& ref) const = 0;
+  // Whether the index covers all of the stored chain. False on a database created before
+  // the index existed (or copied without it) until Blockchain::init rebuilds it.
+  virtual bool gateway_release_refs_complete() const = 0;
+  virtual void set_gateway_release_refs_complete() = 0;
+
   // This function accepts an empty timestamps/difficulties array to fill, or
   // a prior timestamps/difficulties array that was filled by a previous call to
   // this same function in which case it will optimally insert and remove the

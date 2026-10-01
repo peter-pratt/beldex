@@ -1469,6 +1469,17 @@ namespace cryptonote
      * @return true
      */
     bool update_next_cumulative_weight_limit(uint64_t *long_term_effective_median_block_weight = NULL);
+
+    /**
+     * @brief build the permanent gateway release-ref index from stored history
+     *
+     * Runs once on a database whose index is not marked complete (one created before
+     * the index existed, or copied without it), recording every ref a stored bridge-era
+     * block discharged, then marks it complete. Block apply maintains it from then on.
+     *
+     * @return false if a stored transaction could not be read
+     */
+    bool backfill_gateway_release_refs();
     void return_tx_to_pool(std::vector<std::pair<transaction, blobdata>> &txs);
 
     /**

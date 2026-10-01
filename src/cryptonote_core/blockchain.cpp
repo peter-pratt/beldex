@@ -428,6 +428,54 @@ static bool exec_detach_hooks(
 //------------------------------------------------------------------
 //FIXME: possibly move this into the constructor, to avoid accidentally
 //       dereferencing a null BlockchainDB pointer
+bool Blockchain::backfill_gateway_release_refs()
+{
+  if (m_db->gateway_release_refs_complete())
+    return true;
+
+  db_wtxn_guard wtxn_guard{m_db};
+  const uint64_t top = m_db->height();
+
+  // Release refs exist only from the bridge hard fork on. Versions never decrease along
+  // the chain, so find its first stored block by bisection over the headers.
+  uint64_t lo = 0, hi = top;
+  while (lo < hi)
+  {
+    const uint64_t mid = lo + (hi - lo) / 2;
+    if (m_db->get_block_header_from_height(mid).major_version >= feature::BRIDGE)
+      hi = mid;
+    else
+      lo = mid + 1;
+  }
+  if (lo < top)
+    MGINFO("Building the permanent gateway release-ref index over heights " << lo << ".." << top - 1);
+
+  uint64_t recorded = 0;
+  for (uint64_t h = lo; h < top; ++h)
+  {
+    const block blk = m_db->get_block_from_height(h);
+    for (const auto& tx_hash : blk.tx_hashes)
+    {
+      transaction tx;
+      // The prefix carries the refs, so a pruned database rebuilds the same index.
+      if (!m_db->get_pruned_tx(tx_hash, tx))
+      {
+        MERROR("Release-ref index: cannot read tx " << tx_hash << " at height " << h);
+        return false;
+      }
+      for (const auto& [gw, ref] : gateway_release_ref_records(tx))
+      {
+        m_db->add_gateway_release_ref(gw, ref, h);
+        ++recorded;
+      }
+    }
+  }
+  m_db->set_gateway_release_refs_complete();
+  if (lo < top)
+    MGINFO("Permanent gateway release-ref index built: " << recorded << " ref(s)");
+  return true;
+}
+//------------------------------------------------------------------
 bool Blockchain::init(BlockchainDB* db, sqlite3 *bns_db, const network_type nettype, bool offline, const cryptonote::test_options *test_options, difficulty_type fixed_difficulty, const GetCheckpointsCallback& get_checkpoints/* = nullptr*/)
 {
   LOG_PRINT_L3("Blockchain::" << __func__);
@@ -562,6 +610,10 @@ bool Blockchain::init(BlockchainDB* db, sqlite3 *bns_db, const network_type nett
     m_cache.m_timestamps_and_difficulties_height = 0;
     m_tx_pool.on_blockchain_dec();
   }
+
+  // Before anything can validate a release against it.
+  if (!m_db->is_read_only() && !backfill_gateway_release_refs())
+    return false;
 
   if (test_options && test_options->long_term_block_weight_window)
   {

@@ -60,6 +60,20 @@ namespace
     }
     bool remove_gateway_account(const crypto::public_key& id) override { return store.erase(id) > 0; }
     bool gateway_exists(const crypto::public_key& id) const override { return store.count(id) > 0; }
+
+    std::map<std::pair<crypto::public_key, crypto::hash>, uint64_t> release_refs;
+    void add_gateway_release_ref(const crypto::public_key& gw, const crypto::hash& ref, uint64_t h) override
+    {
+      release_refs.emplace(std::make_pair(gw, ref), h);
+    }
+    void remove_gateway_release_ref(const crypto::public_key& gw, const crypto::hash& ref) override
+    {
+      release_refs.erase({gw, ref});
+    }
+    bool has_gateway_release_ref(const crypto::public_key& gw, const crypto::hash& ref) const override
+    {
+      return release_refs.count({gw, ref}) > 0;
+    }
     std::vector<crypto::public_key> get_all_gateway_ids() const override
     {
       std::vector<crypto::public_key> ids;
@@ -1218,6 +1232,61 @@ TEST(GatewayBridgeReleaseRef, rewind_is_byte_exact_and_reallows_the_burn)
   ASSERT_TRUE(rewind_gateways_from_transactions(db, {tx}, h, true, &reason)) << reason;
   EXPECT_EQ(blob_of(gw, db), before) << "rewind must restore a byte-identical blob";
   ASSERT_TRUE(append_gateways_from_transactions(db, {tx}, h, true, &reason)) << reason;
+}
+
+TEST(GatewayBridgeReleaseRef, a_burn_stays_discharged_after_its_window_is_pruned)
+{
+  // The account keeps refs for the current and previous window only. Before the
+  // permanent index, a burn released three windows ago could be released again.
+  MemGatewayDB db;
+  const crypto::public_key gw = seed_gateway(db, 1'000'000);
+  const uint64_t W = GATEWAY_RELEASE_WINDOW_BLOCKS;
+  const crypto::hash old_ref = gateway_release_ref_hash(1, burn_txid(0x55), 0);
+  std::string reason;
+
+  auto old_release = make_withdrawal_with_ref(gw, 1000, 1, burn_txid(0x55));
+  ASSERT_TRUE(append_gateways_from_transactions(db, {old_release}, 10 * W + 1, true, &reason)) << reason;
+  for (uint64_t w = 11; w <= 13; ++w)
+  {
+    auto tx = make_withdrawal_with_ref(gw, 10, 1, burn_txid(static_cast<uint8_t>(0x60 + w)));
+    ASSERT_TRUE(append_gateways_from_transactions(db, {tx}, w * W + 1, true, &reason)) << reason;
+  }
+  gateway_account_data a; ASSERT_TRUE(load_gateway_account(db, gw, a));
+  ASSERT_FALSE(a.release_ref_recorded(old_ref)) << "the window record has pruned it";
+  EXPECT_TRUE(db.has_gateway_release_ref(gw, old_ref)) << "the permanent index has not";
+
+  auto replay = make_withdrawal_with_ref(gw, 999, 1, burn_txid(0x55));
+  EXPECT_FALSE(append_gateways_from_transactions(db, {replay}, 13 * W + 2, true, &reason));
+  EXPECT_NE(reason.find("already-discharged"), std::string::npos) << reason;
+  EXPECT_FALSE(simulate_gateways_from_transactions(db, {replay}, 13 * W + 2, true, &reason));
+}
+
+TEST(GatewayBridgeReleaseRef, permanent_index_follows_append_and_rewind_exactly)
+{
+  MemGatewayDB db;
+  const crypto::public_key gw = seed_gateway(db, 1'000'000);
+  const uint64_t h = 10 * GATEWAY_RELEASE_WINDOW_BLOCKS + 5;
+  const crypto::hash ref = gateway_release_ref_hash(1, burn_txid(0x66), 0);
+  std::string reason;
+
+  auto tx = make_withdrawal_with_ref(gw, 1000, 1, burn_txid(0x66));
+  ASSERT_TRUE(append_gateways_from_transactions(db, {tx}, h, true, &reason)) << reason;
+  ASSERT_EQ(db.release_refs.size(), 1u);
+  EXPECT_EQ(db.release_refs.at({gw, ref}), h) << "recorded with its inclusion height";
+
+  // A block whose gateway changes fail writes nothing to the index either.
+  auto again = make_withdrawal_with_ref(gw, 1000, 1, burn_txid(0x66));
+  EXPECT_FALSE(append_gateways_from_transactions(db, {again}, h + 1, true, &reason));
+  EXPECT_EQ(db.release_refs.size(), 1u);
+
+  // Orphaned by a reorg, the burn is releasable again, exactly as before.
+  ASSERT_TRUE(rewind_gateways_from_transactions(db, {tx}, h, true, &reason)) << reason;
+  EXPECT_TRUE(db.release_refs.empty());
+
+  // Before the bridge hard fork nothing is recorded, matching the window guard.
+  auto pre = make_withdrawal_with_ref(gw, 1000, 1, burn_txid(0x67));
+  ASSERT_TRUE(append_gateways_from_transactions(db, {pre}, h + 2, /*bridge_active=*/false, &reason)) << reason;
+  EXPECT_TRUE(db.release_refs.empty());
 }
 
 TEST(GatewayBridgeReleaseRef, refless_withdrawal_still_valid_and_untouched_by_guard)

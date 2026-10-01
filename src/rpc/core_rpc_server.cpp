@@ -4195,6 +4195,7 @@ namespace cryptonote::rpc {
     auto& db = m_core.get_blockchain_storage().get_db();
     cryptonote::gateway_account_data acct;
     const bool exists = cryptonote::load_gateway_account(db, gw_id, acct);
+    const bool complete = db.gateway_release_refs_complete();
 
     auto discharged = json::array();
     for (size_t i = 0; i < req.chain_ids.size(); ++i)
@@ -4205,17 +4206,22 @@ namespace cryptonote::rpc {
       const uint32_t log_index = req.log_indices.empty() ? 0u : req.log_indices[i];
       const crypto::hash ref =
           cryptonote::gateway_release_ref_hash(req.chain_ids[i], txid, log_index);
-      discharged.push_back(exists && acct.release_ref_recorded(ref));
+      discharged.push_back((exists && acct.release_ref_recorded(ref)) ||
+                           (complete && db.has_gateway_release_ref(gw_id, ref)));
     }
 
-    // The retention floor: refs below this window have been pruned, so a `false`
-    // for an older burn is "not retained", not "never released".
+    // The retention floor: refs below this window are no longer in the account's
+    // windows. With the permanent index complete nothing is lost, so the floor is 0 and
+    // a `false` means "never released". Without it, a `false` for an older burn is "not
+    // retained", not "never released".
     uint64_t retained_from = 0;
-    for (const auto& w : acct.release_ref_windows)
-      if (retained_from == 0 || w.window_id < retained_from) retained_from = w.window_id;
+    if (!complete)
+      for (const auto& w : acct.release_ref_windows)
+        if (retained_from == 0 || w.window_id < retained_from) retained_from = w.window_id;
 
     cmd.response["discharged"]           = std::move(discharged);
     cmd.response["retained_from_window"] = retained_from;
+    cmd.response["index_complete"]       = complete;
     cmd.response["status"]               = STATUS_OK;
   }
 

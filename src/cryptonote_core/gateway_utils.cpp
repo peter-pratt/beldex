@@ -110,6 +110,22 @@ std::vector<tx_extra_gateway_release_ref> extract_gateway_release_refs(const tra
   return v;
 }
 
+std::vector<std::pair<crypto::public_key, crypto::hash>> gateway_release_ref_records(const transaction& tx)
+{
+  std::vector<std::pair<crypto::public_key, crypto::hash>> out;
+  std::set<crypto::public_key> gws;
+  for (const auto& in : tx.vin)
+    if (const auto* g = std::get_if<txin_gateway>(&in))
+      gws.insert(g->gateway_addr);
+  for (const auto& rf : extract_gateway_release_refs(tx))
+  {
+    const crypto::hash ref = gateway_release_ref_hash(rf.chain_id, rf.evm_txid, rf.log_index);
+    for (const auto& gw : gws)
+      out.emplace_back(gw, ref);
+  }
+  return out;
+}
+
 std::string bridge_mint_publish_message(network_type nettype, std::string_view payload)
 {
   const crypto::hash& genesis = gateway_chain_binding(nettype);
@@ -1502,7 +1518,8 @@ bool validate_tx_gateway_operations_against_db(BlockchainDB& db, network_type ne
         return false;
       }
       // Early reject a replay of a ref already discharged on-chain (per source
-      // gateway; the ref is recorded against every gateway the tx spends from).
+      // gateway; the ref is recorded against every gateway the tx spends from). The
+      // account only remembers the last two windows; the permanent index the rest.
       const crypto::hash ref = gateway_release_ref_hash(rf.chain_id, rf.evm_txid, rf.log_index);
       for (const auto& in : tx.vin)
       {
@@ -1510,7 +1527,8 @@ bool validate_tx_gateway_operations_against_db(BlockchainDB& db, network_type ne
         if (!g)
           continue;
         gateway_account_data acct;
-        if (load_gateway_account(db, g->gateway_addr, acct) && acct.release_ref_recorded(ref))
+        if ((load_gateway_account(db, g->gateway_addr, acct) && acct.release_ref_recorded(ref)) ||
+            db.has_gateway_release_ref(g->gateway_addr, ref))
         {
           reason = "gateway release replays an already-discharged burn ref";
           return false;
@@ -1756,16 +1774,6 @@ namespace
     return gws;
   }
 
-  // The distinct source gateways a tx withdraws from (release-ref recording targets).
-  std::set<crypto::public_key> gateways_touched_by_withdrawals(const transaction& tx)
-  {
-    std::set<crypto::public_key> gws;
-    for (const auto& in : tx.vin)
-      if (const auto* g = std::get_if<txin_gateway>(&in))
-        gws.insert(g->gateway_addr);
-    return gws;
-  }
-
   // Core apply logic shared by simulate (dry-run) and append (persist). Fills
   // `cache` with the post-block gateway state, processing txs in block order
   // and, per tx, descriptor ops then deposits then withdrawals (so a same-block
@@ -1899,15 +1907,18 @@ namespace
             }
           }
         }
-        for (const auto& rf : refs_here)
+        for (const auto& [gw_addr, ref] : gateway_release_ref_records(tx))
         {
-          const crypto::hash ref = gateway_release_ref_hash(rf.chain_id, rf.evm_txid, rf.log_index);
-          for (const auto& gw_addr : gateways_touched_by_withdrawals(tx))
+          // The windowed record below only reaches back two windows; past that, only
+          // the permanent index still knows the burn was paid.
+          if (db.has_gateway_release_ref(gw_addr, ref))
           {
-            gateway_account_data& acct = get(gw_addr);
-            if (!add_release_ref(acct, block_height, ref, reason))
-              return false;
+            set_reason(reason, "gateway release replays an already-discharged burn ref");
+            return false;
           }
+          gateway_account_data& acct = get(gw_addr);
+          if (!add_release_ref(acct, block_height, ref, reason))
+            return false;
         }
       }
     }
@@ -1942,6 +1953,9 @@ bool append_gateways_from_transactions(BlockchainDB& db, const std::vector<trans
     const crypto::hash tx_hash = get_transaction_hash(tx);
     for (const auto& gw : gateways_touched_by_tx(tx))
       db.add_gateway_tx(gw, block_height, tx_hash);
+    if (bridge_active)
+      for (const auto& [gw, ref] : gateway_release_ref_records(tx))
+        db.add_gateway_release_ref(gw, ref, block_height);
   }
 
   for (const auto& [id, acct] : cache)
@@ -1979,16 +1993,13 @@ bool rewind_gateways_from_transactions(BlockchainDB& db, const std::vector<trans
     // undo the release-ref records (applied last within the tx, so undone first)
     if (bridge_active)
     {
-      for (const auto& rf : extract_gateway_release_refs(tx))
+      for (const auto& [gw_addr, ref] : gateway_release_ref_records(tx))
       {
-        const crypto::hash ref = gateway_release_ref_hash(rf.chain_id, rf.evm_txid, rf.log_index);
-        for (const auto& gw_addr : gateways_touched_by_withdrawals(tx))
-        {
-          bool ok = false;
-          gateway_account_data& acct = get(gw_addr, ok);
-          if (!ok || !sub_release_ref(acct, block_height, ref, reason))
-            return false;
-        }
+        bool ok = false;
+        gateway_account_data& acct = get(gw_addr, ok);
+        if (!ok || !sub_release_ref(acct, block_height, ref, reason))
+          return false;
+        db.remove_gateway_release_ref(gw_addr, ref);
       }
     }
 

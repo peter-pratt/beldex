@@ -2852,10 +2852,11 @@ namespace cryptonote::rpc {
   /// settled release duties against consensus instead of re-opening sessions for
   /// work already on-chain.
   ///
-  /// NOTE the retention horizon: refs are pruned below the previous release
-  /// window, so `discharged=false` for a very old burn means "not in the retained
-  /// set", not "provably never released". `retained_from_window` is returned so
-  /// the caller can tell the two apart.
+  /// Answers from the gateway account's recent windows and from the permanent
+  /// release-ref index, which keeps every discharged ref for the life of the chain.
+  /// With the index complete (`index_complete`), `discharged=false` means the burn
+  /// was never released. Without it, refs below the previous release window are not
+  /// retained, and `retained_from_window` tells the caller where that horizon is.
   ///
   /// Inputs (three parallel arrays, one entry per burn to check):
   /// - `gateway_id` -- gwB… address or 64-char hex id of the bridge gateway.
@@ -2865,7 +2866,9 @@ namespace cryptonote::rpc {
   ///
   /// Output:
   /// - `discharged` -- parallel to the inputs: true iff recorded as released.
-  /// - `retained_from_window` -- lowest release window still retained (0 if none).
+  /// - `retained_from_window` -- lowest release window still retained (0 if none, or
+  ///   if the permanent index is complete and nothing is lost).
+  /// - `index_complete` -- the permanent release-ref index covers the whole chain.
   /// - `status` -- Generic RPC error code. "OK" is the success value.
   struct GATEWAY_RELEASE_REF_STATUS : PUBLIC
   {

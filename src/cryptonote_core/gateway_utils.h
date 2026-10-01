@@ -136,6 +136,11 @@ crypto::hash gateway_release_ref_hash(uint64_t chain_id, const crypto::hash& evm
 // All tx_extra_gateway_release_ref fields on a tx (validation enforces at most one).
 std::vector<tx_extra_gateway_release_ref> extract_gateway_release_refs(const transaction& tx);
 
+// The (source gateway, ref hash) pairs a bridge-era tx discharges: each carried release
+// ref, against every gateway the tx withdraws from. Block apply, rewind and the permanent
+// index backfill all record exactly these.
+std::vector<std::pair<crypto::public_key, crypto::hash>> gateway_release_ref_records(const transaction& tx);
+
 // Phase I mint bus: the bytes a publishing committee member signs with its
 // `signer_ed25519` so the daemon can authenticate the publisher of a mint payload:
 //   BRIDGE_MINT_PUBLISH ‖ genesis ‖ payload

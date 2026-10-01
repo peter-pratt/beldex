@@ -340,3 +340,58 @@ TYPED_TEST(BlockchainDBTest, RetrieveBlockData)
 }
 
 }  // anonymous namespace
+
+// Permanent gateway release-ref index (HF23): never pruned, exact add/remove inverses,
+// and a completeness marker that lives in the table itself.
+TYPED_TEST(BlockchainDBTest, GatewayReleaseRefIndex)
+{
+  fs::path tempPath = random_tmp_file();
+  std::string dirPath = tempPath.string();
+  this->set_prefix(dirPath);
+
+  crypto::public_key gw_a, gw_b;
+  crypto::secret_key sk;
+  crypto::generate_keys(gw_a, sk);
+  crypto::generate_keys(gw_b, sk);
+  crypto::hash ref1 = crypto::cn_fast_hash("ref1", 4), ref2 = crypto::cn_fast_hash("ref2", 4);
+
+  ASSERT_NO_THROW(this->m_db->open(dirPath, cryptonote::FAKECHAIN));
+  this->get_filenames();
+
+  // A fresh table is empty and not yet vouched for.
+  EXPECT_FALSE(this->m_db->gateway_release_refs_complete());
+  EXPECT_FALSE(this->m_db->has_gateway_release_ref(gw_a, ref1));
+
+  this->m_db->add_gateway_release_ref(gw_a, ref1, 100);
+  this->m_db->add_gateway_release_ref(gw_a, ref1, 200); // second discharge: first one kept
+  EXPECT_TRUE(this->m_db->has_gateway_release_ref(gw_a, ref1));
+  EXPECT_FALSE(this->m_db->has_gateway_release_ref(gw_b, ref1)) << "keyed per gateway";
+  EXPECT_FALSE(this->m_db->has_gateway_release_ref(gw_a, ref2));
+
+  this->m_db->set_gateway_release_refs_complete();
+  EXPECT_TRUE(this->m_db->gateway_release_refs_complete());
+  // The marker shares the table but is never mistaken for a ref.
+  EXPECT_FALSE(this->m_db->has_gateway_release_ref(gw_b, ref2));
+
+  // Survives a reopen, read-only included.
+  ASSERT_NO_THROW(this->m_db->close());
+  ASSERT_NO_THROW(this->m_db->open(dirPath, cryptonote::FAKECHAIN, DBF_RDONLY));
+  EXPECT_TRUE(this->m_db->gateway_release_refs_complete());
+  EXPECT_TRUE(this->m_db->has_gateway_release_ref(gw_a, ref1));
+  ASSERT_NO_THROW(this->m_db->close());
+  ASSERT_NO_THROW(this->m_db->open(dirPath, cryptonote::FAKECHAIN));
+
+  // Removal is the exact inverse, and removing an absent ref is harmless.
+  this->m_db->remove_gateway_release_ref(gw_a, ref1);
+  this->m_db->remove_gateway_release_ref(gw_a, ref1);
+  EXPECT_FALSE(this->m_db->has_gateway_release_ref(gw_a, ref1));
+  EXPECT_TRUE(this->m_db->gateway_release_refs_complete());
+
+  // reset() drops the index and its marker together, so the next start rebuilds it.
+  this->m_db->add_gateway_release_ref(gw_b, ref2, 300);
+  this->m_db->reset();
+  EXPECT_FALSE(this->m_db->has_gateway_release_ref(gw_b, ref2));
+  EXPECT_FALSE(this->m_db->gateway_release_refs_complete());
+
+  ASSERT_NO_THROW(this->m_db->close());
+}

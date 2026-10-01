@@ -256,10 +256,11 @@ const char* const LMDB_MASTER_NODE_DATA = "master_node_data";
 const char* const LMDB_MASTER_NODE_LATEST = "master_node_proofs"; // contains the latest data sent with a proof: time, aux keys, ip, ports
 const char* const LMDB_GATEWAY_ACCOUNTS = "gateway_accounts"; // HF22: gateway_addr -> serialized gateway_account_data
 const char* const LMDB_GATEWAY_TX_HISTORY = "gateway_tx_history"; // HF22: gateway_addr -> (height||tx_hash) entries (DUPSORT)
+const char* const LMDB_GATEWAY_RELEASE_REFS = "gateway_release_refs"; // HF23: (gateway_addr||ref) -> height, never pruned
 
 const char* const LMDB_PROPERTIES = "properties";
 
-constexpr unsigned int LMDB_DB_COUNT = 25; // Should agree with the number of db's above
+constexpr unsigned int LMDB_DB_COUNT = 26; // Should agree with the number of db's above
 
 const char zerokey[8] = {0};
 const MDB_val zerokval = { sizeof(zerokey), (void *)zerokey };
@@ -1541,6 +1542,17 @@ void BlockchainLMDB::open(const fs::path& filename, cryptonote::network_type net
   // the big-endian height prefix, i.e. chronologically.
   lmdb_db_open(txn, LMDB_GATEWAY_TX_HISTORY, MDB_CREATE | MDB_DUPSORT | MDB_DUPFIXED, m_gateway_tx_history, "Failed to open db handle for m_gateway_tx_history");
 
+  // A read-only open cannot create the table, and a database from before it existed
+  // must still open for inspection; the index then reports itself incomplete.
+  if (int res = mdb_dbi_open(txn, LMDB_GATEWAY_RELEASE_REFS, (mdb_flags & MDB_RDONLY) ? 0 : MDB_CREATE, &m_gateway_release_refs))
+  {
+    if (!(mdb_flags & MDB_RDONLY) || res != MDB_NOTFOUND)
+      throw0(DB_OPEN_FAILURE(lmdb_error("Failed to open db handle for m_gateway_release_refs : ", res).c_str()));
+    m_gateway_release_refs_open = false;
+  }
+  else
+    m_gateway_release_refs_open = true;
+
   lmdb_db_open(txn, LMDB_PROPERTIES, MDB_CREATE, m_properties, "Failed to open db handle for m_properties");
 
   mdb_set_dupsort(txn, m_spent_keys, compare_hash32);
@@ -1729,6 +1741,9 @@ void BlockchainLMDB::reset()
     throw0(DB_ERROR(lmdb_error("Failed to drop m_gateway_accounts: ", result).c_str()));
   if (auto result = mdb_drop(txn, m_gateway_tx_history, 0))
     throw0(DB_ERROR(lmdb_error("Failed to drop m_gateway_tx_history: ", result).c_str()));
+  if (m_gateway_release_refs_open)
+    if (auto result = mdb_drop(txn, m_gateway_release_refs, 0))
+      throw0(DB_ERROR(lmdb_error("Failed to drop m_gateway_release_refs: ", result).c_str()));
   if (auto result = mdb_drop(txn, m_properties, 0))
     throw0(DB_ERROR(lmdb_error("Failed to drop m_properties: ", result).c_str()));
 
@@ -6546,6 +6561,114 @@ std::vector<crypto::hash> BlockchainLMDB::get_gateway_txs(const crypto::public_k
     result.push_back(h);
   }
   return result;
+}
+
+namespace
+{
+  // Entries are keyed gateway_addr(32) || ref(32). The completeness marker is a shorter
+  // key in the same table, not a property: a tool that copies the properties but not
+  // this table (blockchain_prune) must not carry over a claim the copy cannot back.
+  constexpr std::string_view RELEASE_REFS_COMPLETE_KEY = "index_complete_v1";
+
+  std::array<unsigned char, 64> release_ref_key(const crypto::public_key& gateway_addr, const crypto::hash& ref)
+  {
+    std::array<unsigned char, 64> k{};
+    std::memcpy(k.data(), &gateway_addr, 32);
+    std::memcpy(k.data() + 32, &ref, 32);
+    return k;
+  }
+}
+
+void BlockchainLMDB::add_gateway_release_ref(const crypto::public_key& gateway_addr, const crypto::hash& ref, uint64_t height)
+{
+  LOG_PRINT_L3("BlockchainLMDB::" << __func__);
+  check_open();
+  if (!m_gateway_release_refs_open)
+    throw0(DB_ERROR("gateway release-ref index is not available"));
+
+  TXN_BLOCK_PREFIX(0);
+  auto k = release_ref_key(gateway_addr, ref);
+  const uint64_t h = oxenc::host_to_little(height);
+  MDB_val key{k.size(), k.data()};
+  MDB_val val{sizeof(h), (void*)&h};
+  // NOOVERWRITE: consensus has already refused a second discharge of this ref, so one
+  // here is a bookkeeping error; keep the first height rather than hide it.
+  int result = mdb_put(*txn_ptr, m_gateway_release_refs, &key, &val, MDB_NOOVERWRITE);
+  if (result && result != MDB_KEYEXIST)
+    throw0(DB_ERROR(lmdb_error("Failed to add gateway release ref: ", result)));
+
+  TXN_BLOCK_POSTFIX_SUCCESS();
+}
+
+void BlockchainLMDB::remove_gateway_release_ref(const crypto::public_key& gateway_addr, const crypto::hash& ref)
+{
+  LOG_PRINT_L3("BlockchainLMDB::" << __func__);
+  check_open();
+  if (!m_gateway_release_refs_open)
+    throw0(DB_ERROR("gateway release-ref index is not available"));
+
+  TXN_BLOCK_PREFIX(0);
+  auto k = release_ref_key(gateway_addr, ref);
+  MDB_val key{k.size(), k.data()};
+  int result = mdb_del(*txn_ptr, m_gateway_release_refs, &key, nullptr);
+  if (result && result != MDB_NOTFOUND)
+    throw0(DB_ERROR(lmdb_error("Failed to remove gateway release ref: ", result)));
+
+  TXN_BLOCK_POSTFIX_SUCCESS();
+}
+
+bool BlockchainLMDB::has_gateway_release_ref(const crypto::public_key& gateway_addr, const crypto::hash& ref) const
+{
+  LOG_PRINT_L3("BlockchainLMDB::" << __func__);
+  check_open();
+  // Never answer "not discharged" from an index that is missing.
+  if (!m_gateway_release_refs_open)
+    throw0(DB_ERROR("gateway release-ref index is not available"));
+
+  TXN_PREFIX_RDONLY();
+  auto k = release_ref_key(gateway_addr, ref);
+  MDB_val key{k.size(), k.data()};
+  MDB_val val{};
+  int result = mdb_get(m_txn, m_gateway_release_refs, &key, &val);
+  if (result == MDB_NOTFOUND)
+    return false;
+  if (result)
+    throw0(DB_ERROR(lmdb_error("Failed to query gateway release ref: ", result)));
+  return true;
+}
+
+bool BlockchainLMDB::gateway_release_refs_complete() const
+{
+  LOG_PRINT_L3("BlockchainLMDB::" << __func__);
+  check_open();
+  if (!m_gateway_release_refs_open)
+    return false;
+
+  TXN_PREFIX_RDONLY();
+  MDB_val key{RELEASE_REFS_COMPLETE_KEY.size(), (void*)RELEASE_REFS_COMPLETE_KEY.data()};
+  MDB_val val{};
+  int result = mdb_get(m_txn, m_gateway_release_refs, &key, &val);
+  if (result == MDB_NOTFOUND)
+    return false;
+  if (result)
+    throw0(DB_ERROR(lmdb_error("Failed to read gateway release-ref index marker: ", result)));
+  return true;
+}
+
+void BlockchainLMDB::set_gateway_release_refs_complete()
+{
+  LOG_PRINT_L3("BlockchainLMDB::" << __func__);
+  check_open();
+  if (!m_gateway_release_refs_open)
+    throw0(DB_ERROR("gateway release-ref index is not available"));
+
+  TXN_BLOCK_PREFIX(0);
+  MDB_val key{RELEASE_REFS_COMPLETE_KEY.size(), (void*)RELEASE_REFS_COMPLETE_KEY.data()};
+  MDB_val val{0, nullptr};
+  if (int result = mdb_put(*txn_ptr, m_gateway_release_refs, &key, &val, 0))
+    throw0(DB_ERROR(lmdb_error("Failed to mark gateway release-ref index complete: ", result)));
+
+  TXN_BLOCK_POSTFIX_SUCCESS();
 }
 
 
