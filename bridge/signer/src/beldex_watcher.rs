@@ -235,22 +235,29 @@ fn hex_to_fixed<const N: usize>(s: &str) -> Option<[u8; N]> {
 }
 
 /// Parse the `events` array of a `gateway_get_history` page into deposit records,
-/// skipping non-deposit events and any entry that does not decode.
-pub fn parse_deposit_events(page: &Value) -> Vec<DepositRecord> {
-    let Some(events) = page.get("events").and_then(Value::as_array) else {
-        return Vec::new();
-    };
+/// skipping non-deposit events.
+///
+/// A deposit entry that does not decode is an error, not a skip: the page's cursor moves
+/// past it either way, so skipping would lose the deposit for good. The output index is
+/// required for the same reason — defaulting it to 0 would merge a transaction's gateway
+/// outputs into one deposit.
+pub fn parse_deposit_events(page: &Value) -> Result<Vec<DepositRecord>, RpcError> {
+    let events = page
+        .get("events")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RpcError::BadResponse("gateway_get_history.events".into()))?;
     let mut out = Vec::new();
     for e in events {
         if e.get("type").and_then(Value::as_str) != Some("deposit") {
             continue;
         }
-        let (Some(txid), Some(height), Some(amount)) = (
+        let (Some(txid), Some(height), Some(amount), Some(output_index)) = (
             e.get("txid").and_then(Value::as_str).and_then(hex_to_fixed::<32>),
             e.get("height").and_then(Value::as_u64),
             e.get("amount").and_then(Value::as_u64),
+            e.get("out_index").and_then(Value::as_u64).and_then(|i| u32::try_from(i).ok()),
         ) else {
-            continue;
+            return Err(RpcError::BadResponse(format!("undecodable deposit event: {e}")));
         };
         // Signer-decrypt path: the raw encrypted bundle {enc_memo, tx_pubkey,
         // out_index}. Present only if all three decode.
@@ -266,11 +273,6 @@ pub fn parse_deposit_events(page: &Value) -> Vec<DepositRecord> {
         };
         // Optional already-plaintext memo (kept for tests / a daemon-decrypt fallback).
         let memo = e.get("memo").and_then(Value::as_str).and_then(hex_to_fixed::<MEMO_LEN>);
-        let output_index = e
-            .get("out_index")
-            .and_then(Value::as_u64)
-            .or_else(|| enc_memo.as_ref().map(|m| m.output_index))
-            .unwrap_or(0) as u32;
         out.push(DepositRecord {
             beldex_txid: txid,
             output_index,
@@ -280,7 +282,7 @@ pub fn parse_deposit_events(page: &Value) -> Vec<DepositRecord> {
             memo,
         });
     }
-    out
+    Ok(out)
 }
 
 /// One member's Beldex watcher for the bridge gateway.
@@ -362,33 +364,53 @@ impl<C: BeldexRpc> BeldexWatcher<C> {
 
     /// Poll for newly-final deposits: everything at height ≤ the immutable checkpoint
     /// that we have not already emitted. Reorg-safe (only checkpoint-final heights are
-    /// finalized) and deduped by txid. Returns the raw records; the caller resolves
-    /// each to a [`MintEvent`] via [`resolve_mint`].
+    /// finalized) and deduped by `(txid, output_index)`. Returns the raw records; the
+    /// caller resolves each to a [`MintEvent`] via [`resolve_mint`].
+    ///
+    /// All-or-nothing per poll: deposits are only marked seen, and the cursor only moved,
+    /// once every page read cleanly. A failure on a later page used to leave the earlier
+    /// pages' deposits marked seen but never returned, so the retry skipped them. The
+    /// cursor also only advances through heights a page actually covered, never straight
+    /// to the frontier on a missing, stalled or exhausted `next_height`.
     pub fn advance(&mut self) -> Result<Vec<DepositRecord>, RpcError> {
         let immutable = self.finality_frontier()?;
         if immutable <= self.finalized_up_to {
             return Ok(Vec::new()); // no new checkpoint-final range
         }
 
-        let mut finalized = Vec::new();
+        let mut staged = Vec::new();
+        let mut staged_keys = BTreeSet::new();
         let mut from = self.finalized_up_to + 1;
-        // Page forward until we've covered [.., immutable]; bounded by the server's
-        // page size (advertised via next_height) and a guard against non-progress.
+        let mut covered = self.finalized_up_to;
+        // Page forward until [.., immutable] is covered. The page bound only splits a huge
+        // backlog across polls; whatever was covered is still committed.
         for _ in 0..10_000 {
             let page = self.history_page(from)?;
-            for rec in parse_deposit_events(&page) {
-                if rec.height <= immutable && self.seen.insert((rec.beldex_txid, rec.output_index)) {
-                    finalized.push(rec);
+            let records = parse_deposit_events(&page)?;
+            let next = page
+                .get("next_height")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| RpcError::BadResponse("gateway_get_history.next_height".into()))?;
+            if next <= from {
+                return Err(RpcError::BadResponse(format!(
+                    "gateway_get_history made no progress from height {from}"
+                )));
+            }
+            for rec in records {
+                let key = (rec.beldex_txid, rec.output_index);
+                if rec.height <= immutable && !self.seen.contains(&key) && staged_keys.insert(key) {
+                    staged.push(rec);
                 }
             }
-            let next = page.get("next_height").and_then(Value::as_u64).unwrap_or(u64::MAX);
-            if next > immutable || next <= from {
-                break; // covered the finalizable range (or no progress)
+            covered = immutable.min(next - 1);
+            if next > immutable {
+                break;
             }
             from = next;
         }
-        self.finalized_up_to = immutable;
-        Ok(finalized)
+        self.seen.extend(staged_keys);
+        self.finalized_up_to = covered;
+        Ok(staged)
     }
 
     pub fn finalized_up_to(&self) -> u64 {
@@ -482,7 +504,7 @@ mod tests {
             {"type":"deposit","txid":"11".repeat(32),"height":10,"amount":2000,"out_index":2},
             {"type":"deposit","txid":"11".repeat(32),"height":10,"amount":3000,"out_index":3},
         ]});
-        let recs = parse_deposit_events(&page);
+        let recs = parse_deposit_events(&page).unwrap();
         assert_eq!(recs.len(), 3, "three outputs parse as three deposits");
         assert_eq!(recs.iter().map(|r| r.output_index).collect::<Vec<_>>(), vec![1, 2, 3]);
 
@@ -569,7 +591,9 @@ mod tests {
                         .filter(|e| e["height"].as_u64().unwrap() >= from)
                         .cloned()
                         .collect();
-                    Ok(json!({ "events": hits, "next_height": self.top + 1, "top_height": self.top }))
+                    // A real chain is never shorter than its own checkpoint.
+                    let top = self.top.max(self.immutable.get());
+                    Ok(json!({ "events": hits, "next_height": top + 1, "top_height": top }))
                 }
                 other => Err(RpcError::Transport(format!("unmocked {other}"))),
             }
@@ -577,7 +601,9 @@ mod tests {
     }
 
     fn deposit_event(height: u64, txid: [u8; 32], amount: u64, memo: Option<[u8; 32]>) -> Value {
-        let mut e = json!({ "height": height, "txid": to_hex(&txid), "type": "deposit", "amount": amount });
+        let mut e = json!({
+            "height": height, "txid": to_hex(&txid), "type": "deposit", "amount": amount, "out_index": 0
+        });
         if let Some(m) = memo {
             e["memo"] = json!(to_hex(&m));
         }
@@ -680,6 +706,127 @@ mod tests {
         assert_eq!(finals.len(), 1);
         assert_eq!(finals[0].beldex_txid, [0x02; 32]);
         assert!(relaxed.advance().unwrap().is_empty());
+    }
+
+    /// A `beldexd` that pages `blocks_per_page` heights at a time, and can be told to fail
+    /// a page or to answer with a broken cursor.
+    struct PagedDaemon {
+        immutable: u64,
+        events: Vec<Value>,
+        blocks_per_page: u64,
+        /// Fail the next request whose `from_height` is at or above this.
+        fail_from: Cell<Option<u64>>,
+        /// Answer every page with this `next_height` (`None`: omit the field).
+        cursor_override: Option<Option<u64>>,
+    }
+    impl PagedDaemon {
+        fn new(immutable: u64, events: Vec<Value>, blocks_per_page: u64) -> Self {
+            PagedDaemon {
+                immutable,
+                events,
+                blocks_per_page,
+                fail_from: Cell::new(None),
+                cursor_override: None,
+            }
+        }
+    }
+    impl BeldexRpc for PagedDaemon {
+        fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+            match method {
+                "get_info" => Ok(json!({ "immutable_height": self.immutable })),
+                "gateway_get_history" => {
+                    let from = params["from_height"].as_u64().unwrap();
+                    if self.fail_from.get().is_some_and(|f| from >= f) {
+                        self.fail_from.set(None);
+                        return Err(RpcError::Transport("connection reset".into()));
+                    }
+                    let next = from + self.blocks_per_page;
+                    let hits: Vec<Value> = self
+                        .events
+                        .iter()
+                        .filter(|e| (from..next).contains(&e["height"].as_u64().unwrap()))
+                        .cloned()
+                        .collect();
+                    let mut page = json!({ "events": hits, "top_height": self.immutable + 50 });
+                    match self.cursor_override {
+                        None => page["next_height"] = json!(next),
+                        Some(Some(n)) => page["next_height"] = json!(n),
+                        Some(None) => {}
+                    }
+                    Ok(page)
+                }
+                other => Err(RpcError::Transport(format!("unmocked {other}"))),
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_later_page_does_not_lose_the_earlier_pages_deposits() {
+        let memo = BridgeMemo { chain_id: 1, evm_addr: [0x11; 20] }.encode();
+        let daemon = PagedDaemon::new(
+            200,
+            vec![
+                deposit_event(10, [0x01; 32], 500, Some(memo)),  // page 1
+                deposit_event(150, [0x02; 32], 700, Some(memo)), // page 2
+            ],
+            100,
+        );
+        daemon.fail_from.set(Some(101));
+        let mut w = BeldexWatcher::new(daemon, "gwTestGateway", 1);
+
+        assert!(w.advance().is_err(), "page 2 failed");
+        assert_eq!(w.finalized_up_to(), 0, "nothing committed");
+
+        let finals = w.advance().unwrap();
+        let ids: Vec<_> = finals.iter().map(|r| r.beldex_txid).collect();
+        assert_eq!(ids, vec![[0x01; 32], [0x02; 32]], "the page-1 deposit survives the retry");
+        assert_eq!(w.finalized_up_to(), 200);
+        assert!(w.advance().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_broken_cursor_never_moves_the_watcher_to_the_frontier() {
+        let memo = BridgeMemo { chain_id: 1, evm_addr: [0x11; 20] }.encode();
+        let events = vec![deposit_event(150, [0x02; 32], 700, Some(memo))];
+        for cursor in [None, Some(1), Some(0)] {
+            let mut daemon = PagedDaemon::new(200, events.clone(), 100);
+            daemon.cursor_override = Some(cursor);
+            let mut w = BeldexWatcher::new(daemon, "gwTestGateway", 1);
+            assert!(w.advance().is_err(), "next_height {cursor:?} is a bad response");
+            assert_eq!(w.finalized_up_to(), 0);
+        }
+    }
+
+    #[test]
+    fn a_long_backlog_commits_only_the_heights_it_covered() {
+        // 10_000 pages of one block each cannot reach a frontier at 20_000.
+        let memo = BridgeMemo { chain_id: 1, evm_addr: [0x11; 20] }.encode();
+        let daemon = PagedDaemon::new(
+            20_000,
+            vec![deposit_event(15_000, [0x03; 32], 700, Some(memo))],
+            1,
+        );
+        let mut w = BeldexWatcher::new(daemon, "gwTestGateway", 1);
+        assert!(w.advance().unwrap().is_empty());
+        assert_eq!(w.finalized_up_to(), 10_000, "stops where the pages stopped");
+        let finals = w.advance().unwrap();
+        assert_eq!(finals.len(), 1, "the deposit past the first poll's reach is still found");
+        assert_eq!(w.finalized_up_to(), 20_000);
+    }
+
+    #[test]
+    fn an_undecodable_deposit_fails_the_poll() {
+        for bad in [
+            json!({ "type": "deposit", "txid": "zz", "height": 10, "amount": 1, "out_index": 0 }),
+            json!({ "type": "deposit", "txid": to_hex(&[1; 32]), "height": 10, "amount": 1 }),
+            json!({ "type": "deposit", "txid": to_hex(&[1; 32]), "height": 10, "amount": 1,
+                    "out_index": u64::from(u32::MAX) + 1 }),
+        ] {
+            let mut w = BeldexWatcher::new(PagedDaemon::new(200, vec![bad], 1000), "gwTestGateway", 1);
+            assert!(w.advance().is_err());
+            assert_eq!(w.finalized_up_to(), 0);
+        }
+        assert!(parse_deposit_events(&json!({})).is_err(), "a page without events");
     }
 
     #[test]
