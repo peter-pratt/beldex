@@ -29,8 +29,8 @@
 //! Verified against `cggmp21 =0.6.3`:
 //!   * `aux_info_gen(eid, i, n, primes)` → `AuxInfoGenerationBuilder`, driven by the
 //!     `AuxOnlyMsg<Sha256, SecurityLevel128>` protocol message; `.start(rng, party)`
-//!     yields `AuxInfo<L>`. `.enforce_reliable_broadcast(false)` matches the keygen
-//!     driver (the `round_based` sim has no reliable-broadcast echo round).
+//!     yields `AuxInfo<L>`. `.enforce_reliable_broadcast(true)` matches the live
+//!     drivers; the echo round is an ordinary broadcast, so the sim runs it too.
 //!   * `KeyShare::from_parts((IncompleteKeyShare, AuxInfo))` → complete `KeyShare`.
 
 use cggmp21::key_refresh::{AuxOnlyMsg, PregeneratedPrimes};
@@ -72,7 +72,7 @@ fn real_dkg_aux_info_sign_recovers_wbdx_address() {
         let mut rng = rand::rngs::OsRng;
         cggmp21::keygen::<Secp256k1>(eid, i, n)
             .set_threshold(t)
-            .enforce_reliable_broadcast(false)
+            .enforce_reliable_broadcast(true)
             .start(&mut rng, party)
             .await
     })
@@ -95,7 +95,7 @@ fn real_dkg_aux_info_sign_recovers_wbdx_address() {
         let mut rng = rand::rngs::OsRng;
         let primes = PregeneratedPrimes::generate(&mut rng);
         cggmp21::aux_info_gen(eid, i, n, primes)
-            .enforce_reliable_broadcast(false)
+            .enforce_reliable_broadcast(true)
             .start(&mut rng, party)
             .await
     })

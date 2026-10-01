@@ -60,7 +60,7 @@ fn real_cggmp21_dkg_no_dealer_agrees_on_wbdx_address() {
             let mut rng = rand::rngs::OsRng;
             cggmp21::keygen::<Secp256k1>(eid, i, n)
                 .set_threshold(t)
-                .enforce_reliable_broadcast(false)
+                .enforce_reliable_broadcast(true)
                 .start(&mut rng, party)
                 .await
         })

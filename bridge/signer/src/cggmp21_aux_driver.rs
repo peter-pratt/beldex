@@ -172,7 +172,9 @@ pub fn run_cggmp21_aux_over_transport<T: SessionTransport>(
         let primes = PregeneratedPrimes::<SecurityLevel128>::generate(&mut rng);
         let mut state = wrap_protocol(|party| async move {
             cggmp21::aux_info_gen(eid, self_index, n, primes)
-                .enforce_reliable_broadcast(false)
+                // The mesh's broadcast is a send to each peer, so a sender could hand
+                // peers different round-1 commitments. The extra echo round catches it.
+                .enforce_reliable_broadcast(true)
                 .start(&mut rng, party)
                 .await
         });
@@ -388,7 +390,7 @@ mod tests {
             let mut rng = rand::rngs::OsRng;
             cggmp21::keygen::<Secp256k1>(keygen_eid, i, n)
                 .set_threshold(t)
-                .enforce_reliable_broadcast(false)
+                .enforce_reliable_broadcast(true)
                 .start(&mut rng, party)
                 .await
         })
