@@ -132,6 +132,17 @@ pub struct ReleaseTxView {
     pub fee: u64,
     /// `gateway_input_message` recomputed from **this** blob (R5's ground truth).
     pub hash_to_sign: [u8; 32],
+    /// The release ref the blob itself carries, which is what consensus records as
+    /// discharged. `None` unless the blob carries exactly one well-formed version-0 ref.
+    pub release_ref: Option<ReleaseRef>,
+}
+
+/// The burn a withdrawal discharges, as carried in its `tx_extra_gateway_release_ref`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseRef {
+    pub chain_id: u64,
+    pub evm_txid: [u8; 32],
+    pub log_index: u32,
 }
 
 /// The built release the leader hands to the codec (the `gateway_create_transfer` result).
@@ -181,9 +192,7 @@ where
         use ProposalVerdict::{Abstain, Accept, Reject};
         let reject = Reject(NackReason::PayloadMismatch);
 
-        // R1 / R6: the proposal names exactly the burn this session is for (provenance), and
-        // — because the raw tuple is what the L1 replay guard records — exactly the burn the
-        // signature will discharge (replay binding).
+        // R1: the proposal names exactly the burn this session is for (provenance).
         if p.chain_id != ev.chain.0 || p.evm_txid != ev.evm_txid || p.log_index != ev.log_index {
             return reject;
         }
@@ -202,6 +211,14 @@ where
 
         // R5: the proposed hash is the gateway_input_message of *this* blob.
         if view.hash_to_sign != p.hash_to_sign {
+            return reject;
+        }
+        // R6: the blob discharges this burn. The leader's metadata above is only a claim;
+        // the replay guard records the ref inside the signed tx. A blob paying this burn's
+        // recipient while carrying another burn's ref would leave this burn open to a second
+        // payout and close the other one unpaid.
+        let expected = ReleaseRef { chain_id: ev.chain.0, evm_txid: ev.evm_txid, log_index: ev.log_index };
+        if view.release_ref != Some(expected) {
             return reject;
         }
         // R2: pays the burn's recipient.
@@ -362,9 +379,16 @@ mod tests {
     // ---- a toy withdrawal format the mock daemon builds + inspects ----------
     //
     // blob = [src_len u8][src][dest_len u8][dest][amount u128 le][fee u64 le]
+    //        [ref_count u8]([chain_id u64 le][evm_txid 32][log_index u32 le])*
     // hash_to_sign = sha256(blob)  (stands in for gateway_input_message)
 
+    /// A blob carrying the ref of [`burn`], which every toy withdrawal is for.
     fn toy_blob(src: &str, dest: &[u8], amount: u128, fee: u64) -> Vec<u8> {
+        let r = ReleaseRef { chain_id: 1, evm_txid: [0x77; 32], log_index: 0 };
+        toy_blob_with_refs(src, dest, amount, fee, &[r])
+    }
+
+    fn toy_blob_with_refs(src: &str, dest: &[u8], amount: u128, fee: u64, refs: &[ReleaseRef]) -> Vec<u8> {
         let mut b = Vec::new();
         b.push(src.len() as u8);
         b.extend_from_slice(src.as_bytes());
@@ -372,6 +396,12 @@ mod tests {
         b.extend_from_slice(dest);
         b.extend_from_slice(&amount.to_le_bytes());
         b.extend_from_slice(&fee.to_le_bytes());
+        b.push(refs.len() as u8);
+        for r in refs {
+            b.extend_from_slice(&r.chain_id.to_le_bytes());
+            b.extend_from_slice(&r.evm_txid);
+            b.extend_from_slice(&r.log_index.to_le_bytes());
+        }
         b
     }
 
@@ -390,12 +420,27 @@ mod tests {
         let amount = u128::from_le_bytes(blob.get(at..at + 16).ok_or("truncated")?.try_into().unwrap());
         at += 16;
         let fee = u64::from_le_bytes(blob.get(at..at + 8).ok_or("truncated")?.try_into().unwrap());
+        at += 8;
+        let ref_count = *blob.get(at).ok_or("truncated")? as usize;
+        at += 1;
+        let mut refs = Vec::new();
+        for _ in 0..ref_count {
+            let r = blob.get(at..at + 44).ok_or("truncated")?;
+            refs.push(ReleaseRef {
+                chain_id: u64::from_le_bytes(r[..8].try_into().unwrap()),
+                evm_txid: r[8..40].try_into().unwrap(),
+                log_index: u32::from_le_bytes(r[40..].try_into().unwrap()),
+            });
+            at += 44;
+        }
         Ok(ReleaseTxView {
             source_gateway: String::from_utf8_lossy(src).into_owned(),
             dest: dest.to_vec(),
             amount,
             fee,
             hash_to_sign: sha256(blob),
+            // As the live inspector reports it: exactly one ref, or none at all.
+            release_ref: if refs.len() == 1 { Some(refs[0]) } else { None },
         })
     }
 
@@ -403,7 +448,8 @@ mod tests {
     const FEE: u64 = 25;
 
     fn toy_build(ev: &ReleaseEvent) -> Result<BuiltRelease, BuildError> {
-        let blob = toy_blob(GW, &ev.beldex_recipient, ev.amount - u128::from(FEE), FEE);
+        let r = ReleaseRef { chain_id: ev.chain.0, evm_txid: ev.evm_txid, log_index: ev.log_index };
+        let blob = toy_blob_with_refs(GW, &ev.beldex_recipient, ev.amount - u128::from(FEE), FEE, &[r]);
         let hash = sha256(&blob);
         Ok(BuiltRelease { unsigned_tx_blob: blob, hash_to_sign: hash, fee: FEE, tx_key: [0xAB; 32] })
     }
@@ -539,6 +585,27 @@ mod tests {
             let mut p = proposal_for(&ev);
             p.unsigned_tx_blob = toy_blob(GW, b"attacker", ev.amount - u128::from(FEE), FEE);
             assert_eq!(policy().verify(&duty, &p.encode()), reject, "R5");
+        }
+        // R6: metadata names this burn, but the blob carries another ref, none, or two.
+        // Only the blob's ref is recorded on chain, so each would leave this burn open.
+        let this = ReleaseRef { chain_id: 1, evm_txid: [0x77; 32], log_index: 0 };
+        let other_burn = ReleaseRef { evm_txid: [0x99; 32], ..this };
+        let other_log = ReleaseRef { log_index: 7, ..this };
+        let other_chain = ReleaseRef { chain_id: 2, ..this };
+        for refs in [
+            vec![other_burn],
+            vec![other_log],
+            vec![other_chain],
+            vec![],
+            vec![this, this],
+            vec![this, other_burn],
+        ] {
+            let blob =
+                toy_blob_with_refs(GW, &ev.beldex_recipient, ev.amount - u128::from(FEE), FEE, &refs);
+            let mut p = proposal_for(&ev);
+            p.hash_to_sign = sha256(&blob);
+            p.unsigned_tx_blob = blob;
+            assert_eq!(policy().verify(&duty, &p.encode()), reject, "R6 refs {refs:?}");
         }
         // R4: over the per-tx cap (as verify; the actionability screen catches it earlier).
         {

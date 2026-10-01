@@ -4091,11 +4091,15 @@ namespace cryptonote::rpc {
     cmd.response["hash_to_sign"]           = tools::type_to_hex(sum.hash_to_sign);
     cmd.response["to_wallet"]              = sum.to_wallet;
 
-    // Any carried release replay-guard ref (HF23) — the R1/R6 fields.
+    // Any carried release replay-guard ref (HF23) — the R1/R6 fields. The count lets a
+    // signer insist on exactly one: the ref consensus records is the one in the blob, not
+    // the one the leader names alongside it.
     {
       const auto refs = cryptonote::extract_gateway_release_refs(tx);
+      cmd.response["release_ref_count"] = refs.size();
       if (!refs.empty())
         cmd.response["release_ref"] = json{
+            {"version", refs.front().version},
             {"chain_id", refs.front().chain_id},
             {"evm_txid", tools::type_to_hex(refs.front().evm_txid)},
             {"log_index", refs.front().log_index},

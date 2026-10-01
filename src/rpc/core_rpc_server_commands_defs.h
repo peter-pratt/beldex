@@ -2825,7 +2825,8 @@ namespace cryptonote::rpc {
   ///
   /// Output:
   /// - `source_gateway_id`, `total_debit`, `fee`, `hash_to_sign`, `to_wallet`.
-  /// - `release_ref` -- {chain_id, evm_txid, log_index} if carried.
+  /// - `release_ref_count` -- number of release refs the blob carries.
+  /// - `release_ref` -- {version, chain_id, evm_txid, log_index} of the first, if any.
   /// - `dest_all_outputs_match` -- every stealth output pays `address` (iff tx_key+address given).
   /// - `dest_amount` -- Σ decoded amounts paid to `address`.
   /// - `status` -- Generic RPC error code. "OK" is the success value.

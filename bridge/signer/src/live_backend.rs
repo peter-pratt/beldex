@@ -201,7 +201,88 @@ impl HttpGatewayRpc {
         let fee = get_u64("fee").ok_or("decode: missing fee")?;
         let hash_to_sign =
             hex32(&get_str("hash_to_sign").ok_or("decode: missing hash_to_sign")?)?;
-        Ok(crate::release_policy::ReleaseTxView { source_gateway, dest, amount, fee, hash_to_sign })
+        let release_ref = decoded_release_ref(&r)?;
+        Ok(crate::release_policy::ReleaseTxView {
+            source_gateway,
+            dest,
+            amount,
+            fee,
+            hash_to_sign,
+            release_ref,
+        })
+    }
+}
+
+/// The release ref a `gateway_decode_withdrawal` answer says the blob carries.
+///
+/// `Ok(None)` when the blob carries no ref, several, or one this signer cannot read: the
+/// proposal is then rejected, since only a single version-0 ref is what consensus records.
+/// A daemon that does not report `release_ref_count` predates that field, and is an error so
+/// the member abstains rather than trusting a view it cannot complete.
+#[cfg(feature = "autonomy")]
+fn decoded_release_ref(
+    r: &serde_json::Value,
+) -> Result<Option<crate::release_policy::ReleaseRef>, String> {
+    let count = r
+        .get("release_ref_count")
+        .and_then(|v| v.as_u64())
+        .ok_or("decode: missing release_ref_count (daemon too old to verify the release ref?)")?;
+    if count != 1 {
+        return Ok(None);
+    }
+    let Some(rf) = r.get("release_ref") else { return Ok(None) };
+    let field = |k: &str| rf.get(k).and_then(|v| v.as_u64());
+    let parsed = (|| {
+        if field("version")? != 0 {
+            return None;
+        }
+        Some(crate::release_policy::ReleaseRef {
+            chain_id: field("chain_id")?,
+            evm_txid: hex32(rf.get("evm_txid")?.as_str()?).ok()?,
+            log_index: u32::try_from(field("log_index")?).ok()?,
+        })
+    })();
+    Ok(parsed)
+}
+
+#[cfg(all(test, feature = "autonomy"))]
+mod release_ref_tests {
+    use super::decoded_release_ref;
+    use crate::release_policy::ReleaseRef;
+    use serde_json::json;
+
+    #[test]
+    fn only_a_single_well_formed_ref_is_reported() {
+        let txid = "77".repeat(32);
+        let good = json!({ "release_ref_count": 1,
+            "release_ref": { "version": 0, "chain_id": 1, "evm_txid": txid, "log_index": 3 } });
+        assert_eq!(
+            decoded_release_ref(&good).unwrap(),
+            Some(ReleaseRef { chain_id: 1, evm_txid: [0x77; 32], log_index: 3 })
+        );
+
+        for none in [
+            json!({ "release_ref_count": 0 }),
+            json!({ "release_ref_count": 2,
+                "release_ref": { "version": 0, "chain_id": 1, "evm_txid": txid, "log_index": 3 } }),
+            json!({ "release_ref_count": 1 }),
+            json!({ "release_ref_count": 1,
+                "release_ref": { "version": 1, "chain_id": 1, "evm_txid": txid, "log_index": 3 } }),
+            json!({ "release_ref_count": 1,
+                "release_ref": { "chain_id": 1, "evm_txid": txid, "log_index": 3 } }),
+            json!({ "release_ref_count": 1,
+                "release_ref": { "version": 0, "chain_id": 1, "evm_txid": "77", "log_index": 3 } }),
+            json!({ "release_ref_count": 1,
+                "release_ref": { "version": 0, "chain_id": 1, "evm_txid": txid,
+                                 "log_index": u64::from(u32::MAX) + 1 } }),
+        ] {
+            assert_eq!(decoded_release_ref(&none).unwrap(), None, "{none}");
+        }
+
+        // An older daemon that does not report the count: abstain, do not guess.
+        let old = json!({
+            "release_ref": { "version": 0, "chain_id": 1, "evm_txid": txid, "log_index": 3 } });
+        assert!(decoded_release_ref(&old).is_err());
     }
 }
 
