@@ -46,6 +46,13 @@ impl OmqCommitteeClient {
     /// Call `bridge.committee` and return the parsed committee for `height`
     /// (the epoch containing it; `None` = current tip).
     pub fn fetch_committee(&self, height: Option<u64>) -> Result<CommitteeView, CommitteeError> {
+        CommitteeView::from_bridge_committee_json(&self.fetch_committee_json(height)?)
+    }
+
+    /// The raw `bridge.committee` reply behind [`Self::fetch_committee`]. `dkg` keeps it
+    /// beside the shares it writes, so the committee that holds a key can still be read
+    /// after consensus has selected a different one.
+    pub fn fetch_committee_json(&self, height: Option<u64>) -> Result<String, CommitteeError> {
         let tx = |e: String| CommitteeError::Transport(e);
 
         let sock = self
@@ -95,7 +102,7 @@ impl OmqCommitteeClient {
 
         let data = reply.get(3).ok_or_else(|| tx("empty reply data".into()))?;
         let json = std::str::from_utf8(data).map_err(|_| tx("reply not utf-8".into()))?;
-        CommitteeView::from_bridge_committee_json(json)
+        Ok(json.to_string())
     }
 
     /// Publish a completed, committee-signed **mint payload** to `bridge.mint_payload`, which
