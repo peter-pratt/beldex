@@ -623,6 +623,22 @@ namespace
     info->bridge_seat.serving_key_epoch       = serving;
     cur.master_nodes_infos[pk] = info;
   }
+
+  // A seat asks to leave through the real, MN-signed unbond path.
+  bool run_unbond(master_node_list::state_t& cur, const crypto::public_key& pk,
+                  const crypto::secret_key& sk, uint64_t block_height)
+  {
+    tx_extra_bridge_unbond op{};
+    op.master_node_pubkey = pk;
+    crypto::generate_signature(master_nodes::bridge_unbond_message(op), pk, sk, op.signature);
+    transaction tx{};
+    tx.type = txtype::bridge_registration;
+    add_bridge_unbond_to_tx_extra(tx.extra, op);
+    block blk{};
+    blk.major_version = hf::hf23_bridge;
+    blk.miner_tx.vin.push_back(txin_gen{block_height});
+    return cur.process_bridge_unbond_tx(NET_FC, blk, tx);
+  }
 } // namespace
 
 TEST(GatewayBridgeSlash, consensus_action_forfeits_bond_and_survives_finalize)
@@ -740,6 +756,45 @@ TEST(GatewayBridgeSlash, forfeit_frees_seat_for_queue_head)
   EXPECT_EQ(count_seated(cur), CAP); // still exactly CAP seats occupied
 }
 
+// A voluntary leaver gives its slot to the queue head at once, and is never a committee
+// candidate again: the next committee generates the next key, and a member that asked to
+// leave must hold no share of it. It keeps serving the key it already holds — from that
+// key's saved committee, which needs no slot — until the key is retired.
+TEST(GatewayBridgeSlash, exiting_seat_frees_its_slot_and_is_not_a_candidate)
+{
+  const size_t CAP = cryptonote::BRIDGE_SEAT_CAP;
+  master_node_list::state_t cur(nullptr);
+  cur.height = 6000;
+
+  std::vector<crypto::public_key> seats;
+  for (size_t i = 0; i < CAP; ++i)
+  {
+    crypto::public_key pk; crypto::secret_key sk; crypto::generate_keys(pk, sk);
+    seat_member(cur, pk, crypto::ed25519_public_key::null(), 100 + i, /*seated=*/true);
+    seats.push_back(pk);
+  }
+  crypto::public_key queued; { crypto::secret_key sk; crypto::generate_keys(queued, sk); }
+  seat_member(cur, queued, crypto::ed25519_public_key::null(), 100 + CAP, /*seated=*/false);
+
+  // seats[0] asks to leave: the state process_bridge_unbond_tx leaves it in — still
+  // `seated` (serving its key), with an unbond requested.
+  {
+    auto info = std::make_shared<master_node_info>(*cur.master_nodes_infos.at(seats[0]));
+    info->bridge_seat.requested_unbond_height = 6000;
+    info->bridge_seat.bond_unlock_height      = 6000 + cryptonote::bridge_bond_unlock_blocks(NET_FC);
+    cur.master_nodes_infos[seats[0]] = info;
+  }
+  const auto& leaver = cur.master_nodes_infos.at(seats[0])->bridge_seat;
+  EXPECT_TRUE(leaver.is_exiting_seat()) << "it still serves the key it holds";
+  EXPECT_FALSE(leaver.is_active_seat()) << "but it is no longer a committee candidate";
+
+  cur.refresh_bridge_seats();
+  EXPECT_TRUE(cur.master_nodes_infos.at(queued)->bridge_seat.seated)
+      << "the queue head takes the leaver's slot at once, not when its key retires";
+  EXPECT_TRUE(cur.master_nodes_infos.at(seats[0])->bridge_seat.registered)
+      << "the leaver's bond stays locked";
+}
+
 // --------------------------------------------------------------------------
 // H.6.3 — the rotation gate as a consensus action on state_t: rotation-acks advance
 // observed_key_epoch; finalize_bridge_unbonds withholds a bond until every chain in the
@@ -826,6 +881,142 @@ TEST(GatewayBridgeRotation, gate_grandfathers_chain_added_after_unbond)
   cur.finalize_bridge_unbonds(6000);
   EXPECT_FALSE(cur.master_nodes_infos.at(c.mn[5])->bridge_seat.registered)
       << "a chain added after unbond must not gate the seat";
+}
+
+// A departing seat's bond waits for the GATEWAY to be handed over as well as the wBDX
+// chains — a failed gateway hand-over leaves its Pgw share live — and for TWO hand-overs
+// on each side: it may hold a share of the next key, if it asked to leave after its
+// committee's DKG but before the hand-over to that key.
+TEST(GatewayBridgeRotation, bond_waits_for_two_hand_overs_on_every_side_including_the_gateway)
+{
+  const size_t N = cryptonote::bridge_committee_size(NET_FC); // 6
+  auto c = make_committee(N);
+  master_node_list::state_t cur(nullptr);
+  cur.height = 5000;
+  for (size_t i = 0; i < N; ++i) seat_member(cur, c.mn[i], c.ed_pub[i], 100 + i);
+
+  const crypto::public_key gw = rand_pubkey();
+  auto gateway_tx = [&](gateway_descriptor_op_type type, const crypto::public_key& owner) {
+    tx_extra_gateway_descriptor_operation op{};
+    op.op_type               = type;
+    op.address_id            = gw;
+    op.descriptor.version    = 1;
+    op.descriptor.owner_key  = owner;
+    op.descriptor.flags      = GATEWAY_FLAG_BRIDGE_RESERVE;
+    transaction tx{};
+    add_gateway_descriptor_operation_to_tx_extra(tx.extra, op);
+    return tx;
+  };
+  const crypto::public_key key_a = rand_pubkey(), key_b = rand_pubkey(), key_c = rand_pubkey();
+
+  // The bridge gateway registered under key A: tracked, nothing handed over yet.
+  EXPECT_FALSE(cur.process_bridge_gateway_owner_tx(gateway_tx(gateway_descriptor_op_type::register_address, key_a)));
+  EXPECT_EQ(observed_epoch(cur, BRIDGE_GATEWAY_CHAIN_ID), 0u);
+  ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 1, {0, 1, 2, 3}, 3), 5000));
+
+  // A seat asks to leave through the real unbond path.
+  crypto::public_key leaver; crypto::secret_key leaver_sk;
+  crypto::generate_keys(leaver, leaver_sk);
+  seat_member(cur, leaver, crypto::ed25519_public_key::null(), 200);
+  ASSERT_TRUE(run_unbond(cur, leaver, leaver_sk, 5000));
+  const auto unlock = cur.master_nodes_infos.at(leaver)->bridge_seat.bond_unlock_height;
+  auto released = [&] {
+    cur.finalize_bridge_unbonds(unlock);
+    return !cur.master_nodes_infos.at(leaver)->bridge_seat.registered;
+  };
+
+  // wBDX hands over twice, but the gateway hand-over failed: its Pgw share is still live.
+  ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 2, {0, 1, 2, 3}, 3), 5001));
+  ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 3, {0, 1, 2, 3}, 3), 5002));
+  EXPECT_FALSE(released()) << "the gateway was never handed over — the bond must wait";
+
+  // An update that keeps the owner is not a hand-over.
+  EXPECT_FALSE(cur.process_bridge_gateway_owner_tx(gateway_tx(gateway_descriptor_op_type::update_address, key_a)));
+  EXPECT_FALSE(released());
+
+  // One gateway hand-over (A -> B): the seat may still hold a share of B.
+  EXPECT_TRUE(cur.process_bridge_gateway_owner_tx(gateway_tx(gateway_descriptor_op_type::update_address, key_b)));
+  EXPECT_EQ(observed_epoch(cur, BRIDGE_GATEWAY_CHAIN_ID), 1u);
+  EXPECT_FALSE(released()) << "one hand-over can land on a key the seat still holds";
+
+  // The second (B -> C) lands on a key generated without it.
+  EXPECT_TRUE(cur.process_bridge_gateway_owner_tx(gateway_tx(gateway_descriptor_op_type::update_address, key_c)));
+  EXPECT_TRUE(released()) << "two hand-overs on every side: the bond is released";
+}
+
+// With only ONE wBDX hand-over after the request the bond still waits — every side needs
+// its second hand-over. (No bridge gateway is registered here, so only the wBDX side gates.)
+TEST(GatewayBridgeRotation, one_wbdx_hand_over_is_not_enough)
+{
+  const size_t N = cryptonote::bridge_committee_size(NET_FC);
+  auto c = make_committee(N);
+  master_node_list::state_t cur(nullptr);
+  cur.height = 5000;
+  for (size_t i = 0; i < N; ++i) seat_member(cur, c.mn[i], c.ed_pub[i], 100 + i);
+  ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 1, {0, 1, 2, 3}, 3), 5000));
+
+  crypto::public_key leaver; crypto::secret_key leaver_sk;
+  crypto::generate_keys(leaver, leaver_sk);
+  seat_member(cur, leaver, crypto::ed25519_public_key::null(), 200);
+  ASSERT_TRUE(run_unbond(cur, leaver, leaver_sk, 5000));
+  const auto unlock = cur.master_nodes_infos.at(leaver)->bridge_seat.bond_unlock_height;
+
+  // No bridge gateway registered: nothing on that side to wait for.
+  ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 2, {0, 1, 2, 3}, 3), 5001));
+  cur.finalize_bridge_unbonds(unlock);
+  EXPECT_TRUE(cur.master_nodes_infos.at(leaver)->bridge_seat.registered) << "one hand-over is not enough";
+
+  ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 3, {0, 1, 2, 3}, 3), 5002));
+  cur.finalize_bridge_unbonds(unlock);
+  EXPECT_FALSE(cur.master_nodes_infos.at(leaver)->bridge_seat.registered) << "the second releases it";
+}
+
+// Before any wBDX rotation is acknowledged, a seated member's bond would have no wBDX chain to
+// wait on — so its leave request is refused until one has, rather than recorded unguarded.
+TEST(GatewayBridgeRotation, seated_leave_waits_for_a_first_acknowledged_rotation)
+{
+  const size_t N = cryptonote::bridge_committee_size(NET_FC);
+  auto c = make_committee(N);
+  master_node_list::state_t cur(nullptr);
+  cur.height = 5000;
+  for (size_t i = 0; i < N; ++i) seat_member(cur, c.mn[i], c.ed_pub[i], 100 + i);
+
+  crypto::public_key leaver; crypto::secret_key leaver_sk;
+  crypto::generate_keys(leaver, leaver_sk);
+  seat_member(cur, leaver, crypto::ed25519_public_key::null(), 200);
+
+  EXPECT_FALSE(run_unbond(cur, leaver, leaver_sk, 5000)) << "nothing acknowledged yet: refused";
+  EXPECT_EQ(cur.master_nodes_infos.at(leaver)->bridge_seat.requested_unbond_height, 0u)
+      << "and not recorded — the seat is untouched";
+
+  ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 1, {0, 1, 2, 3}, 3), 5000));
+  EXPECT_TRUE(run_unbond(cur, leaver, leaver_sk, 5001)) << "accepted once a rotation is acknowledged";
+}
+
+// A seat still in the QUEUE was never seated, so never selected and never given a share of
+// any key. Its bond waits only for the unbonding window — no hand-over can concern it.
+TEST(GatewayBridgeRotation, queued_seat_leaves_on_the_window_alone)
+{
+  const size_t N = cryptonote::bridge_committee_size(NET_FC);
+  auto c = make_committee(N);
+  master_node_list::state_t cur(nullptr);
+  cur.height = 5000;
+  for (size_t i = 0; i < N; ++i) seat_member(cur, c.mn[i], c.ed_pub[i], 100 + i);
+  ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 1, {0, 1, 2, 3}, 3), 5000));
+
+  crypto::public_key queued; crypto::secret_key queued_sk;
+  crypto::generate_keys(queued, queued_sk);
+  seat_member(cur, queued, crypto::ed25519_public_key::null(), 200, /*seated=*/false);
+  ASSERT_TRUE(run_unbond(cur, queued, queued_sk, 5000));
+  const auto& bs = cur.master_nodes_infos.at(queued)->bridge_seat;
+  EXPECT_TRUE(bs.serving_key_epoch.empty()) << "no key to hand over, so no baseline";
+  const auto unlock = bs.bond_unlock_height;
+
+  cur.finalize_bridge_unbonds(unlock - 1);
+  EXPECT_TRUE(cur.master_nodes_infos.at(queued)->bridge_seat.registered) << "still inside the window";
+  cur.finalize_bridge_unbonds(unlock);
+  EXPECT_FALSE(cur.master_nodes_infos.at(queued)->bridge_seat.registered)
+      << "released when the window closes, with no rotation at all";
 }
 
 // --------------------------------------------------------------------------

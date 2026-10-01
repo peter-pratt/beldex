@@ -2055,9 +2055,12 @@ namespace master_nodes
             continue; // not an epoch boundary: leave bridge quorum unset (nullptr)
 
           // Candidate seats: active MNs that opted into the bridge set and are
-          // seated (not merely queued). An EXITING seat is still a candidate: it
-          // holds the only share that can sign under the current key, so it must
-          // stay selectable until the rotation that retires that key completes.
+          // seated (not merely queued). An EXITING seat is NOT a candidate: this
+          // committee runs the DKG for the next key, and a member that has asked
+          // to leave must not hold a share of it. It does not need to be selected to
+          // keep signing under the key it already holds — its signer signs from that
+          // key's own committee, saved beside the share — until the rotation that
+          // retires that key completes.
           // sort_and_filter yields a deterministic (pubkey-sorted) order so every
           // node agrees.
           std::vector<pubkey_and_mninfo> seats =
@@ -2299,13 +2302,15 @@ namespace master_nodes
     // after the seat unbonded is simply not in the snapshot, so it is never required. A
     // chain no longer "registered" (implicit model: no longer present in `observed`) is
     // skipped, so a retired chain never strands an honest bond. An empty snapshot (taken
-    // before any rotation was observed) is vacuously satisfied.
+    // before any rotation was observed) is vacuously satisfied. The GATEWAY is never
+    // skipped: it enters `observed` only at its first hand-over, so its absence means
+    // "not handed over yet" — the very case the bond must keep waiting on.
     bool rotation_completed_for(const std::vector<bridge_chain_epoch> &observed,
                                 const std::vector<bridge_chain_epoch> &serving)
     {
       for (const auto &b : serving)
       {
-        if (!chain_epoch_present(observed, b.chain_id))
+        if (b.chain_id != cryptonote::BRIDGE_GATEWAY_CHAIN_ID && !chain_epoch_present(observed, b.chain_id))
           continue; // no longer registered (retired) → does not gate
         if (chain_epoch_get(observed, b.chain_id) <= b.key_epoch)
           return false; // this chain has not yet rotated past the seat's baseline
@@ -2354,34 +2359,57 @@ namespace master_nodes
       return false;
     }
 
-    // Enter the unbonding state: the seat is no longer promoted or re-seated
-    // (refresh_bridge_seats skips exiting seats when filling slots), but it keeps the
-    // seat it already holds and stays committee-eligible — see the note below. The bond
-    // stays locked, and the operator slashable, until bond_unlock_height. The ≥30-day
-    // window spans many epochs, so the operator remains accountable for every duty it
-    // performs while it is still serving.
+    // A SEATED member may hold a share of the live keys, and its bond waits for every wBDX
+    // chain in `observed_key_epoch` to hand over twice. Before the first rotation has been
+    // acknowledged that list names no chain, so the bond would wait on no wBDX hand-over at
+    // all. Refused, not recorded: the operator resubmits once an acknowledgement has landed.
+    // (A queued seat holds no key and is not affected.)
+    if (curinfo.bridge_seat.seated &&
+        std::none_of(observed_key_epoch.begin(), observed_key_epoch.end(), [](const bridge_chain_epoch &e) {
+          return e.chain_id != cryptonote::BRIDGE_GATEWAY_CHAIN_ID;
+        }))
+    {
+      LOG_PRINT_L1("Bridge unbond TX: no wBDX rotation acknowledged yet; master node "
+                   << op.master_node_pubkey << " cannot leave until one has");
+      return false;
+    }
+
+    // Enter the unbonding state: the seat is no longer promoted or re-seated, it stops
+    // being committee-eligible, and its slot goes to the queue head at once
+    // (refresh_bridge_seats skips exiting seats when filling slots) — see the note below.
+    // The bond stays locked, and the operator slashable, until bond_unlock_height. The
+    // ≥30-day window spans many epochs, so the operator remains accountable for every
+    // duty it performs while it is still serving.
     auto &info = duplicate_info(iter->second);
     info.bridge_seat.requested_unbond_height = block_height;
     info.bridge_seat.bond_unlock_height      = block_height + cryptonote::bridge_bond_unlock_blocks(nettype);
-    // NOT unseated here. The seat keeps serving until its key is retired: its share is
-    // the only thing that can sign under the current key, so dropping it now would take
-    // the signers away while leaving the key they hold live — and with enough seats
-    // leaving at once, nothing could reach threshold, not even to authorize the
-    // rotation that would fix it. `finalize_bridge_unbonds` unseats it once the key
-    // has moved past its baseline, which is the same moment the bond is released.
+    // NOT unseated here. The seat keeps serving the key it already holds until that key
+    // is retired: its share is the only thing that can sign under it, so dropping it now
+    // would take the signers away while leaving the key they hold live — and with enough
+    // seats leaving at once, nothing could reach threshold, not even to authorize the
+    // rotation that would fix it. It serves from that key's saved committee, so it needs
+    // no slot and is never selected for the next key. `finalize_bridge_unbonds` unseats it
+    // once the key has moved past its baseline.
     // H.6.3: snapshot the per-chain baseline — where every EVM chain's wBDX key epoch
     // stood right now. The bond is not released until every chain here has rotated
     // strictly past its baseline (proof the departure's hand-off landed), gated in
     // finalize_bridge_unbonds. bridge_seat version 1 marks the presence of this field.
     info.bridge_seat.version           = 1;
+    // A seat still in the QUEUE has never been seated — the FIFO only ever moves seats
+    // up, never back — so it was never selected and holds no share of any key. It has no
+    // hand-over to wait for: an empty baseline, and only the unbonding window gates it.
+    if (!info.bridge_seat.seated)
+      return true;
     info.bridge_seat.serving_key_epoch = observed_key_epoch;
     // The seat also holds a share of the NATIVE gateway owner key, and that share keeps
     // signing until the gateway is re-pointed. Releasing the bond once only the wBDX
     // chains have rotated would hand the stake back while the gateway share is still
     // live — the very thing the bond is there to prevent. Ensure the baseline carries a
     // gateway entry even when none has been observed yet, or `rotation_completed_for`
-    // would treat the gateway as "not registered" and skip it entirely.
-    if (!chain_epoch_present(info.bridge_seat.serving_key_epoch,
+    // would treat the gateway as "not registered" and skip it entirely. (With no bridge
+    // gateway registered at all there is no gateway key to hold a share of.)
+    if (!bridge_gateway_owners.empty() &&
+        !chain_epoch_present(info.bridge_seat.serving_key_epoch,
                              cryptonote::BRIDGE_GATEWAY_CHAIN_ID))
     {
       bridge_chain_epoch gw{};
@@ -2389,6 +2417,13 @@ namespace master_nodes
       gw.key_epoch = chain_epoch_get(observed_key_epoch, cryptonote::BRIDGE_GATEWAY_CHAIN_ID);
       info.bridge_seat.serving_key_epoch.push_back(gw);
     }
+    // TWO hand-overs past where each chain stands now, not one. The seat may hold a share
+    // of the key the committee it was last selected into generated — which, if it asked to
+    // leave after that DKG but before the hand-over TO that key, is the NEXT key, not the
+    // live one. The first hand-over can therefore move the bridge onto a key it still holds;
+    // the second moves it onto one generated without it, since it is never selected again.
+    for (auto &e : info.bridge_seat.serving_key_epoch)
+      ++e.key_epoch;
     return true;
   }
 
@@ -2539,6 +2574,53 @@ namespace master_nodes
     return true;
   }
 
+  bool master_node_list::state_t::process_bridge_gateway_owner_tx(const cryptonote::transaction &tx)
+  {
+    // The gateway's side of a committee rotation: its owner key handed to the incoming
+    // committee's Pgw (the hand-over update), or taken by governance (a re-point). Consensus
+    // applies either one itself, so unlike a wBDX chain it needs no committee's word for it —
+    // but the op carries only the NEW descriptor, so the owner last seen is kept to tell a
+    // real hand-over from an update that leaves the owner as it was.
+    const auto owner_hash = [](const cryptonote::gateway_owner_key_v &key) {
+      std::string buf(1, static_cast<char>(key.index()));
+      std::visit([&buf](const auto &k) { buf.append(reinterpret_cast<const char *>(&k), sizeof(k)); }, key);
+      return crypto::cn_fast_hash(buf.data(), buf.size());
+    };
+    bool handed_over = false;
+    const auto note = [&](const crypto::public_key &gateway_id, const cryptonote::gateway_descriptor_base &desc) {
+      auto it = std::find_if(bridge_gateway_owners.begin(), bridge_gateway_owners.end(),
+                             [&](const bridge_gateway_owner &g) { return g.gateway_id == gateway_id; });
+      if (it == bridge_gateway_owners.end())
+      {
+        // Only a bridge-reserve gateway is tracked; the flag is sticky, so every later
+        // descriptor of such a gateway carries it too. First sight is its registration —
+        // nothing is handed over yet.
+        if (desc.is_bridge_reserve())
+          bridge_gateway_owners.push_back(bridge_gateway_owner{gateway_id, owner_hash(desc.owner_key)});
+        return;
+      }
+      const crypto::hash owner = owner_hash(desc.owner_key);
+      if (it->owner == owner)
+        return; // an update that keeps the owner: not a hand-over
+      it->owner = owner;
+      chain_epoch_advance(observed_key_epoch, cryptonote::BRIDGE_GATEWAY_CHAIN_ID,
+                          chain_epoch_get(observed_key_epoch, cryptonote::BRIDGE_GATEWAY_CHAIN_ID) + 1);
+      MGINFO("Bridge gateway " << gateway_id << " handed to a new owner key: gateway key epoch now "
+             << chain_epoch_get(observed_key_epoch, cryptonote::BRIDGE_GATEWAY_CHAIN_ID));
+      handed_over = true;
+    };
+
+    size_t skip = 0;
+    cryptonote::tx_extra_gateway_descriptor_operation op{};
+    while (cryptonote::get_field_from_tx_extra(tx.extra, op, skip++))
+      note(op.address_id, op.descriptor);
+    skip = 0;
+    cryptonote::tx_extra_gateway_repoint repoint{};
+    while (cryptonote::get_field_from_tx_extra(tx.extra, repoint, skip++))
+      note(repoint.gateway_id, repoint.new_owner_descriptor);
+    return handed_over;
+  }
+
   void master_node_list::state_t::finalize_bridge_unbonds(uint64_t block_height)
   {
     // Release any seat whose unbonding period has elapsed: clear the bridge_seat
@@ -2548,12 +2630,13 @@ namespace master_nodes
     // Two independent milestones, and conflating them costs one way or the other.
     //
     //   STOP SERVING once the key this seat holds a share of has been retired. That is the
-    //   only reason a departing seat is kept on the committee at all: dropping it while its
-    //   key is still live would remove signers from under a key that can still be asked to
-    //   sign, and with enough seats leaving at once nothing could reach threshold — not even
-    //   to authorise the rotation that would fix it. After the rotation that reason is gone,
-    //   and holding the seat any longer only keeps a departing operator signing and blocks
-    //   the queue head from its slot for the rest of the unbonding period.
+    //   only reason a departing seat is kept serving at all: dropping it while its key is
+    //   still live would remove signers from under a key that can still be asked to sign,
+    //   and with enough seats leaving at once nothing could reach threshold — not even to
+    //   authorise the rotation that would fix it. After the rotation that reason is gone,
+    //   and holding the seat any longer only keeps a departing operator signing for the
+    //   rest of the unbonding period. (It already gave up its slot and its eligibility for
+    //   the committee when it asked to leave.)
     //
     //   RELEASE THE BOND only once the ≥30-day window has ALSO elapsed. The window is the
     //   slashing horizon: the operator stays accountable for the duties it performed, long
@@ -2598,22 +2681,15 @@ namespace master_nodes
     // first BRIDGE_SEAT_CAP, queue the rest. Only flip a seat's `seated` flag when
     // it actually changes (duplicate_info is copy-on-write).
     //
-    // An exiting seat that is still seated holds its slot: it is still serving, and its
-    // slot is only freed for the queue head once its key has been retired
-    // (finalize_bridge_unbonds). Promoting a replacement earlier would seat a member
-    // holding no share of the live key while unseating one that does.
+    // An exiting seat that is still seated does NOT hold its slot. It keeps serving the key
+    // it already holds from that key's saved committee, which needs no slot, and it is
+    // never selected again — so its slot goes to the queue head at once. Holding it would
+    // only keep the seat count, and the committee drawn from it, short of a member.
     std::vector<crypto::public_key> registered;
-    size_t held_by_exiting = 0;
     for (const auto &[pk, info] : master_nodes_infos)
     {
-      if (!info->bridge_seat.registered)
+      if (!info->bridge_seat.registered || info->bridge_seat.requested_unbond_height != 0)
         continue;
-      if (info->bridge_seat.requested_unbond_height != 0)
-      {
-        if (info->bridge_seat.seated)
-          ++held_by_exiting;
-        continue;
-      }
       registered.push_back(pk);
     }
 
@@ -2625,12 +2701,9 @@ namespace master_nodes
       return ia.registration_txid < ib.registration_txid;
     });
 
-    const size_t free_slots = cryptonote::BRIDGE_SEAT_CAP > held_by_exiting
-                                  ? cryptonote::BRIDGE_SEAT_CAP - held_by_exiting
-                                  : 0;
     for (size_t i = 0; i < registered.size(); ++i)
     {
-      const bool should_seat = i < free_slots;
+      const bool should_seat = i < cryptonote::BRIDGE_SEAT_CAP;
       auto iter              = master_nodes_infos.find(registered[i]);
       if (iter->second->bridge_seat.seated != should_seat)
         duplicate_info(iter->second).bridge_seat.seated = should_seat;
@@ -2808,6 +2881,11 @@ namespace master_nodes
         else
           process_bridge_registration_tx(nettype, block, tx, index);
       }
+
+      // HF23: a bridge-reserve gateway handed to a new owner key — the gateway's side of a
+      // committee rotation (register / update ride their own tx types; a re-point any).
+      if (hf_version >= cryptonote::hf::hf23_bridge)
+        process_bridge_gateway_owner_tx(tx);
     }
 
     // HF23: release any elapsed unbonds, then (re)assign bridge seats
@@ -3378,6 +3456,7 @@ namespace master_nodes
     result.key_image_blacklist = state.key_image_blacklist;
     result.block_hash          = state.block_hash;
     result.observed_key_epoch  = state.observed_key_epoch; // HF23 H.6.3
+    result.bridge_gateway_owners = state.bridge_gateway_owners;
     return result;
   }
 
@@ -4021,6 +4100,7 @@ namespace master_nodes
   , only_loaded_quorums{state.only_stored_quorums}
   , block_hash{state.block_hash}
   , observed_key_epoch{std::move(state.observed_key_epoch)} // HF23 H.6.3
+  , bridge_gateway_owners{std::move(state.bridge_gateway_owners)}
   , mn_list{mnl}
   {
     if (!mn_list)

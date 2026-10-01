@@ -37,7 +37,9 @@ NONMEMBER=""
 for d in beldex-127.0.0.1-*/devnet; do
   [ -d "$d" ] || continue
   if has_shares "$d/$SUBDIR"; then INCOMING="$INCOMING $d"
-  elif [ -d "$d/$SUBDIR" ];   then NONMEMBER="$NONMEMBER $d"
+  # Not on the incoming committee: an empty incoming tree, or none at all (dkg-next.sh removes
+  # the empty one) while still holding the retiring key in `shares`.
+  elif [ -d "$d/$SUBDIR" ] || has_shares "$d/shares"; then NONMEMBER="$NONMEMBER $d"
   fi
 done
 
@@ -102,13 +104,13 @@ if [ -z "${ARCHIVE:-}" ]; then
   i=0
   while :; do
     taken=0
-    for d in $INCOMING; do [ -e "$d/shares-gen$i" ] && taken=1; done
+    for d in $INCOMING $NONMEMBER; do [ -e "$d/shares-gen$i" ] && taken=1; done
     [ "$taken" -eq 0 ] && break
     i=$(( i + 1 ))
   done
   ARCHIVE="shares-gen$i"
 fi
-for d in $INCOMING; do
+for d in $INCOMING $NONMEMBER; do
   if [ -e "$d/$ARCHIVE" ]; then
     echo "!! $d/$ARCHIVE already exists — pick another name with ARCHIVE=..." >&2
     exit 1
@@ -120,7 +122,7 @@ echo "  retiring to   : $(printf '%-12s' "$ARCHIVE") (group key 0x${OLDKEY:0:12}
 [ "$DRY" -eq 1 ] && echo "  MODE          : dry run, nothing will be moved"
 if [ -n "$NONMEMBER" ]; then
   echo ""
-  echo "  skipping (empty $SUBDIR — not on the bridge committee):"
+  echo "  not on the incoming committee (no $SUBDIR keyshares; a retiring tree is archived below):"
   for d in $NONMEMBER; do echo "    ${d%%/*}"; done
 fi
 echo ""
@@ -138,6 +140,18 @@ for d in $INCOMING; do
   [ "$DRY" -eq 1 ] && continue
   mv "$d/shares" "$d/$ARCHIVE"
   mv "$d/$SUBDIR" "$d/shares"
+done
+# A node that held the retiring key but is not on the incoming committee — not reselected, or
+# it asked to leave — retires its tree too. Left as `shares`, serve-live.sh would start it again
+# on a dead key, at an index the incoming committee may now use for someone else.
+for d in $NONMEMBER; do
+  has_shares "$d/shares" || continue
+  if [ "$(groupkey "$d/shares")" != "$OLDKEY" ]; then
+    echo "  ${d%%/*}: shares holds neither the retiring nor the incoming key — left as is, check it"
+    continue
+  fi
+  echo "  ${d%%/*}: shares -> $ARCHIVE (not on the incoming committee)"
+  [ "$DRY" -eq 1 ] || mv "$d/shares" "$d/$ARCHIVE"
 done
 
 if [ "$DRY" -eq 1 ]; then

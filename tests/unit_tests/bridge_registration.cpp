@@ -131,6 +131,10 @@ TEST(BridgeRegistration, mn_info_v7_has_no_bridge_seat)
 // the moment it asks to leave removes the members who can still sign while leaving the
 // key they hold live — and if enough leave at once, nothing can reach threshold, not
 // even to authorize the rotation that would fix it.
+//
+// But it must not be selected again either: the next committee runs the DKG for the next
+// key, and a member that asked to leave must hold no share of that. It keeps serving the
+// key it holds from that key's saved committee, which needs neither a slot nor selection.
 TEST(BridgeRegistration, exiting_seat_keeps_serving_until_its_key_retires)
 {
   master_nodes::master_node_info info{};
@@ -147,9 +151,10 @@ TEST(BridgeRegistration, exiting_seat_keeps_serving_until_its_key_retires)
   bs.requested_unbond_height = 2000;
   bs.bond_unlock_height      = 2000 + 30 * 2880;
 
-  EXPECT_TRUE(bs.is_active_seat())
-      << "an exiting seat must STILL serve — it holds the only usable share";
-  EXPECT_TRUE(bs.is_exiting_seat()) << "and is recognisable as on its way out";
+  EXPECT_FALSE(bs.is_active_seat())
+      << "an exiting seat must never be selected again — the next key is generated without it";
+  EXPECT_TRUE(bs.is_exiting_seat())
+      << "but it STILL serves the key it holds — it has the only usable share";
 
   // Its key is retired. The seat stops serving AT THAT POINT — the reason to keep it was
   // that it held the only usable share, and that reason is gone. It stays `registered`,
