@@ -2294,19 +2294,40 @@ namespace master_nodes
       return true;
     }
 
+    // Does a baseline name at least one wBDX chain? Only those have hand-off evidence
+    // (rotation acks); the gateway entry is the reserved id and has none yet.
+    bool has_evm_baseline(const std::vector<bridge_chain_epoch> &v)
+    {
+      return std::any_of(v.begin(), v.end(), [](const bridge_chain_epoch &e) {
+        return e.chain_id != cryptonote::BRIDGE_GATEWAY_CHAIN_ID;
+      });
+    }
+
     // H.6.3 gate: has every chain in this seat's baseline snapshot rotated strictly past
     // its baseline? Iterates the SEAT's snapshot (grandfathering, §6.2): a chain added
-    // after the seat unbonded is simply not in the snapshot, so it is never required. A
-    // chain no longer "registered" (implicit model: no longer present in `observed`) is
-    // skipped, so a retired chain never strands an honest bond. An empty snapshot (taken
-    // before any rotation was observed) is vacuously satisfied.
+    // after the seat unbonded is simply not in the snapshot, so it is never required.
+    //
+    // Fails closed. A baseline with no wBDX chain records no hand-off to wait for, so it
+    // never completes: releasing on it would return the bond while the seat's share of the
+    // live key still signs. Observations are only ever added, so a wBDX chain in the
+    // snapshot that is missing from `observed` is not a retired chain; it blocks.
+    //
+    // The gateway entry is the exception while it is unobserved: nothing yet produces
+    // evidence of a gateway key hand-off (rotation acks carry a wBDX signer address), so
+    // gating on it would hold every bond forever. Once observed, it gates like any chain.
     bool rotation_completed_for(const std::vector<bridge_chain_epoch> &observed,
                                 const std::vector<bridge_chain_epoch> &serving)
     {
+      if (!has_evm_baseline(serving))
+        return false;
       for (const auto &b : serving)
       {
         if (!chain_epoch_present(observed, b.chain_id))
-          continue; // no longer registered (retired) → does not gate
+        {
+          if (b.chain_id == cryptonote::BRIDGE_GATEWAY_CHAIN_ID)
+            continue;
+          return false;
+        }
         if (chain_epoch_get(observed, b.chain_id) <= b.key_epoch)
           return false; // this chain has not yet rotated past the seat's baseline
       }
@@ -2351,6 +2372,17 @@ namespace master_nodes
     if (!crypto::check_signature(msg, op.master_node_pubkey, op.signature))
     {
       LOG_PRINT_L1("Bridge unbond TX: bad master-node signature for " << op.master_node_pubkey);
+      return false;
+    }
+
+    // The baseline below is what the bond waits on. With no wBDX chain observed yet there
+    // is nothing to snapshot, and such a bond could never be released (see
+    // rotation_completed_for). Refuse before touching the seat; the operator retries once
+    // the first rotation ack establishes a baseline.
+    if (!has_evm_baseline(observed_key_epoch))
+    {
+      LOG_PRINT_L1("Bridge unbond TX: no wBDX key epoch observed yet for " << op.master_node_pubkey
+                   << "; nothing to hand off against, retry after the first rotation ack");
       return false;
     }
 

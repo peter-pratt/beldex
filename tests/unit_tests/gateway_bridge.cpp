@@ -828,6 +828,88 @@ TEST(GatewayBridgeRotation, gate_grandfathers_chain_added_after_unbond)
       << "a chain added after unbond must not gate the seat";
 }
 
+TEST(GatewayBridgeRotation, gate_never_releases_on_a_baseline_without_a_wbdx_chain)
+{
+  // A seat that unbonded before any wBDX rotation was observed has nothing in its
+  // baseline but (at most) the unobservable gateway entry. Before, that passed vacuously
+  // and the bond came back at the unlock height while the seat's share was still live.
+  const size_t N = cryptonote::bridge_committee_size(NET_FC);
+  auto c = make_committee(N);
+  master_node_list::state_t cur(nullptr);
+  cur.height = 5000;
+  for (size_t i = 0; i < N; ++i) seat_member(cur, c.mn[i], c.ed_pub[i], 100 + i);
+
+  set_unbonding(cur, c.mn[4], 4000, 5000, {});
+  set_unbonding(cur, c.mn[5], 4000, 5000, {chain_ep(cryptonote::BRIDGE_GATEWAY_CHAIN_ID, 0)});
+
+  // Chains rotate afterwards; neither seat recorded them, so neither may use them.
+  ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 2, {0, 1, 2, 3}, 3), 6000));
+  cur.finalize_bridge_unbonds(1000000);
+  EXPECT_TRUE(cur.master_nodes_infos.at(c.mn[4])->bridge_seat.registered) << "empty baseline";
+  EXPECT_TRUE(cur.master_nodes_infos.at(c.mn[5])->bridge_seat.registered) << "gateway-only baseline";
+}
+
+TEST(GatewayBridgeRotation, gate_waits_for_wbdx_chains_but_not_the_unobserved_gateway)
+{
+  // The gateway entry rides along in every baseline but no evidence of a gateway hand-off
+  // exists yet, so it cannot gate; the wBDX chains still must all rotate.
+  const size_t N = cryptonote::bridge_committee_size(NET_FC);
+  auto c = make_committee(N);
+  master_node_list::state_t cur(nullptr);
+  cur.height = 5000;
+  for (size_t i = 0; i < N; ++i) seat_member(cur, c.mn[i], c.ed_pub[i], 100 + i);
+  ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 1, {0, 1, 2, 3}, 3), 5000));
+
+  set_unbonding(cur, c.mn[5], 4000, 5000,
+                {chain_ep(1, 1), chain_ep(cryptonote::BRIDGE_GATEWAY_CHAIN_ID, 0)});
+  cur.finalize_bridge_unbonds(6000);
+  EXPECT_TRUE(cur.master_nodes_infos.at(c.mn[5])->bridge_seat.registered);
+
+  ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 2, {0, 1, 2, 3}, 3), 6000));
+  cur.finalize_bridge_unbonds(6000);
+  EXPECT_FALSE(cur.master_nodes_infos.at(c.mn[5])->bridge_seat.registered);
+}
+
+TEST(GatewayBridgeRotation, unbond_is_refused_until_a_baseline_exists)
+{
+  const size_t N = cryptonote::bridge_committee_size(NET_FC);
+  auto c = make_committee(N);
+  master_node_list::state_t cur(nullptr);
+  cur.height = 5000;
+  for (size_t i = 0; i < N; ++i) seat_member(cur, c.mn[i], c.ed_pub[i], 100 + i);
+
+  crypto::public_key pk; crypto::secret_key sk; crypto::generate_keys(pk, sk);
+  seat_member(cur, pk, c.ed_pub[0], 50);
+
+  tx_extra_bridge_unbond op{};
+  op.master_node_pubkey = pk;
+  crypto::generate_signature(master_nodes::bridge_unbond_message(op), pk, sk, op.signature);
+  cryptonote::transaction tx{};
+  tx.type = cryptonote::txtype::bridge_registration;
+  ASSERT_TRUE(add_bridge_unbond_to_tx_extra(tx.extra, op));
+  cryptonote::block blk{};
+  blk.major_version = cryptonote::hf::hf23_bridge;
+  blk.miner_tx.vin.push_back(cryptonote::txin_gen{5000});
+
+  // No wBDX key epoch observed: refused, and the seat is untouched.
+  EXPECT_FALSE(cur.process_bridge_unbond_tx(NET_FC, blk, tx));
+  const auto& before = cur.master_nodes_infos.at(pk)->bridge_seat;
+  EXPECT_EQ(before.requested_unbond_height, 0u);
+  EXPECT_TRUE(before.seated);
+
+  // Once a rotation ack establishes a baseline the same request goes through, and the
+  // bond then waits for that chain to rotate.
+  ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 1, {0, 1, 2, 3}, 3), 5000));
+  ASSERT_TRUE(cur.process_bridge_unbond_tx(NET_FC, blk, tx));
+  const auto& after = cur.master_nodes_infos.at(pk)->bridge_seat;
+  EXPECT_EQ(after.requested_unbond_height, 5000u);
+  cur.finalize_bridge_unbonds(after.bond_unlock_height);
+  EXPECT_TRUE(cur.master_nodes_infos.at(pk)->bridge_seat.registered);
+  ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 2, {0, 1, 2, 3}, 3), 6000));
+  cur.finalize_bridge_unbonds(cur.master_nodes_infos.at(pk)->bridge_seat.bond_unlock_height);
+  EXPECT_FALSE(cur.master_nodes_infos.at(pk)->bridge_seat.registered);
+}
+
 // --------------------------------------------------------------------------
 // Governance message domain separation (S6/S14 on the native leg).
 // --------------------------------------------------------------------------
