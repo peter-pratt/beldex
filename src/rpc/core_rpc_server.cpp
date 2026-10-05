@@ -4364,7 +4364,9 @@ namespace cryptonote::rpc {
       const auto &bs = e.info->bridge_seat;
       if (!bs.registered)
         continue;
-      if (bs.seated) ++seated; else ++queued;
+      // A seat on its way out (or forfeited) holds no slot and waits for none — it may still
+      // have `seated` set while it serves its key — so it counts as neither.
+      if (bs.is_active_seat()) ++seated; else if (bs.requested_unbond_height == 0) ++queued;
       if (std::find(ops.begin(), ops.end(), e.info->operator_address) == ops.end())
         ops.push_back(e.info->operator_address);
       // The exit fields. Nothing logs a successful unbond and the seat deliberately stays

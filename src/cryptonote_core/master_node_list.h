@@ -232,6 +232,21 @@ namespace master_nodes
     END_SERIALIZE()
   };
 
+  // A bridge-reserve gateway's current owner key, as consensus last saw it set by a
+  // register / update / re-point op. Kept so an owner CHANGE — the gateway handed to a new
+  // committee key — can be told apart from an update that leaves the owner as it was: the
+  // ops themselves carry only the new descriptor. `owner` is H(serialized owner key).
+  struct bridge_gateway_owner
+  {
+    crypto::public_key gateway_id{};
+    crypto::hash       owner{};
+
+    BEGIN_SERIALIZE_OBJECT()
+      FIELD(gateway_id)
+      FIELD(owner)
+    END_SERIALIZE()
+  };
+
   struct master_node_info // registration information
   {
     enum class version_t : uint8_t
@@ -324,11 +339,12 @@ namespace master_nodes
       // >= 1 (a seat that never unbonded stays version 0 and omits it).
       std::vector<bridge_chain_epoch> serving_key_epoch;
 
-      // Serving right now. An EXITING seat is deliberately still serving: its share is
-      // the only thing that can sign under the current key, so removing it from the
-      // committee the moment it asks to leave takes away the very members who can sign.
-      // `finalize_bridge_unbonds` clears `seated` once the key has actually rotated.
-      bool is_active_seat() const { return registered && seated; }
+      // Holding a slot and eligible for the committee. An EXITING seat is neither: the next
+      // key must be generated without it, so it is never selected again. It still serves
+      // the key it already holds a share of — its signer signs from the committee saved
+      // beside that share, not from its seat — so it keeps `seated` until the key has
+      // actually rotated, when `finalize_bridge_unbonds` clears it.
+      bool is_active_seat() const { return registered && seated && requested_unbond_height == 0; }
       // Asked to leave, but still serving until its key is retired.
       bool is_exiting_seat() const { return registered && seated && requested_unbond_height != 0; }
 
@@ -736,8 +752,8 @@ namespace master_nodes
 
     struct state_serialized
     {
-      enum struct version_t : uint8_t { version_0, version_1_serialize_hash, version_2_bridge_rotation, count, };
-      static version_t get_version(cryptonote::hf /*hf_version*/) { return version_t::version_2_bridge_rotation; }
+      enum struct version_t : uint8_t { version_0, version_1_serialize_hash, version_2_bridge_rotation, version_3_bridge_gateway_owner, count, };
+      static version_t get_version(cryptonote::hf /*hf_version*/) { return version_t::version_3_bridge_gateway_owner; }
 
       version_t                              version;
       uint64_t                               height;
@@ -747,6 +763,7 @@ namespace master_nodes
       bool                                   only_stored_quorums;
       crypto::hash                           block_hash;
       std::vector<bridge_chain_epoch>        observed_key_epoch; // HF23 H.6.3
+      std::vector<bridge_gateway_owner>      bridge_gateway_owners; // HF23: gateway hand-over
 
       BEGIN_SERIALIZE()
         ENUM_FIELD(version, version < version_t::count)
@@ -760,6 +777,8 @@ namespace master_nodes
           FIELD(block_hash);
         if (version >= version_t::version_2_bridge_rotation)
           FIELD(observed_key_epoch);
+        if (version >= version_t::version_3_bridge_gateway_owner)
+          FIELD(bridge_gateway_owners);
       END_SERIALIZE()
     };
 
@@ -795,6 +814,10 @@ namespace master_nodes
       // committee-attested rotation-ack tx. Carried block-to-block like the other state
       // and snapshotted per height into state_history, so it is reorg-safe for free.
       std::vector<bridge_chain_epoch>        observed_key_epoch;
+      // The owner key of each bridge-reserve gateway, as last set on chain. A change of it
+      // advances `observed_key_epoch` for BRIDGE_GATEWAY_CHAIN_ID — the gateway's side of a
+      // rotation, which a departing seat's bond waits for alongside the wBDX chains'.
+      std::vector<bridge_gateway_owner>      bridge_gateway_owners;
       master_node_list*                     mn_list;
 
       state_t(master_node_list* mnl) : mn_list{mnl} {}
@@ -847,6 +870,9 @@ namespace master_nodes
       bool process_bridge_rotation_ack_tx(cryptonote::network_type nettype, cryptonote::block const &block,
                                           const cryptonote::transaction& tx,
                                           const bridge_committee_resolver& resolve_committee);
+      // Returns true if a bridge-reserve gateway's owner key changed (the gateway was handed
+      // to a new key), which advances observed_key_epoch for BRIDGE_GATEWAY_CHAIN_ID (HF23).
+      bool process_bridge_gateway_owner_tx(const cryptonote::transaction& tx);
       // Release (clear) any bridge seat whose bond unlock height has been reached.
       void finalize_bridge_unbonds(uint64_t block_height);
       // Number of currently seated (not merely queued) bridge operators.

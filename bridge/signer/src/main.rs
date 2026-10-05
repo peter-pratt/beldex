@@ -100,7 +100,9 @@ fn run_dkg(cfg: &Config) -> Result<(), String> {
     //    the daemon reports for itself (OMQ `self_index`) so no per-node pubkey
     //    config is needed; fall back to matching the configured MN pubkey.
     let client = OmqCommitteeClient::new(cfg.oxenmq_endpoint.clone());
-    let committee = client.fetch_committee(None).map_err(|e| e.to_string())?;
+    let committee_json = client.fetch_committee_json(None).map_err(|e| e.to_string())?;
+    let committee = beldex_bridge_signer::committee::CommitteeView::from_bridge_committee_json(&committee_json)
+        .map_err(|e| e.to_string())?;
     let self_index = committee
         .daemon_self_index
         .or_else(|| committee.self_index(&cfg.self_mn_pubkey))
@@ -362,8 +364,60 @@ fn run_dkg(cfg: &Config) -> Result<(), String> {
         }
     }
 
+    // The committee these shares belong to. A share's index is its position in THIS list,
+    // and this list — not whichever committee consensus selects later — is who can sign
+    // with the key until it is replaced on chain.
+    if let Ok(dir) = std::env::var("BRIDGE_SIGNER_SHARE_DIR") {
+        std::fs::write(format!("{dir}/{KEY_COMMITTEE_FILE}"), &committee_json)
+            .map_err(|e| format!("write {dir}/{KEY_COMMITTEE_FILE}: {e}"))?;
+        println!("key committee (epoch {}) written to {dir}/{KEY_COMMITTEE_FILE}", committee.epoch);
+    }
+
     println!("(shares in the scaffold in-memory store; production custody = Vault/enclave)");
     Ok(())
+}
+
+/// Beside each share tree: the `bridge.committee` reply `dkg` ran against.
+#[cfg(feature = "live-dkg")]
+const KEY_COMMITTEE_FILE: &str = "committee.json";
+
+/// The committee that holds the key in `dir`, and this node's index in it.
+///
+/// That is the committee `dkg` saved beside the shares — not the current one. Consensus
+/// selects a new committee every epoch, but the key it held stays live, and stays signable
+/// only by its own holders, until the rotation replacing it lands; the outgoing committee
+/// has to sign that very rotation. A tree written before `dkg` saved its committee falls
+/// back to the current one, which is what it was built against.
+#[cfg(feature = "live-dkg")]
+fn load_key_committee(
+    cfg: &Config,
+    dir: &str,
+) -> Result<(beldex_bridge_signer::committee::CommitteeView, u16), String> {
+    use beldex_bridge_signer::committee::CommitteeView;
+    use beldex_bridge_signer::omq_client::OmqCommitteeClient;
+
+    let path = format!("{dir}/{KEY_COMMITTEE_FILE}");
+    let committee = match std::fs::read_to_string(&path) {
+        Ok(json) => {
+            let c = CommitteeView::from_bridge_committee_json(&json).map_err(|e| format!("{path}: {e}"))?;
+            println!("key committee from {path} (epoch {}, size {})", c.epoch, c.size());
+            c
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => OmqCommitteeClient::new(cfg.oxenmq_endpoint.clone())
+            .fetch_committee(None)
+            .map_err(|e| e.to_string())?,
+        Err(e) => return Err(format!("read {path}: {e}")),
+    };
+    // `self_index` in a saved reply is this node's own daemon's answer at DKG time — the
+    // index its share files carry.
+    let self_index = committee
+        .daemon_self_index
+        .or_else(|| committee.self_index(&cfg.self_mn_pubkey))
+        .ok_or("this node does not hold a share of this committee's key")? as u16;
+    if !committee.has_signer_keys() {
+        return Err("bridge.committee returned no signer_keys — update beldexd".into());
+    }
+    Ok((committee, self_index))
 }
 
 #[cfg(not(feature = "live-dkg"))]
@@ -513,19 +567,12 @@ fn persist_pevm_material(
 fn run_sign(cfg: &Config) -> Result<(), String> {
     use beldex_bridge_signer::dkg_driver::live::{MeshIdentity, PeerTransportAddr};
     use beldex_bridge_signer::ffi;
-    use beldex_bridge_signer::omq_client::OmqCommitteeClient;
     use std::time::Duration;
 
-    // 1) Committee + self_index.
-    let client = OmqCommitteeClient::new(cfg.oxenmq_endpoint.clone());
-    let committee = client.fetch_committee(None).map_err(|e| e.to_string())?;
-    let self_index = committee
-        .daemon_self_index
-        .or_else(|| committee.self_index(&cfg.self_mn_pubkey))
-        .ok_or("this node is not on the current bridge committee")? as u16;
-    if !committee.has_signer_keys() {
-        return Err("bridge.committee returned no signer_keys — update beldexd".into());
-    }
+    // 1) Committee + self_index: the committee that holds the key in the share dir.
+    let dir = std::env::var("BRIDGE_SIGNER_SHARE_DIR")
+        .map_err(|_| "set BRIDGE_SIGNER_SHARE_DIR (where `dkg` wrote the shares)".to_string())?;
+    let (committee, self_index) = load_key_committee(cfg, &dir)?;
 
     // 2) Leg + signer set (default: the first `threshold` committee members).
     let leg = std::env::var("BRIDGE_SIGNER_SIGN_LEG").unwrap_or_else(|_| "pgw".into());
@@ -543,8 +590,6 @@ fn run_sign(cfg: &Config) -> Result<(), String> {
     }
 
     // 3) Shared config + mesh identity material (from the MN key).
-    let dir = std::env::var("BRIDGE_SIGNER_SHARE_DIR")
-        .map_err(|_| "set BRIDGE_SIGNER_SHARE_DIR (where `dkg` wrote the shares)".to_string())?;
     let port_base: u16 = std::env::var("BRIDGE_SIGNER_MESH_PORT_BASE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1138,6 +1183,7 @@ struct LiveSigners {
     pgw_pubkey_package: frost_ed25519::keys::PublicKeyPackage,
     pgw_group_vk: [u8; 32],
     pevm_key_share: Vec<u8>,
+    pevm_address: [u8; 20],
     curve_secret: [u8; 32],
     curve_public: [u8; 32],
     ed25519_secret: [u8; 64],
@@ -1280,19 +1326,12 @@ impl LiveSigners {
 #[cfg(feature = "serve-live")]
 fn build_live_signers(cfg: &Config) -> Result<LiveSigners, String> {
     use beldex_bridge_signer::ffi;
-    use beldex_bridge_signer::omq_client::OmqCommitteeClient;
     use frost_ed25519 as frost;
     use std::time::Duration;
 
-    let client = OmqCommitteeClient::new(cfg.oxenmq_endpoint.clone());
-    let committee = client.fetch_committee(None).map_err(|e| e.to_string())?;
-    let self_index = committee
-        .daemon_self_index
-        .or_else(|| committee.self_index(&cfg.self_mn_pubkey))
-        .ok_or("this node is not on the current bridge committee")? as u16;
-    if !committee.has_signer_keys() {
-        return Err("bridge.committee returned no signer_keys — update beldexd".into());
-    }
+    let dir = std::env::var("BRIDGE_SIGNER_SHARE_DIR")
+        .map_err(|_| "set BRIDGE_SIGNER_SHARE_DIR (where `dkg` wrote the shares)".to_string())?;
+    let (committee, self_index) = load_key_committee(cfg, &dir)?;
     let signers: Vec<u16> = match std::env::var("BRIDGE_SIGNER_SIGN_SIGNERS") {
         Ok(s) => s.split(',').filter_map(|x| x.trim().parse().ok()).collect(),
         Err(_) => (0..committee.threshold as u16).collect(),
@@ -1301,8 +1340,6 @@ fn build_live_signers(cfg: &Config) -> Result<LiveSigners, String> {
         return Err(format!("this node ({self_index}) is not in the signer set {signers:?}"));
     }
 
-    let dir = std::env::var("BRIDGE_SIGNER_SHARE_DIR")
-        .map_err(|_| "set BRIDGE_SIGNER_SHARE_DIR (where `dkg` wrote the shares)".to_string())?;
     let port_base: u16 = std::env::var("BRIDGE_SIGNER_MESH_PORT_BASE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1379,6 +1416,18 @@ fn build_live_signers(cfg: &Config) -> Result<LiveSigners, String> {
     // Pevm cggmp21 keyshare (raw bytes; the driver deserializes).
     let pevm_key_share = std::fs::read(format!("{dir}/pevm-{self_index}.keyshare"))
         .map_err(|e| format!("read pevm keyshare: {e} (run `dkg` first with BRIDGE_SIGNER_SHARE_DIR set)"))?;
+    // The wBDX signer address this share set signs as — what the contract's `currentSigner`
+    // reads while this key is the live one.
+    let pevm_address = {
+        use k256::ecdsa::VerifyingKey;
+        use sha3::{Digest, Keccak256};
+        let x33 = read_secret_file(&format!("{dir}/pevm-{self_index}.groupkey"))?;
+        let vk = VerifyingKey::from_sec1_bytes(&x33).map_err(|e| format!("bad pevm groupkey: {e}"))?;
+        let h = Keccak256::digest(&vk.to_encoded_point(false).as_bytes()[1..]);
+        let mut a = [0u8; 20];
+        a.copy_from_slice(&h[12..]);
+        a
+    };
 
     Ok(LiveSigners {
         committee,
@@ -1388,6 +1437,7 @@ fn build_live_signers(cfg: &Config) -> Result<LiveSigners, String> {
         pgw_pubkey_package,
         pgw_group_vk,
         pevm_key_share,
+        pevm_address,
         curve_secret,
         curve_public,
         ed25519_secret,
@@ -1866,17 +1916,27 @@ where
     }
 
     // The committee this process was built against. It is read once at startup — the
-    // shares, the mesh identities and the signer indices all derive from it — so if the
-    // on-chain committee moves underneath us, everything this node computes is against a
-    // view that no longer exists: it may hold no usable share at its new index, or count a
-    // member who has left. Opening new work in that state produces rounds that cannot
-    // reach threshold. Detect it and stop taking on new duties; in-flight ones still
-    // finish, and the node is restarted to pick up the new committee.
+    // shares, the mesh identities and the signer indices all derive from it — and it is
+    // the committee that holds this share dir's key (`load_key_committee`), not whichever
+    // one consensus has selected since. Consensus moving on does not retire that key: it
+    // stays live, and signable only by its own holders, until the rotation replacing it
+    // lands — and the outgoing committee is who has to keep the bridge running until then.
+    // So a new committee is only reported. What stops this node taking new work is its key
+    // being replaced on chain, per leg: the wBDX signer (per chain) and the gateway owner
+    // are handed over by separate transactions. In-flight work still finishes, and the node
+    // is restarted on the successor shares.
     let started_with = ls.committee.membership_bytes();
     let committee_probe = beldex_bridge_signer::omq_client::OmqCommitteeClient::new(
         cfg.oxenmq_endpoint.clone(),
     );
     let mut committee_changed = false;
+    let key_probe_evm: Vec<(u64, HttpJsonRpc, [u8; 20])> = configs
+        .iter()
+        .map(|c| (c.chain_id, HttpJsonRpc::new(c.rpc_url.clone()), c.contract))
+        .collect();
+    let key_probe_gw = HttpJsonRpc::new(format!("{}/json_rpc", beldexd_rpc.trim_end_matches('/')));
+    let mut mint_key_replaced: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    let mut release_key_replaced = false;
 
     // H.6.3 rotation acknowledgements. Each member observes a wBDX key change on its own
     // RPC, signs the fact, and shares that signature over the mesh; once threshold-many
@@ -1905,13 +1965,52 @@ where
             if let Ok(now) = committee_probe.fetch_committee(None) {
                 if now.membership_bytes() != started_with {
                     committee_changed = true;
-                    eprintln!(
-                        "!! COMMITTEE CHANGED (epoch {} -> {}): this node was built against the \
-                         previous view, so its share index and mesh identities no longer match. \
-                         Not opening further duties; in-flight work will finish. Re-run the DKG \
-                         for the new committee and restart.",
+                    println!(
+                        "committee moved on (epoch {} -> {}): this node keeps serving the key it \
+                         holds until that key is replaced on chain",
                         ls.committee.epoch, now.epoch
                     );
+                }
+            }
+        }
+        // Is this node's key still the live one? Same cadence. An unreadable answer is not a
+        // replacement — only a signer / owner that reads back and differs counts.
+        if ticks % 12 == 0 {
+            use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
+            use sha3::{Digest, Keccak256};
+            let ours = format!("0x{}", hex(&ls.pevm_address));
+            let selector = format!("0x{}", hex(&Keccak256::digest(b"currentSigner()")[..4]));
+            for (chain_id, client, contract) in &key_probe_evm {
+                if mint_key_replaced.contains(chain_id) {
+                    continue;
+                }
+                let params = serde_json::json!([{ "to": format!("0x{}", hex(contract)), "data": selector }, "latest"]);
+                let Ok(word) = client.call("eth_call", params) else { continue };
+                let Some(word) = word.as_str().filter(|w| w.len() == 66) else { continue };
+                let live = format!("0x{}", &word[26..]).to_lowercase();
+                if live != ours {
+                    mint_key_replaced.insert(*chain_id);
+                    eprintln!(
+                        "!! KEY REPLACED on chain {chain_id}: the wBDX signer is now {live}, not this \
+                         share set's {ours}. Not opening further mints for it; in-flight work will \
+                         finish. Promote the successor shares and restart."
+                    );
+                }
+            }
+            if !release_key_replaced {
+                let params = serde_json::json!({ "gateway_address": release_gateway });
+                if let Ok(info) = key_probe_gw.call("get_gateway_info", params) {
+                    if let Some(owner) = info.get("owner_key").and_then(|v| v.as_str()) {
+                        if !owner.eq_ignore_ascii_case(&hex(&ls.pgw_group_vk)) {
+                            release_key_replaced = true;
+                            eprintln!(
+                                "!! KEY REPLACED on the gateway: its owner key is now {owner}, not \
+                                 this share set's {}. Not opening further releases; in-flight work \
+                                 will finish. Promote the successor shares and restart.",
+                                hex(&ls.pgw_group_vk)
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1949,14 +2048,14 @@ where
             }
         };
         // Keep draining the watchers so their cursors advance, but do not turn events into
-        // duties against a committee view that has moved on.
+        // duties for a key that has been replaced — they belong to the successor committee.
         for m in src.poll_mints() {
-            if !committee_changed {
+            if !mint_key_replaced.contains(&m.dst_chain.0) {
                 ingest(orch, Duty::Mint(m));
             }
         }
         for r in src.poll_releases() {
-            if !committee_changed {
+            if !release_key_replaced {
                 ingest(orch, Duty::Release(r));
             }
         }
@@ -2386,5 +2485,66 @@ mod secret_file_tests {
                 "{transient} is about right now, not about the request"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "live-dkg"))]
+mod key_committee_tests {
+    use super::*;
+
+    fn cfg(self_mn_pubkey: &str) -> Config {
+        let m: HashMap<String, String> = [
+            ("beldexd_rpc_url", "http://127.0.0.1:1".to_string()),
+            // Unreachable on purpose: a saved committee must never need the daemon.
+            ("oxenmq_endpoint", "ipc:///nonexistent/beldexd.sock".to_string()),
+            ("gateway_id", "11".repeat(32)),
+            ("self_mn_pubkey", self_mn_pubkey.to_string()),
+            ("bridge_epoch_blocks", "120".to_string()),
+            ("committee_threshold", "2".to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        Config::from_map(&m).unwrap()
+    }
+
+    fn saved(dir: &str, self_index: i64) {
+        let json = format!(
+            r#"{{"epoch":3,"height":360,"threshold":2,"active":true,"self_index":{self_index},
+               "members":["{a}","{b}","{c}"],"signer_keys":["{d}","{e}","{f}"]}}"#,
+            a = "a1".repeat(32), b = "b2".repeat(32), c = "c3".repeat(32),
+            d = "d4".repeat(32), e = "e5".repeat(32), f = "f6".repeat(32),
+        );
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(format!("{dir}/{KEY_COMMITTEE_FILE}"), json).unwrap();
+    }
+
+    /// The committee that ran the DKG keeps signing with its key after consensus has
+    /// selected another one — it has to, to sign the rotation that replaces it. So the
+    /// share tree's own committee is used, and the daemon's current view is never asked.
+    #[test]
+    fn a_saved_key_committee_is_used_instead_of_the_current_one() {
+        let dir = std::env::temp_dir().join(format!("bx-keycomm-{}", std::process::id()));
+        let d = dir.to_str().unwrap();
+        saved(d, 2);
+        let (c, idx) = load_key_committee(&cfg(&"00".repeat(32)), d).unwrap();
+        assert_eq!((c.epoch, c.size(), idx), (3, 3, 2));
+        assert_eq!(c.signer_key(2), Some([0xf6; 32]));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// A node that holds no share of the saved committee's key must not start signing
+    /// for it under some other index.
+    #[test]
+    fn a_node_outside_the_saved_committee_is_refused() {
+        let dir = std::env::temp_dir().join(format!("bx-keycomm-out-{}", std::process::id()));
+        let d = dir.to_str().unwrap();
+        saved(d, -1);
+        let err = load_key_committee(&cfg(&"00".repeat(32)), d).unwrap_err();
+        assert!(err.contains("does not hold a share"), "got: {err}");
+        // Matched by MN pubkey when the daemon's own index is absent.
+        let (_, idx) = load_key_committee(&cfg(&"b2".repeat(32)), d).unwrap();
+        assert_eq!(idx, 1);
+        let _ = std::fs::remove_dir_all(d);
     }
 }

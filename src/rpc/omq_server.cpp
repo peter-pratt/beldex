@@ -990,28 +990,37 @@ void omq_rpc::on_bridge_mint_payload(oxenmq::Message& m)
     return;
   }
 
-  // Authenticate the publisher against the CURRENT epoch's committee.
+  // Authenticate the publisher against the CURRENT epoch's committee first — the common
+  // case. That committee is not the only legitimate publisher: the committee holding the
+  // live key keeps signing, and publishing, after consensus has selected its successor,
+  // until the rotation replacing that key lands, and by then its index in the current
+  // committee means nothing. So a signature from any REGISTERED bridge seat is also
+  // accepted. Every registered seat is bonded, so the bus is still no open amplifier.
   {
     const auto nettype = core_.get_nettype();
     const uint64_t top = core_.get_current_blockchain_height();
     const uint64_t epoch_blocks = cryptonote::bridge_epoch_blocks(nettype);
     const uint64_t epoch_height = epoch_blocks ? (top ? (top - 1) / epoch_blocks * epoch_blocks : 0) : 0;
 
+    const std::string msg = cryptonote::bridge_mint_publish_message(nettype, payload);
+    const auto verifies = [&](const crypto::ed25519_public_key& key) {
+      return crypto_sign_verify_detached(publisher_sig.data,
+                                         reinterpret_cast<const unsigned char*>(msg.data()), msg.size(),
+                                         key.data) == 0;
+    };
+
     std::vector<crypto::public_key> members;
     std::vector<crypto::ed25519_public_key> signer_keys;
     size_t threshold = 0;
-    if (!core_.get_master_node_list().get_bridge_committee(epoch_height, members, signer_keys, threshold)) {
-      m.send_reply(OMQ_BAD_REQUEST, "bridge.mint_payload: no active bridge committee");
-      return;
-    }
-    if (publisher_index >= signer_keys.size()) {
-      m.send_reply(OMQ_BAD_REQUEST, "bridge.mint_payload: publisher_index out of committee range");
-      return;
-    }
-    const std::string msg = cryptonote::bridge_mint_publish_message(nettype, payload);
-    if (crypto_sign_verify_detached(publisher_sig.data,
-                                    reinterpret_cast<const unsigned char*>(msg.data()), msg.size(),
-                                    signer_keys[publisher_index].data) != 0) {
+    bool authentic = core_.get_master_node_list().get_bridge_committee(epoch_height, members, signer_keys, threshold)
+                     && publisher_index < signer_keys.size() && verifies(signer_keys[publisher_index]);
+    if (!authentic)
+      for (const auto& e : core_.get_master_node_list_state({}))
+        if (e.info->bridge_seat.registered && verifies(e.info->bridge_seat.signer_ed25519)) {
+          authentic = true;
+          break;
+        }
+    if (!authentic) {
       MWARNING("bridge.mint_payload: rejected publication claiming committee index "
                << publisher_index << " from " << m.remote << " — bad signature");
       m.send_reply(OMQ_BAD_REQUEST, "bridge.mint_payload: publisher signature does not verify");
