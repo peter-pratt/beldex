@@ -114,6 +114,9 @@ pub mod coordinator;
 /// Inspection outages abstain (never NACK an honest leader). [`release_policy::DualPolicy`]
 /// composes mint + release for `serve --live`. std-only; multi-node tested.
 pub mod release_outbox;
+/// **DKG execution ledger** — every execution id this node has started, so a retried DKG
+/// cannot reuse one. std-only.
+pub mod execution_ledger;
 /// **Mint outbox** — each signed mint payload, kept on disk until `processedDeposits` shows
 /// it minted, so a missed hand-off is re-delivered instead of stranding the deposit.
 /// std-only.

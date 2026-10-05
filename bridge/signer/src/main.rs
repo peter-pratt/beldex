@@ -200,6 +200,44 @@ fn run_dkg(cfg: &Config) -> Result<(), String> {
         return Err("the Pevm leg / dual DKG needs BRIDGE_SIGNER_MESH_PORT_BASE (distinct port ranges per leg)".into());
     }
 
+    // Reserve every execution this run will start before any of them sends a message. The
+    // ids are derived from the committee and key generation, so a retry with the same
+    // generation derives them again; the ledger refuses that. Default location: beside the
+    // share tree, so `shares` and `shares-next` share one ledger.
+    let ledger_dir = match std::env::var("BRIDGE_SIGNER_EXECUTION_LEDGER")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(d) => std::path::PathBuf::from(d),
+        None => {
+            let share = std::env::var("BRIDGE_SIGNER_SHARE_DIR").map_err(|_| {
+                "set BRIDGE_SIGNER_SHARE_DIR or BRIDGE_SIGNER_EXECUTION_LEDGER: a DKG must \
+                 record its execution ids so a retry cannot reuse them"
+                    .to_string()
+            })?;
+            let share = std::path::Path::new(&share);
+            share.parent().unwrap_or(std::path::Path::new(".")).join("dkg-executions")
+        }
+    };
+    {
+        use beldex_bridge_signer::execution_ledger::reserve;
+        if run_pgw {
+            let id = beldex_bridge_signer::committee::execution_id(
+                b"beldex-pgw-dkg-v1",
+                &[&committee.identity_bytes(), &key_generation.to_le_bytes()],
+            );
+            reserve(&ledger_dir, "pgw-dkg", &id)?;
+        }
+        #[cfg(feature = "live-pevm-dkg")]
+        if run_pevm {
+            let keygen = beldex_bridge_signer::cggmp21_driver::keygen_execution_id(&committee, key_generation);
+            let aux = beldex_bridge_signer::cggmp21_aux_driver::aux_execution_id(&committee, key_generation);
+            reserve(&ledger_dir, "pevm-keygen", &keygen)?;
+            reserve(&ledger_dir, "pevm-aux", &aux)?;
+        }
+        println!("execution ids for key generation {key_generation} reserved in {}", ledger_dir.display());
+    }
+
     // Pevm ports live PEVM_PORT_OFFSET above the Pgw ports, so the two legs never
     // collide when run back-to-back on one host. Kept small (100, not 1000) so the
     // Pevm range stays near the Pgw base and away from ports the host may already

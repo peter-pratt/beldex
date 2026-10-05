@@ -86,6 +86,15 @@ pub fn complete_key_share_blob(
         .map_err(|e| DriverError::Protocol(format!("serialize complete share: {e}")))
 }
 
+/// The cggmp21 execution id of the Pevm aux-info run for `committee` at `key_generation`.
+/// See [`crate::cggmp21_driver::keygen_execution_id`].
+pub fn aux_execution_id(committee: &crate::committee::CommitteeView, key_generation: u32) -> [u8; 32] {
+    crate::committee::execution_id(
+        b"beldex-pevm-aux-v1",
+        &[&committee.identity_bytes(), &key_generation.to_le_bytes()],
+    )
+}
+
 /// Run the real cggmp21 aux-info generation to completion over `transport`,
 /// returning this node's serialized `AuxInfo`. All committee members participate;
 /// party index is the committee index. `transport` is expected to authenticate
@@ -160,11 +169,9 @@ pub fn run_cggmp21_aux_over_transport<T: SessionTransport>(
     let (in_tx, in_rx) = mpsc::channel::<Incoming<AuxMsg>>();
 
     // Protocol thread: generate safe primes, then drive the aux-info state machine.
-    // Unique per run, from values every participant agrees on (crate::committee).
-    let eid_bytes = crate::committee::execution_id(
-        b"beldex-pevm-aux-v1",
-        &[&committee.identity_bytes(), &key_generation.to_le_bytes()],
-    );
+    // Unique per run, from values every participant agrees on (crate::committee). The
+    // caller reserves it in the execution ledger before this runs.
+    let eid_bytes = aux_execution_id(committee, key_generation);
 
     let proto = std::thread::spawn(move || -> Result<Vec<u8>, String> {
         let mut rng = rand::rngs::OsRng;

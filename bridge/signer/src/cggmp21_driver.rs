@@ -76,6 +76,16 @@ fn wire(epoch: u64, tag: [u8; 32], from: u16, kind: u8, msg_bytes: &[u8]) -> Wir
     }
 }
 
+/// The cggmp21 execution id of the Pevm keygen for `committee` at `key_generation`. The
+/// same on every participant, so a retry at the same generation derives it again; callers
+/// reserve it in [`crate::execution_ledger`] so that never happens.
+pub fn keygen_execution_id(committee: &crate::committee::CommitteeView, key_generation: u32) -> [u8; 32] {
+    crate::committee::execution_id(
+        b"beldex-pevm-dkg-v1",
+        &[&committee.identity_bytes(), &key_generation.to_le_bytes()],
+    )
+}
+
 /// Run the real cggmp21 keygen to completion over `transport`, returning the
 /// compressed 33-byte group public key `X` (→ the wBDX signer address) and this
 /// node's serialized incomplete key share. `transport` is expected to already
@@ -156,11 +166,9 @@ pub fn run_cggmp21_keygen_over_transport<T: SessionTransport>(
     let (out_tx, out_rx) = mpsc::channel::<Outgoing<KeygenMsg>>();
     let (in_tx, in_rx) = mpsc::channel::<Incoming<KeygenMsg>>();
 
-    // Unique per run, from values every participant agrees on (crate::committee).
-    let eid_bytes = crate::committee::execution_id(
-        b"beldex-pevm-dkg-v1",
-        &[&committee.identity_bytes(), &key_generation.to_le_bytes()],
-    );
+    // Unique per run, from values every participant agrees on (crate::committee). The
+    // caller reserves it in the execution ledger before this runs.
+    let eid_bytes = keygen_execution_id(committee, key_generation);
 
     // Protocol thread: drive the cggmp21 keygen state machine synchronously.
     let proto = std::thread::spawn(move || -> Result<([u8; 33], Vec<u8>), String> {

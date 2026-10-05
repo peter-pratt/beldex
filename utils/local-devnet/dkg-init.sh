@@ -20,6 +20,11 @@
 #                                     ONE host they contend for cores, so 60s is far too
 #                                     little (keygen finishes, aux-info then times out).
 #   ALLOW_CLOBBER=1                   overwrite an existing `shares` tree
+#   BRIDGE_SIGNER_DKG_KEYGEN          key generation, default 0. Each node records the
+#                                     execution ids it has started (devnet/dkg-executions)
+#                                     and refuses to start one twice, so after a FAILED run
+#                                     retry with a fresh number (1, 2, ...) and remember it:
+#                                     dkg-next.sh must not reuse it either.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -90,6 +95,7 @@ for d in beldex-127.0.0.1-*/; do
   BRIDGE_SIGNER_MN_KEY_FILE="$key" BRIDGE_SIGNER_MESH_PORT_BASE=6000 \
   BRIDGE_SIGNER_MESH_USE_CURVE=false \
   BRIDGE_SIGNER_DKG_TIMEOUT_SECS="$TIMEOUT" \
+  BRIDGE_SIGNER_DKG_KEYGEN="${BRIDGE_SIGNER_DKG_KEYGEN:-0}" \
   BRIDGE_SIGNER_SHARE_DIR="$SOCKBASE/${d}devnet/shares" \
     "$SIGNER" dkg > "dkg-${d%/}.log" 2>&1 &
   PIDS="$PIDS $!"

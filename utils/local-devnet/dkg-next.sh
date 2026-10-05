@@ -46,7 +46,8 @@ if [ -z "$KEYGEN" ]; then
   echo "" >&2
   echo "  The number must not repeat one already used. The original devnet key is" >&2
   echo "  generation 0 (the default), so the first rotation is 1, the next 2, ..." >&2
-  echo "  It is recorded in the run log, not on chain — check .debug/history." >&2
+  echo "  Each node also records the ones it has started in devnet/dkg-executions and" >&2
+  echo "  refuses a repeat, so a failed run must be retried with a fresh number." >&2
   exit 1
 fi
 case "$KEYGEN" in
