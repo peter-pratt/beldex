@@ -200,6 +200,9 @@ where
         for w in &mut self.evm {
             match w.advance() {
                 Ok(update) => out.extend(update.finalized),
+                Err(crate::evm_watcher::RpcError::FinalityViolation(why)) => {
+                    eprintln!("!! EVM chain HALTED, nothing on it will be released: {why}")
+                }
                 Err(e) => eprintln!("evm watcher poll failed (will retry): {e:?}"),
             }
         }

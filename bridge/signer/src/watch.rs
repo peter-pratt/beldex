@@ -165,13 +165,15 @@ pub struct Observation<E> {
 /// * `finalized_height` — the chain's own statement that a block will never be
 ///   reversed (BSC's fast finality, Ethereum's finalized checkpoint). When the chain
 ///   offers this, it is an actual guarantee.
-/// * `required_confs` — depth, as a fallback for a chain or endpoint that does not
-///   publish one. Depth is a *probability*, not a promise: a reorg deeper than the
-///   configured number erases a burn the bridge has already paid out against, and the
-///   native release cannot be taken back.
+/// * `required_confs` — depth. Depth is a *probability*, not a promise: a reorg deeper
+///   than the configured number erases a burn the bridge has already paid out against,
+///   and the native release cannot be taken back.
 ///
-/// Depth is still required even when a finalized height is available, so a chain that
-/// reports an implausibly high finalized block cannot make a shallow event final.
+/// So depth alone settles nothing unless the caller opts into it (`depth_only`), which
+/// is for a dev chain with no finality of its own. Without a finalized height, an event
+/// stays pending however deep it is. Depth is still required even when a finalized
+/// height is available, so a chain that reports an implausibly high finalized block
+/// cannot make a shallow event final.
 pub struct FinalityGate;
 
 impl FinalityGate {
@@ -181,6 +183,7 @@ impl FinalityGate {
         tip_height: u64,
         required_confs: u64,
         finalized_height: Option<u64>,
+        depth_only: bool,
     ) -> Finality {
         if !still_canonical {
             return Finality::Dropped;
@@ -195,7 +198,8 @@ impl FinalityGate {
                     Finality::Pending
                 }
             }
-            None if deep_enough => Finality::Final,
+            // No finality source: depth decides only where explicitly allowed.
+            None if depth_only && deep_enough => Finality::Final,
             None => Finality::Pending,
         }
     }
@@ -217,11 +221,22 @@ pub struct TrackerUpdate<E> {
 pub struct Tracker<E> {
     pending: Vec<Observation<E>>,
     required_confs: u64,
+    /// Settle on depth alone when the chain reports no finalized height. Off unless the
+    /// tracker was built with [`Tracker::depth_only`].
+    depth_only: bool,
 }
 
 impl<E: Clone> Tracker<E> {
+    /// Requires the chain's own finalized height, plus `required_confs` of depth.
     pub fn new(required_confs: u64) -> Tracker<E> {
-        Tracker { pending: Vec::new(), required_confs }
+        Tracker { pending: Vec::new(), required_confs, depth_only: false }
+    }
+
+    /// Settles on `required_confs` of depth alone when the chain reports no finalized
+    /// height. Only for a dev chain that has no finality (anvil): on a real chain a
+    /// reorg deeper than the depth reverses an event the bridge has already acted on.
+    pub fn depth_only(required_confs: u64) -> Tracker<E> {
+        Tracker { pending: Vec::new(), required_confs, depth_only: true }
     }
 
     /// Record a freshly-seen observation (idempotence is the caller's concern).
@@ -272,6 +287,7 @@ impl<E: Clone> Tracker<E> {
                 tip_height,
                 self.required_confs,
                 finalized_height,
+                self.depth_only,
             ) {
                 Finality::Final => finalized.push(obs.event),
                 Finality::Dropped => dropped.push(obs),
@@ -397,11 +413,27 @@ mod tests {
 
     #[test]
     fn finality_gate_pending_final_dropped() {
-        // required 12 confs, included at height 100.
-        assert_eq!(FinalityGate::classify(100, true, 105, 12, None), Finality::Pending);
-        assert_eq!(FinalityGate::classify(100, true, 112, 12, None), Finality::Final);
+        // Depth-only (dev chain): required 12 confs, included at height 100.
+        assert_eq!(FinalityGate::classify(100, true, 105, 12, None, true), Finality::Pending);
+        assert_eq!(FinalityGate::classify(100, true, 112, 12, None, true), Finality::Final);
         // reorged away (not canonical) → dropped, even if deep enough.
-        assert_eq!(FinalityGate::classify(100, false, 200, 12, None), Finality::Dropped);
+        assert_eq!(FinalityGate::classify(100, false, 200, 12, None, true), Finality::Dropped);
+    }
+
+    /// H-02: depth is a probability, not finality. Without the chain's own finalized
+    /// height an event never settles, however deep, unless depth-only was chosen.
+    #[test]
+    fn depth_alone_never_settles_by_default() {
+        assert_eq!(FinalityGate::classify(100, true, 1_000_000, 12, None, false), Finality::Pending);
+        assert_eq!(FinalityGate::classify(100, false, 1_000_000, 12, None, false), Finality::Dropped);
+
+        let mut strict: Tracker<MintEvent> = Tracker::new(12);
+        strict.observe(Observation { event: mint(1), inclusion_height: 100, block_hash: [1; 32] });
+        let u = strict.poll(10_000, None, |_, _| true);
+        assert!(u.finalized.is_empty(), "no finalized height: nothing settles");
+        assert_eq!(strict.pending_len(), 1, "it waits rather than being dropped");
+        let u = strict.poll(10_000, Some(100), |_, _| true);
+        assert_eq!(u.finalized, vec![mint(1)], "settles once the chain finalizes it");
     }
 
     /// The chain's own finalised marker is the stronger signal, but depth still has to
@@ -410,20 +442,23 @@ mod tests {
     #[test]
     fn chain_finality_is_required_as_well_as_depth() {
         // Deep enough, but the chain has not finalised that far yet.
-        assert_eq!(FinalityGate::classify(100, true, 120, 12, Some(90)), Finality::Pending);
-        // Finalised AND deep enough.
-        assert_eq!(FinalityGate::classify(100, true, 120, 12, Some(100)), Finality::Final);
-        // Finalised far ahead, but not yet deep — still pending.
-        assert_eq!(FinalityGate::classify(100, true, 105, 12, Some(999)), Finality::Pending);
-        // No finality source: depth alone decides, as before.
-        assert_eq!(FinalityGate::classify(100, true, 120, 12, None), Finality::Final);
-        // Never final once the block is gone, whatever the chain says.
-        assert_eq!(FinalityGate::classify(100, false, 120, 12, Some(999)), Finality::Dropped);
+        for depth_only in [false, true] {
+            assert_eq!(FinalityGate::classify(100, true, 120, 12, Some(90), depth_only), Finality::Pending);
+            // Finalised AND deep enough.
+            assert_eq!(FinalityGate::classify(100, true, 120, 12, Some(100), depth_only), Finality::Final);
+            // Finalised far ahead, but not yet deep — still pending.
+            assert_eq!(FinalityGate::classify(100, true, 105, 12, Some(999), depth_only), Finality::Pending);
+            // Never final once the block is gone, whatever the chain says.
+            assert_eq!(FinalityGate::classify(100, false, 120, 12, Some(999), depth_only), Finality::Dropped);
+        }
+        // No finality source: depth decides only where it was chosen.
+        assert_eq!(FinalityGate::classify(100, true, 120, 12, None, true), Finality::Final);
+        assert_eq!(FinalityGate::classify(100, true, 120, 12, None, false), Finality::Pending);
     }
 
     #[test]
     fn tracker_finalizes_deep_and_drops_reorged() {
-        let mut t: Tracker<MintEvent> = Tracker::new(12);
+        let mut t: Tracker<MintEvent> = Tracker::depth_only(12);
         t.observe(Observation { event: mint(1), inclusion_height: 100, block_hash: [1; 32] });
         t.observe(Observation { event: mint(2), inclusion_height: 100, block_hash: [2; 32] });
 

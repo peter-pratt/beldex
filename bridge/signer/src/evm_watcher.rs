@@ -55,6 +55,10 @@ pub enum RpcError {
     Rpc { code: i64, message: String },
     /// A malformed or unexpected response shape.
     BadResponse(String),
+    /// The endpoint contradicted finality it reported earlier: a finalized block went
+    /// back, or changed. The watcher stops finalizing anything on this chain until a
+    /// person investigates (see [`EvmWatcher::with_finality_record`]).
+    FinalityViolation(String),
 }
 
 /// A single burn log failed to decode (skipped, never fatal to the scan).
@@ -259,6 +263,26 @@ pub fn decode_rotated_logs(result: &Value, chain: ChainId, contract: [u8; 20]) -
         .unwrap_or_default()
 }
 
+/// Replace `path` with `bytes`: scratch file, fsync, rename, then fsync the directory.
+fn write_durably(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    // Unique per write: two processes pointed at one directory must not share a scratch
+    // file (each would truncate the other's, and one rename would fail).
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}-{seq}.tmp", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
+        f.write_all(bytes).map_err(|e| format!("write: {e}"))?;
+        f.sync_all().map_err(|e| format!("fsync: {e}"))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(|e| format!("fsync dir: {e}"))?;
+    }
+    Ok(())
+}
+
 // ---- the watcher -----------------------------------------------------------
 
 /// Blocks per `eth_getLogs` request. Hosted providers reject a wider span, and an
@@ -281,9 +305,20 @@ pub struct EvmWatcher<C: JsonRpcClient> {
     rotations: Tracker<RotationEvent>,
     /// Next block to scan (inclusive).
     next_scan: u64,
+    /// Settle on depth when the chain reports no finalized block. Dev chains only.
+    depth_only: bool,
+    /// The highest finalized block this endpoint has reported: `(height, hash)`. A later
+    /// report below it, or a different hash at its height, is a finality violation.
+    anchor: Option<(u64, [u8; 32])>,
+    /// Where the anchor and any halt are kept across restarts, if configured.
+    record_dir: Option<std::path::PathBuf>,
+    /// Set by a finality violation. Nothing on this chain finalizes while it is set.
+    halted: Option<String>,
 }
 
 impl<C: JsonRpcClient> EvmWatcher<C> {
+    /// A watcher that settles an event only once the chain's own `finalized` block has
+    /// reached it (and it is `confirmations` deep). Depth alone never settles anything.
     pub fn new(client: C, chain: ChainId, contract: [u8; 20], confirmations: u64, start_block: u64) -> Self {
         EvmWatcher {
             client,
@@ -293,6 +328,93 @@ impl<C: JsonRpcClient> EvmWatcher<C> {
             rotations: Tracker::new(confirmations),
             finalized_rotations: Vec::new(),
             next_scan: start_block,
+            depth_only: false,
+            anchor: None,
+            record_dir: None,
+            halted: None,
+        }
+    }
+
+    /// Settle on `confirmations` of depth when the chain reports no finalized block.
+    ///
+    /// Only for a dev chain with no finality of its own (anvil). On a real chain, depth is
+    /// a probability: a reorg deeper than it erases a burn after the native release it
+    /// paid for, and that release cannot be taken back.
+    pub fn depth_only_finality(mut self) -> Self {
+        let confs = self.tracker.required_confs();
+        self.tracker = Tracker::depth_only(confs);
+        self.rotations = Tracker::depth_only(confs);
+        self.depth_only = true;
+        self
+    }
+
+    pub fn is_depth_only(&self) -> bool {
+        self.depth_only
+    }
+
+    /// Keep this chain's finality anchor, and any halt, in `dir` across restarts.
+    ///
+    /// Without it a restart forgets both: an endpoint whose finalized history changed
+    /// while the signer was down would be believed, and a chain halted for a violation
+    /// would quietly resume. A record that cannot be read is an error, never "no record".
+    pub fn with_finality_record(mut self, dir: &std::path::Path) -> Result<Self, String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        let anchor_path = dir.join(format!("{}.anchor", self.chain.0));
+        match std::fs::read_to_string(&anchor_path) {
+            Ok(text) => {
+                let mut it = text.split_whitespace();
+                let height = it.next().and_then(|h| h.parse::<u64>().ok());
+                let hash = it.next().and_then(hex_to_fixed32);
+                match (height, hash, it.next()) {
+                    (Some(h), Some(hash), None) => self.anchor = Some((h, hash)),
+                    _ => return Err(format!("{}: unreadable finality anchor", anchor_path.display())),
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("read {}: {e}", anchor_path.display())),
+        }
+        match std::fs::read_to_string(dir.join(format!("{}.halted", self.chain.0))) {
+            Ok(reason) => self.halted = Some(reason.trim().to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("read halt marker: {e}")),
+        }
+        self.record_dir = Some(dir.to_path_buf());
+        Ok(self)
+    }
+
+    /// Why this chain is halted, if it is.
+    pub fn halted(&self) -> Option<&str> {
+        self.halted.as_deref()
+    }
+
+    /// Check at startup that this endpoint can tell the watcher what is final.
+    ///
+    /// A strict watcher on an endpoint that reports no finalized block would simply never
+    /// settle anything, which reads as a quiet, healthy bridge. A dev chain (anvil,
+    /// hardhat, ganache) has no finality at all however it answers. Both are refused
+    /// here unless depth-only finality was chosen for this chain.
+    pub fn check_finality_source(&self) -> Result<(), String> {
+        if self.depth_only {
+            return Ok(());
+        }
+        if let Ok(v) = self.client.call("web3_clientVersion", json!([])) {
+            let name = v.as_str().unwrap_or_default().to_ascii_lowercase();
+            if ["anvil", "hardhat", "ganache"].iter().any(|d| name.contains(d)) {
+                return Err(format!(
+                    "chain {}: the endpoint is a dev chain ({name}) with no finality; set \
+                     \"depth_only_finality\": true for it if this is a test network",
+                    self.chain.0
+                ));
+            }
+        }
+        match self.finalized_block() {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(format!(
+                "chain {}: the endpoint reports no finalized block, so no burn on it could \
+                 ever be settled; use an endpoint that serves the `finalized` tag",
+                self.chain.0
+            )),
+            Err(e) => Err(format!("chain {}: reading the finalized block: {e:?}", self.chain.0)),
         }
     }
 
@@ -331,30 +453,80 @@ impl<C: JsonRpcClient> EvmWatcher<C> {
         Ok(decode_get_logs(&v, self.chain, self.contract))
     }
 
-    /// The chain's own finalised block height, if it publishes one.
+    /// The chain's own finalised block, `(height, hash)`, if it publishes one.
     ///
-    /// BSC (fast finality) and Ethereum both answer the `finalized` tag; a chain or
-    /// endpoint that does not simply returns nothing and the watcher falls back to
-    /// confirmation depth. An error is treated the same as absence — a finality source
-    /// that is briefly unreachable must not make events look settled.
+    /// BSC (fast finality) and Ethereum both answer the `finalized` tag. A chain or
+    /// endpoint that does not answers nothing, and then nothing settles unless the
+    /// watcher is depth-only.
     ///
-    /// Genesis counts as absence too. A dev chain (anvil) answers the tag but always
-    /// names block 0, which is not a finality claim — genesis is final on every chain, so
-    /// the answer carries no information. Read literally it pins the finalised head below
+    /// Genesis counts as absence. A dev chain (anvil) answers the tag but always names
+    /// block 0, which is not a finality claim — genesis is final on every chain, so the
+    /// answer carries no information. Read literally it pins the finalised head below
     /// every real event and nothing ever settles, which is how it presented: the watcher
     /// held a burn at `pending=1` forever while the tip moved past it.
-    fn finalized_height(&self) -> Option<u64> {
-        let v = self
-            .client
-            .call("eth_getBlockByNumber", json!(["finalized", false]))
-            .ok()?;
+    fn finalized_block(&self) -> Result<Option<(u64, [u8; 32])>, RpcError> {
+        let v = self.client.call("eth_getBlockByNumber", json!(["finalized", false]))?;
         if v.is_null() {
-            return None;
+            return Ok(None);
         }
-        v.get("number")
+        let height = v
+            .get("number")
             .and_then(Value::as_str)
             .and_then(hex_to_u64)
-            .filter(|h| *h > 0)
+            .ok_or_else(|| RpcError::BadResponse("finalized.number".into()))?;
+        let hash = v
+            .get("hash")
+            .and_then(Value::as_str)
+            .and_then(hex_to_fixed32)
+            .ok_or_else(|| RpcError::BadResponse("finalized.hash".into()))?;
+        Ok((height > 0).then_some((height, hash)))
+    }
+
+    /// Hold the endpoint to the finality it reported before. A finalized block may only
+    /// move forward, and the block it named must still be there. Anything else means the
+    /// endpoint is lying, misconfigured, or a load balancer switching between nodes that
+    /// disagree — and finality from it can no longer be trusted, so the chain halts.
+    fn check_anchor(&mut self, now: (u64, [u8; 32])) -> Result<(), RpcError> {
+        if let Some((height, hash)) = self.anchor {
+            let violation = if now.0 < height {
+                Some(format!("finalized height went back from {height} to {}", now.0))
+            } else {
+                match self.block_hash_at(height)? {
+                    Some(h) if h == hash => None,
+                    Some(_) => Some(format!("the finalized block at height {height} changed")),
+                    None => Some(format!("the finalized block at height {height} is gone")),
+                }
+            };
+            if let Some(why) = violation {
+                return Err(self.halt(why));
+            }
+        }
+        if self.anchor.map(|a| a.0) != Some(now.0) {
+            self.anchor = Some(now);
+            self.save_anchor();
+        }
+        Ok(())
+    }
+
+    fn halt(&mut self, why: String) -> RpcError {
+        let reason = format!("chain {}: {why}", self.chain.0);
+        if let Some(dir) = &self.record_dir {
+            let _ = write_durably(&dir.join(format!("{}.halted", self.chain.0)), reason.as_bytes());
+        }
+        self.halted = Some(reason.clone());
+        RpcError::FinalityViolation(reason)
+    }
+
+    fn save_anchor(&self) {
+        let (Some(dir), Some((height, hash))) = (&self.record_dir, self.anchor) else {
+            return;
+        };
+        let hexs: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        let path = dir.join(format!("{}.anchor", self.chain.0));
+        if let Err(e) = write_durably(&path, format!("{height} 0x{hexs}\n").as_bytes()) {
+            // Not fatal to this poll: the in-memory anchor still guards this run.
+            eprintln!("chain {}: could not save finality anchor ({e})", self.chain.0);
+        }
     }
 
     /// The current canonical block hash at `height`, or `None` if that height is not
@@ -372,8 +544,17 @@ impl<C: JsonRpcClient> EvmWatcher<C> {
     /// the current chain (reorg-aware). Returns what became final (actionable
     /// [`ReleaseEvent`]s) and what dropped this step.
     pub fn advance(&mut self) -> Result<TrackerUpdate<ReleaseEvent>, RpcError> {
+        if let Some(why) = &self.halted {
+            return Err(RpcError::FinalityViolation(why.clone()));
+        }
         let tip = self.tip()?;
-        let finalized = self.finalized_height();
+        // An endpoint that cannot answer is not one that says "nothing is final": treat it
+        // as an outage and try again next poll.
+        let finalized_block = self.finalized_block()?;
+        if let Some(fb) = finalized_block {
+            self.check_anchor(fb)?;
+        }
+        let finalized = finalized_block.map(|(h, _)| h);
 
         if tip >= self.next_scan {
             // Bounded span: providers cap the range one `eth_getLogs` may cover, so a
@@ -574,6 +755,10 @@ pub struct EvmChainConfig {
     pub per_epoch_cap: u128,
     /// First block to scan (e.g. the wBDX deployment block); defaults to 0.
     pub start_block: u64,
+    /// Settle burns and rotations on `confirmations` alone when the chain reports no
+    /// finalized block. Dev chains only (anvil); defaults to false, which requires the
+    /// chain's own finality.
+    pub depth_only_finality: bool,
 }
 
 impl EvmChainConfig {
@@ -602,7 +787,8 @@ fn value_to_u128(v: Option<&Value>) -> Option<u128> {
 /// Parse the `BRIDGE_SIGNER_EVM_CHAINS` JSON array into per-chain configs. Shape:
 /// `[{"chain_id":1,"contract":"0x…20 bytes","confirmations":12,"rpc":"https://…",
 ///   "per_tx_max":"…","per_epoch_cap":"…","start_block":18000000}, …]`
-/// (`per_tx_max`/`per_epoch_cap` may be strings or numbers; `start_block` optional).
+/// (`per_tx_max`/`per_epoch_cap` may be strings or numbers; `start_block` optional;
+/// `"depth_only_finality": true` optional, dev chains only).
 pub fn parse_evm_chains(json: &str) -> Result<Vec<EvmChainConfig>, String> {
     let v: Value = serde_json::from_str(json).map_err(|e| format!("EVM chains JSON: {e}"))?;
     let arr = v.as_array().ok_or("EVM chains config must be a JSON array")?;
@@ -623,6 +809,11 @@ pub fn parse_evm_chains(json: &str) -> Result<Vec<EvmChainConfig>, String> {
         let per_tx_max = value_to_u128(row.get("per_tx_max")).ok_or_else(|| miss("per_tx_max"))?;
         let per_epoch_cap = value_to_u128(row.get("per_epoch_cap")).ok_or_else(|| miss("per_epoch_cap"))?;
         let start_block = row.get("start_block").and_then(Value::as_u64).unwrap_or(0);
+        let depth_only_finality = match row.get("depth_only_finality") {
+            None => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err(miss("depth_only_finality (true/false)")),
+        };
 
         out.push(EvmChainConfig {
             chain_id,
@@ -632,6 +823,7 @@ pub fn parse_evm_chains(json: &str) -> Result<Vec<EvmChainConfig>, String> {
             per_tx_max,
             per_epoch_cap,
             start_block,
+            depth_only_finality,
         });
     }
     Ok(out)
@@ -650,13 +842,18 @@ pub fn build_registry(configs: &[EvmChainConfig]) -> Result<ChainRegistry, Strin
 impl EvmChainConfig {
     /// Build a live watcher for this chain over its own HTTP JSON-RPC endpoint.
     pub fn build_watcher(&self) -> EvmWatcher<HttpJsonRpc> {
-        EvmWatcher::new(
+        let w = EvmWatcher::new(
             HttpJsonRpc::new(self.rpc_url.clone()),
             ChainId(self.chain_id),
             self.contract,
             self.confirmations,
             self.start_block,
-        )
+        );
+        if self.depth_only_finality {
+            w.depth_only_finality()
+        } else {
+            w
+        }
     }
 }
 
@@ -769,11 +966,16 @@ mod tests {
                 }
                 "eth_getBlockByNumber" => {
                     let tag = params[0].as_str().unwrap();
-                    // `finalized` models a chain that publishes one; the default node
-                    // answers null, i.e. depth-only finality as before.
+                    // `finalized` models a chain that publishes one; `None` answers null,
+                    // i.e. a chain with no finality of its own.
                     if tag == "finalized" {
                         return Ok(match self.finalized.get() {
-                            Some(h) => json!({ "number": to_hex_quantity(h) }),
+                            Some(h) => {
+                                // A finalized block has a hash, and the block lookup at that
+                                // height must agree with it.
+                                let hash = *self.hashes.borrow_mut().entry(h).or_insert([0xF0; 32]);
+                                json!({ "number": to_hex_quantity(h), "hash": to_hex_bytes(&hash) })
+                            }
                             None => Value::Null,
                         });
                     }
@@ -863,7 +1065,7 @@ mod tests {
             hashes: RefCell::new([(100u64, [0xAA; 32])].into_iter().collect()),
             finalized: Cell::new(None),
         };
-        let mut w = EvmWatcher::new(node, ChainId(1), [0x22; 20], 12, 100);
+        let mut w = EvmWatcher::new(node, ChainId(1), [0x22; 20], 12, 100).depth_only_finality();
 
         // Alice's burn is seen but is only 5 deep, so it is still pending.
         let u = w.advance().unwrap();
@@ -895,7 +1097,7 @@ mod tests {
             hashes: RefCell::new([(100u64, [0xAA; 32])].into_iter().collect()),
             finalized: Cell::new(None),
         };
-        let mut w = EvmWatcher::new(node, ChainId(1), [0x22; 20], 12, 100);
+        let mut w = EvmWatcher::new(node, ChainId(1), [0x22; 20], 12, 100).depth_only_finality();
 
         for _ in 0..5 {
             w.advance().unwrap();
@@ -1000,26 +1202,159 @@ mod tests {
     }
 
     /// A dev chain answers the `finalized` tag but always names genesis. That is not a
-    /// finality claim — genesis is final everywhere — so it must fall back to confirmation
-    /// depth. Taken literally it pinned the finalised head under every real event and the
-    /// watcher held burns pending forever, which is exactly what a devnet burn did.
+    /// finality claim — genesis is final everywhere — so it counts as no finality: a
+    /// strict watcher holds the burn, and only a depth-only watcher lets depth decide.
+    /// (Taken literally, genesis pinned the finalised head under every real event and a
+    /// devnet burn sat pending forever with no explanation.)
     #[test]
-    fn a_genesis_finalized_head_falls_back_to_confirmation_depth() {
-        let node = MockNode {
+    fn a_genesis_finalized_head_is_no_finality() {
+        let node = || MockNode {
             tip: Cell::new(9),
             logs: RefCell::new(vec![burn_log(7, [0xAA; 32], [0x01; 32], 500, b"bxAlice")]),
             hashes: RefCell::new([(7u64, [0xAA; 32])].into_iter().collect()),
             finalized: Cell::new(Some(0)), // anvil: always block 0
         };
-        let mut w = EvmWatcher::new(node, ChainId(1), [0x22; 20], 1, 7);
+        let mut strict = EvmWatcher::new(node(), ChainId(1), [0x22; 20], 1, 7);
+        assert!(strict.advance().unwrap().finalized.is_empty(), "no finality: nothing settles");
 
-        let u = w.advance().unwrap();
-        assert_eq!(
-            u.finalized.len(),
-            1,
-            "genesis carries no finality information; depth must decide"
-        );
+        let mut dev = EvmWatcher::new(node(), ChainId(1), [0x22; 20], 1, 7).depth_only_finality();
+        let u = dev.advance().unwrap();
+        assert_eq!(u.finalized.len(), 1, "depth decides only where it was chosen");
         assert_eq!(u.finalized[0].amount, 500);
+    }
+
+    // ---- H-02: finality, not depth --------------------------------------------------
+    fn deep_burn_node(finalized: Option<u64>) -> MockNode {
+        MockNode {
+            tip: Cell::new(10_000),
+            logs: RefCell::new(vec![burn_log(100, [0xAA; 32], [0x01; 32], 500, b"bxAlice")]),
+            hashes: RefCell::new([(100u64, [0xAA; 32])].into_iter().collect()),
+            finalized: Cell::new(finalized),
+        }
+    }
+
+    /// A burn 9,900 blocks deep on a chain that reports no finality is still not final:
+    /// depth is a probability, and a release paid against it cannot be taken back.
+    #[test]
+    fn a_strict_watcher_never_settles_on_depth_alone() {
+        let mut w = EvmWatcher::new(deep_burn_node(None), ChainId(1), [0x22; 20], 12, 100);
+        for _ in 0..3 {
+            assert!(w.advance().unwrap().finalized.is_empty());
+        }
+        w.client.finalized.set(Some(100));
+        assert_eq!(w.advance().unwrap().finalized.len(), 1, "settles when the chain finalizes it");
+    }
+
+    /// A finalized height that goes back means the endpoint cannot be trusted about
+    /// finality any more. The chain halts, and stays halted.
+    #[test]
+    fn a_finalized_height_going_back_halts_the_chain() {
+        let mut w = EvmWatcher::new(deep_burn_node(Some(500)), ChainId(1), [0x22; 20], 12, 100);
+        w.advance().unwrap();
+        w.client.finalized.set(Some(400));
+        assert!(matches!(w.advance(), Err(RpcError::FinalityViolation(_))));
+        // Even a sane answer afterwards does not resume it on its own.
+        w.client.finalized.set(Some(600));
+        assert!(matches!(w.advance(), Err(RpcError::FinalityViolation(_))));
+        assert!(w.halted().unwrap().contains("went back"));
+    }
+
+    /// The block the endpoint called final must still be there, unchanged.
+    #[test]
+    fn a_changed_finalized_block_halts_the_chain() {
+        let mut w = EvmWatcher::new(deep_burn_node(Some(500)), ChainId(1), [0x22; 20], 12, 100);
+        w.advance().unwrap();
+        // The node now serves a different block at the finalized height 500.
+        w.client.hashes.borrow_mut().insert(500, [0x0B; 32]);
+        let e = w.advance().unwrap_err();
+        assert!(matches!(&e, RpcError::FinalityViolation(m) if m.contains("changed")), "{e:?}");
+
+        // A burn the halted chain would otherwise settle is not released.
+        assert!(w.advance().is_err());
+    }
+
+    fn record_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("bx-evm-finality-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// The anchor outlives the process, so an endpoint whose finalized history went back
+    /// while the signer was down is still caught; and a halt outlives it too.
+    #[test]
+    fn the_anchor_and_a_halt_survive_a_restart() {
+        let dir = record_dir("restart");
+        {
+            let mut w = EvmWatcher::new(deep_burn_node(Some(500)), ChainId(1), [0x22; 20], 12, 100)
+                .with_finality_record(&dir)
+                .unwrap();
+            w.advance().unwrap();
+        }
+        // "Restart" against an endpoint that now reports less.
+        let mut w = EvmWatcher::new(deep_burn_node(Some(450)), ChainId(1), [0x22; 20], 12, 100)
+            .with_finality_record(&dir)
+            .unwrap();
+        assert!(matches!(w.advance(), Err(RpcError::FinalityViolation(_))));
+
+        // And after another restart it is still halted, whatever the endpoint says now.
+        let w = EvmWatcher::new(deep_burn_node(Some(900)), ChainId(1), [0x22; 20], 12, 100)
+            .with_finality_record(&dir)
+            .unwrap();
+        assert!(w.halted().is_some(), "a halt is lifted by a person, not by restarting");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A damaged anchor is an error, never "no anchor": treating it as missing would
+    /// accept whatever the endpoint reports next.
+    #[test]
+    fn a_damaged_anchor_is_refused() {
+        let dir = record_dir("damaged");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("1.anchor"), "five hundred").unwrap();
+        let r = EvmWatcher::new(deep_burn_node(None), ChainId(1), [0x22; 20], 12, 100).with_finality_record(&dir);
+        assert!(r.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An endpoint that names itself.
+    struct Named(MockNode, &'static str);
+    impl JsonRpcClient for Named {
+        fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+            if method == "web3_clientVersion" {
+                return Ok(json!(self.1));
+            }
+            self.0.call(method, params)
+        }
+    }
+
+    /// Startup refuses what could never be finalized: a dev chain, or an endpoint that
+    /// reports no finalized block. Depth-only skips the check because it was chosen.
+    #[test]
+    fn startup_refuses_an_endpoint_without_finality() {
+        let named = |n: MockNode, v| EvmWatcher::new(Named(n, v), ChainId(1), [0x22; 20], 12, 100);
+        let e = named(deep_burn_node(Some(500)), "anvil/v1.0.0").check_finality_source().unwrap_err();
+        assert!(e.contains("dev chain"), "{e}");
+        assert!(named(deep_burn_node(Some(500)), "Hardhat/2.22").check_finality_source().is_err());
+        let e = named(deep_burn_node(None), "Geth/v1.14").check_finality_source().unwrap_err();
+        assert!(e.contains("no finalized block"), "{e}");
+        assert!(named(deep_burn_node(Some(0)), "Geth/v1.14").check_finality_source().is_err(), "genesis is no finality");
+        assert!(named(deep_burn_node(Some(500)), "Geth/v1.14").check_finality_source().is_ok());
+        assert!(named(deep_burn_node(None), "anvil/v1.0.0").depth_only_finality().check_finality_source().is_ok());
+    }
+
+    #[test]
+    fn depth_only_finality_is_opt_in_and_strictly_parsed() {
+        let row = |extra: &str| {
+            format!(
+                r#"[{{"chain_id":1,"contract":"0x{}","confirmations":12,"rpc":"http://x",
+                    "per_tx_max":"1","per_epoch_cap":"2"{extra}}}]"#,
+                "22".repeat(20)
+            )
+        };
+        assert!(!parse_evm_chains(&row("")).unwrap()[0].depth_only_finality, "strict unless asked");
+        assert!(parse_evm_chains(&row(r#","depth_only_finality":true"#)).unwrap()[0].depth_only_finality);
+        assert!(!parse_evm_chains(&row(r#","depth_only_finality":false"#)).unwrap()[0].depth_only_finality);
+        assert!(parse_evm_chains(&row(r#","depth_only_finality":"yes""#)).is_err(), "not a bool");
     }
 
     /// A rotation must be as settled as a burn before it is acknowledged. The bond gate
@@ -1034,7 +1369,7 @@ mod tests {
             hashes: RefCell::new([(100u64, [0xAA; 32])].into_iter().collect()),
             finalized: Cell::new(None),
         };
-        let mut w = EvmWatcher::new(node, ChainId(1), [0x22; 20], 12, 100);
+        let mut w = EvmWatcher::new(node, ChainId(1), [0x22; 20], 12, 100).depth_only_finality();
 
         // Seen, but only 5 deep — not yet acknowledgeable.
         w.advance().unwrap();
@@ -1084,7 +1419,7 @@ mod tests {
             hashes: RefCell::new([(100u64, [0xAA; 32])].into_iter().collect()),
             finalized: Cell::new(None),
         };
-        let mut w = EvmWatcher::new(node, ChainId(1), [0x22; 20], 12, 100);
+        let mut w = EvmWatcher::new(node, ChainId(1), [0x22; 20], 12, 100).depth_only_finality();
 
         // Only 5 deep → still pending.
         let u = w.advance().unwrap();

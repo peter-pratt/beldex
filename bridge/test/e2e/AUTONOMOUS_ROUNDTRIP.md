@@ -65,7 +65,9 @@ export BRIDGE_SIGNER_BELDEXD_RPC=http://127.0.0.1:<this node's rpc port>
 export BRIDGE_SIGNER_GATEWAY_ID=<deposit gateway gwB… or hex id>
 export BRIDGE_SIGNER_GATEWAY_VIEW_SECRET=<32-byte hex view secret>
 export BRIDGE_SIGNER_BELDEX_START_HEIGHT=<recent height>
-export BRIDGE_SIGNER_EVM_CHAINS='[{"chain_id":31337,"rpc_url":"http://127.0.0.1:8545","contract":"<wBDX addr>","confirmations":1,"per_epoch_cap":"1000000000000","per_tx_max":"1000000000000","epoch_blocks":100}]'
+export BRIDGE_SIGNER_EVM_CHAINS='[{"chain_id":31337,"rpc":"http://127.0.0.1:8545","contract":"<wBDX addr>","confirmations":1,"per_epoch_cap":"1000000000000","per_tx_max":"1000000000000","depth_only_finality":true}]'
+# depth_only_finality: anvil has no finality, so this test settles burns on depth alone.
+# Without it the signer refuses anvil at startup. Never set it for a real chain.
 export BRIDGE_SIGNER_WATCH_POLL_SECS=5
 
 # --- release leg ---

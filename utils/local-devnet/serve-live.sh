@@ -110,11 +110,16 @@ SIGN_SIGNERS="${SIGN_SIGNERS:-0,1,2,3,4,5}"
 #     block used to carry an `epoch_blocks` that nothing ever read) looks applied
 #     and is not. `start_block` is the real name for "skip ahead".
 # Caps gate resolve_mint, not the contract — adjust to taste.
+#
+# depth_only_finality: anvil has no finality of its own (its `finalized` tag always names
+# genesis), so burns settle on `confirmations` alone. Signers refuse a dev chain without
+# it. Never set it for a real chain: a reorg deeper than the depth reverses a burn after
+# its BDX was released.
 EVM_START_BLOCK="${EVM_START_BLOCK:-0}"
 EVM_CHAINS=$(cat <<EOF
 [{"chain_id":${CHAIN_ID},"rpc":"${EVM_RPC}","contract":"${WBDX}","confirmations":1,
   "per_epoch_cap":"1000000000000000","per_tx_max":"1000000000000000",
-  "start_block":${EVM_START_BLOCK}}]
+  "start_block":${EVM_START_BLOCK},"depth_only_finality":true}]
 EOF
 )
 
@@ -189,6 +194,7 @@ for d in beldex-127.0.0.1-*/; do
   BRIDGE_SIGNER_BELDEX_START_HEIGHT="$START_HEIGHT" \
   BRIDGE_SIGNER_BELDEX_CONFIRMATIONS="$BELDEX_CONFIRMATIONS" \
   BRIDGE_SIGNER_EVM_CHAINS="$EVM_CHAINS" \
+  BRIDGE_SIGNER_EVM_FINALITY_DIR="$SOCKBASE/${d}devnet/evm-finality" \
   BRIDGE_SIGNER_WATCH_POLL_SECS="$POLL_SECS" \
   BRIDGE_SIGNER_RELEASE_GATEWAY="$RELEASE_GATEWAY" \
   BRIDGE_SIGNER_RELEASE_FEE="$RELEASE_FEE" \

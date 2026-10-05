@@ -869,6 +869,38 @@ fn run_sign(_cfg: &Config) -> Result<(), String> {
 /// `BRIDGE_SIGNER_EVM_CHAINS` and poll for finalized wBDX burns (E.2). Prints each
 /// finalized `ReleaseEvent` and its canonical id (what members agree on). Only built
 /// with `--features evm-watcher-http`.
+/// Build a chain's watcher the way every live path needs it: holding the endpoint to the
+/// finality it has reported before (`BRIDGE_SIGNER_EVM_FINALITY_DIR`, default
+/// `evm-finality`), and refusing at startup an endpoint that cannot say what is final.
+/// A chain configured `depth_only_finality` skips that check and says so loudly.
+#[cfg(feature = "evm-watcher-http")]
+fn live_evm_watcher(
+    c: &beldex_bridge_signer::evm_watcher::EvmChainConfig,
+) -> Result<beldex_bridge_signer::evm_watcher::EvmWatcher<beldex_bridge_signer::evm_watcher::HttpJsonRpc>, String> {
+    let dir = std::env::var("BRIDGE_SIGNER_EVM_FINALITY_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "evm-finality".to_string());
+    let w = c.build_watcher().with_finality_record(std::path::Path::new(&dir))?;
+    if w.is_depth_only() {
+        println!(
+            "  WARNING: chain {} settles burns on {} confirmations alone (depth_only_finality). \
+             A deeper reorg reverses a burn after its BDX was released. Test networks only.",
+            c.chain_id, c.confirmations
+        );
+    } else {
+        w.check_finality_source()?;
+    }
+    if let Some(why) = w.halted() {
+        eprintln!(
+            "!! chain {} is HALTED after a finality violation: {why}\n   Nothing on it will be \
+             released. Investigate the endpoint, then remove {dir}/{}.halted to resume.",
+            c.chain_id, c.chain_id
+        );
+    }
+    Ok(w)
+}
+
 #[cfg(feature = "evm-watcher-http")]
 fn run_watch_evm(_cfg: &Config) -> Result<(), String> {
     use beldex_bridge_signer::evm_watcher::{build_registry, parse_evm_chains};
@@ -904,7 +936,8 @@ fn run_watch_evm(_cfg: &Config) -> Result<(), String> {
         .ok()
         .and_then(|s| s.parse().ok());
 
-    let mut watchers: Vec<_> = configs.iter().map(|c| (c.chain_id, c.build_watcher())).collect();
+    let mut watchers: Vec<_> =
+        configs.iter().map(|c| live_evm_watcher(c).map(|w| (c.chain_id, w))).collect::<Result<_, _>>()?;
     println!(
         "watching {} EVM chain(s), polling every {poll_secs}s: {:?}",
         watchers.len(),
@@ -969,7 +1002,7 @@ fn run_serve(cfg: &Config) -> Result<(), String> {
         return Err("BRIDGE_SIGNER_EVM_CHAINS is empty — no chains to watch".into());
     }
     let registry = build_registry(&configs)?;
-    let evm: Vec<_> = configs.iter().map(|c| c.build_watcher()).collect();
+    let evm: Vec<_> = configs.iter().map(live_evm_watcher).collect::<Result<_, _>>()?;
 
     // Beldex gateway deposits (→ mints).
     let beldexd_rpc =
