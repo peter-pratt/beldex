@@ -61,7 +61,9 @@ fn main() {
                  relay environment:\n  \
                  RELAYER_GAS_KEY   32-byte hex secp256k1 gas key (NOT a bridge key)\n  \
                  RELAYER_CHAINS    JSON: [{{\"chain_id\":31337,\"rpc_url\":\"http://127.0.0.1:8545\"}}]\n\
-                 \t\t    optional per chain: max_fee_cap_wei, priority_fee_wei, gas_limit_pct",
+                 \t\t    optional per chain: max_fee_cap_wei, priority_fee_wei, gas_limit_pct\n  \
+                 RELAYER_STATE_DIR in-flight transactions per gas key (default relayer-state);\n\
+                 \t\t    every relay on one gas key must share it",
                 env!("CARGO_PKG_VERSION")
             );
             std::process::exit(2);
@@ -148,9 +150,14 @@ fn run_prepare(_src: &str) -> Result<String, String> {
 /// `relay <payload>` — sign the outer EIP-1559 envelope with the configured gas key and
 /// broadcast. Reverts (already minted, over cap, bad signature) are caught by the gas
 /// estimation dry-run and reported without spending anything.
+///
+/// The wallet's in-flight transactions are kept in `RELAYER_STATE_DIR` (default
+/// `relayer-state`), so a payload already pending is not sent twice and a transaction stuck
+/// below the base fee is re-priced by the next run. Every run on one gas key must share
+/// that directory.
 #[cfg(feature = "submit-http")]
 fn run_relay(src: &str) -> Result<String, String> {
-    use beldex_bridge_relayer::{ChainEndpoint, HttpSubmitter, RelayPayload, TxSubmitter};
+    use beldex_bridge_relayer::{ChainEndpoint, HttpSubmitter, RelayOutcome, RelayPayload};
 
     let json = read_source(src)?;
     let payload =
@@ -182,15 +189,29 @@ fn run_relay(src: &str) -> Result<String, String> {
         chains.push(ep);
     }
 
+    let state_dir = std::env::var("RELAYER_STATE_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "relayer-state".to_string());
+
     let submitter = HttpSubmitter::new(&key, chains).map_err(|e| format!("gas key: {e}"))?;
     let call = payload.to_prepared();
-    let tx_hash = submitter.submit(&call).map_err(|e| format!("{e:?}"))?;
+    let mut log = Vec::new();
+    let result = submitter.relay(&call, &state_dir, &mut log);
+    for line in &log {
+        eprintln!("  {line}");
+    }
+    let (what, tx_hash, nonce) = match result.map_err(|e| format!("{e:?}"))? {
+        RelayOutcome::Sent { tx_hash, nonce } => ("relayed", tx_hash, nonce),
+        RelayOutcome::AlreadyPending { tx_hash, nonce } => ("already pending", tx_hash, nonce),
+    };
     Ok(format!(
-        "relayed: chain_id {} → {}\n  gas wallet: 0x{}\n  tx: {}\n",
+        "{what}: chain_id {} → {}\n  gas wallet: 0x{}\n  tx: {} (nonce {})\n",
         call.chain_id,
         format_args!("0x{}", hex::encode(call.to)),
         hex::encode(submitter.address),
         tx_hash,
+        nonce,
     ))
 }
 

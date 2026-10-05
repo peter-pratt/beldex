@@ -12,8 +12,10 @@ user builds the same transaction from the signed payload and submits it themselv
 ```
 src/abi.rs      byte-exact ABI calldata for mint(...) / rotateSigner(...) (selectors pinned)
 src/payload.rs  RelayPayload (self-contained signed payload) + JSON codec + PreparedCall
-src/submit.rs   TxSubmitter broadcast seam + a mock (real gas-key backend is a follow-on)
-src/main.rs     `prepare` — emit the {chain_id, to, data} to broadcast
+src/submit.rs   TxSubmitter broadcast seam + a mock
+src/http_submit.rs  the gas-paying submitter behind `relay` (feature submit-http)
+src/relay_state.rs  per-wallet in-flight transactions, locked on disk (feature submit-http)
+src/main.rs     `prepare` — emit the {chain_id, to, data} to broadcast; `relay` — broadcast it
 ```
 
 ## Build & test
@@ -50,10 +52,34 @@ Payload JSON (produced by a signer, or hand-assembled):
   "new_signer": "<40hex>", "new_key_epoch": 7, "sig": "<130hex>" }
 ```
 
-## Reference relayer (follow-on)
+## Reference relayer (`relay`, feature `submit-http`)
 
-The automated service — watch for signed payloads, build+sign the outer EIP-1559 tx with a
-funded gas key, `eth_sendRawTransaction`, and retry — plugs into the `TxSubmitter` seam
-(`src/submit.rs`). It is deliberately not built here: it needs an EVM transaction library and
-a funded key (deployment concerns), and it adds nothing to the trust model. The
-`prepare`/`to_prepared` path already guarantees liveness without it.
+`relay` builds the outer EIP-1559 transaction around a signed payload, signs it with a funded
+gas key (no bridge authority: a leak costs gas, never funds) and broadcasts it. A call that
+would revert (already minted, over cap, bad signature) fails gas estimation and is reported
+without spending anything.
+
+```bash
+cargo build --features submit-http
+export RELAYER_GAS_KEY=<32-byte hex>
+export RELAYER_CHAINS='[{"chain_id":31337,"rpc_url":"http://127.0.0.1:8545"}]'
+export RELAYER_STATE_DIR=/var/lib/beldex-relayer   # default ./relayer-state
+beldex-bridge-relayer relay payload.json           # or `relay -` for stdin
+```
+
+Each gas wallet's in-flight transactions are kept in `RELAYER_STATE_DIR`, one file per
+`(chain, wallet)`, and every run holds an exclusive lock on it while deciding. With that:
+
+- a payload whose call is already pending from this wallet is not sent again (`already
+  pending`), so a re-delivered mint does not pay for a second, reverting transaction;
+- a transaction still unmined after 3 minutes is re-signed at the same nonce with at least
+  +25% fees, or the chain's current fees if higher, up to `max_fee_cap_wei`, so a fee spike
+  cannot leave it blocking every later transaction;
+- one whose call would now revert (another relayer minted the deposit) is replaced by a
+  zero-value transfer to the wallet itself, freeing the nonce without paying for a revert;
+- concurrent runs on one key take turns instead of picking the same nonce.
+
+Stale transactions are only looked at when `relay` runs. Signers re-deliver unminted payloads
+every few minutes, so while anything is outstanding that happens on its own. **Every relay on
+one gas key must use the same state directory**; two directories for one key reintroduce
+nonce collisions.

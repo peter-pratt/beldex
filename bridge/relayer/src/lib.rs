@@ -22,6 +22,9 @@
 //!     resolve nonce/fees/gas, sign the outer envelope with a funded key, broadcast. The gas
 //!     key carries **no bridge authority** (the committee signature is inside the calldata),
 //!     so a leak costs gas, never funds.
+//!   * [`relay_state`] (feature `submit-http`) — the wallet's in-flight transactions, kept
+//!     on disk under a lock, so `relay` neither double-sends a pending call nor leaves a
+//!     stuck transaction blocking the queue.
 //!
 //! The **submit-your-own** liveness guarantee is delivered today by
 //! [`payload::RelayPayload::to_prepared`]: no key, no service, no trust — just the calldata.
@@ -35,6 +38,8 @@ pub mod submit;
 
 #[cfg(feature = "submit-http")]
 pub mod http_submit;
+#[cfg(feature = "submit-http")]
+pub mod relay_state;
 
 pub use digest::{mint_digest, mint_preimage};
 pub use eip1559::Eip1559Tx;
@@ -42,7 +47,7 @@ pub use payload::{PreparedCall, RelayPayload};
 pub use submit::{SubmitError, TxSubmitter};
 
 #[cfg(feature = "submit-http")]
-pub use http_submit::{ChainEndpoint, HttpSubmitter};
+pub use http_submit::{ChainEndpoint, HttpSubmitter, RelayOutcome};
 
 /// Crate version.
 pub const RELAYER_VERSION: [u16; 3] = [0, 1, 0];
