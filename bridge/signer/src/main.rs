@@ -1093,6 +1093,10 @@ fn run_relay_watch_standalone() -> Result<(), String> {
     // The output index is part of the key because one Beldex transaction can pay several
     // gateway outputs, each its own mint. Keying on the txid alone would drop every output
     // after the first for the life of this process.
+    //
+    // Only a payload that RELAYED is marked handled. One whose relay failed must stay
+    // eligible: the signers re-deliver unminted payloads and the daemon re-fans them, and
+    // that re-delivery is this process's only chance to try again.
     let mut handled: std::collections::HashSet<String> = std::collections::HashSet::new();
     let per_sub_timeout = Duration::from_millis(5000 / subs.len().max(1) as u64);
     loop {
@@ -1109,15 +1113,22 @@ fn run_relay_watch_standalone() -> Result<(), String> {
                     let txid = field("beldex_txid", true).unwrap_or_default();
                     let idx = field("output_index", false).unwrap_or_else(|| "0".into());
                     let key = format!("{txid}:{idx}");
-                    if !txid.is_empty() && !handled.insert(key.clone()) {
-                        println!("(skip: {key} already handled this session)");
+                    if !txid.is_empty() && handled.contains(&key) {
+                        println!("(skip: {key} already relayed this session)");
                         continue;
                     }
                     count += 1;
                     println!("[{count}] mint payload received: {payload}");
                     match pipe_to_relay(&cmd, &payload) {
-                        Ok(out) => println!("     relayed: {}", out.trim()),
-                        Err(e) => eprintln!("     RELAY FAILED ({e}) — payload above stays valid"),
+                        Ok(out) => {
+                            println!("     relayed: {}", out.trim());
+                            if !txid.is_empty() {
+                                handled.insert(key);
+                            }
+                        }
+                        Err(e) => eprintln!(
+                            "     RELAY FAILED ({e}) — will try again when it is re-delivered"
+                        ),
                     }
                 }
                 Ok(None) => {}
@@ -1503,6 +1514,51 @@ fn classify_release_build_error(
     beldex_bridge_signer::coordinator::BuildError::Transient(e)
 }
 
+/// The ways a signed mint payload leaves this node: the daemon's mint bus and the optional
+/// relay command. Shared by the duty's completion and the mint outbox's re-delivery sweep,
+/// so a retry goes out exactly the way the first attempt did.
+#[cfg(feature = "omq-client")]
+struct MintHandoff {
+    bus: Option<beldex_bridge_signer::omq_client::OmqCommitteeClient>,
+    bus_genesis: [u8; 32],
+    bus_sign_key: [u8; 64],
+    self_index: u16,
+    relay_cmd: Option<String>,
+    relay_stagger_ms: u64,
+}
+
+#[cfg(feature = "omq-client")]
+impl MintHandoff {
+    /// Best effort on every path: the payload is already saved, and the sweep re-delivers
+    /// anything that has not minted, so a failure here is logged and nothing more.
+    fn deliver(&self, payload: &str) {
+        if let Some(bus) = &self.bus {
+            use beldex_bridge_signer::omq_client::mint_publish_message;
+            let msg = mint_publish_message(&self.bus_genesis, payload);
+            match beldex_bridge_signer::ffi::ed25519_sign_detached(&self.bus_sign_key, &msg) {
+                Ok(pub_sig) => match bus.publish_mint_payload(payload, self.self_index, &pub_sig) {
+                    // `DUPLICATE` = a peer in the same quorum published it moments ago.
+                    // Expected and desirable: one fan-out per deposit, not t+1.
+                    Ok(status) => println!("  published to mint bus: {status}"),
+                    Err(e) => eprintln!("  mint-bus publish failed ({e}) — kept for re-delivery"),
+                },
+                Err(e) => eprintln!("  mint-bus signing failed ({e}) — kept for re-delivery"),
+            }
+        }
+        if let Some(cmd) = &self.relay_cmd {
+            if self.relay_stagger_ms > 0 && self.self_index > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    self.relay_stagger_ms * self.self_index as u64,
+                ));
+            }
+            match pipe_to_relay(cmd, payload) {
+                Ok(out) => println!("  relayed: {}", out.trim()),
+                Err(e) => eprintln!("  RELAY FAILED ({e}) — kept for re-delivery"),
+            }
+        }
+    }
+}
+
 fn run_serve_live<B, C>(
     cfg: &Config,
     src: &mut beldex_bridge_signer::service::WatcherEventSource<B, C>,
@@ -1680,13 +1736,16 @@ where
     //   1. `BRIDGE_SIGNER_RELAY_CMD` — spawn that command and write the payload JSON to its
     //      stdin (e.g. `beldex-bridge-relayer relay -`). The gas key lives in *that*
     //      process's environment, never here.
-    //   2. Always: print `MINT-PAYLOAD <json>`. This line is the **durable artifact** — the
-    //      committee's job is done once the signature exists, and anyone holding this line
-    //      can broadcast it later with `relay -` or `prepare` + `cast send`.
+    //   2. Always: print `MINT-PAYLOAD <json>`, which anyone can broadcast by hand with
+    //      `relay -` or `prepare` + `cast send`.
+    //
+    // Before either, the payload is saved to the mint outbox (`BRIDGE_SIGNER_MINT_OUTBOX`),
+    // and a sweep re-delivers it until `processedDeposits` shows it minted. That record,
+    // not the log line, is what keeps a missed hand-off from stranding the deposit.
     //
     // Broadcast failure therefore does NOT fail the duty: re-running a whole mesh signing
-    // round to retry an HTTP call would be the wrong layer, and the payload is already
-    // public and reusable. Failures are logged loudly instead.
+    // round to retry an HTTP call would be the wrong layer, and the saved payload is
+    // re-delivered anyway. Failures are logged loudly instead.
     //
     // Enabling the hook on several nodes is safe but not free: a *late* duplicate costs
     // nothing (gas estimation catches `Replay()` before broadcasting), while *simultaneous*
@@ -1768,6 +1827,25 @@ where
         Some(c) => println!("  mint hand-off: piping payloads to `{c}` (stagger {}ms)", relay_stagger_ms * self_index as u64),
         None => println!("  mint hand-off: log only (set BRIDGE_SIGNER_RELAY_CMD to auto-broadcast)"),
     }
+    let mint_handoff = Rc::new(MintHandoff {
+        bus: bus_client,
+        bus_genesis,
+        bus_sign_key,
+        self_index,
+        relay_cmd,
+        relay_stagger_ms,
+    });
+    let handoff_for_sweep = Rc::clone(&mint_handoff);
+
+    // Where signed mints are kept until `processedDeposits` shows them minted. The hand-off
+    // above is fire-and-forget; this is what makes a missed one recoverable without a
+    // person reading logs.
+    let mint_outbox_dir = std::env::var("BRIDGE_SIGNER_MINT_OUTBOX")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "mints".to_string());
+    println!("  signed mints kept in: {mint_outbox_dir}");
+    let mint_outbox_for_sweep = mint_outbox_dir.clone();
 
     let done_rpc = rpc.clone();
     let done_contracts = contracts;
@@ -1780,35 +1858,31 @@ where
                 let payload = mint_relay_payload_json(ev, contract, sig);
                 // Print first: the payload must survive even if every hand-off below fails.
                 println!("MINT-PAYLOAD {payload}");
-                if let Some(bus) = &bus_client {
-                    use beldex_bridge_signer::omq_client::mint_publish_message;
-                    let msg = mint_publish_message(&bus_genesis, &payload);
-                    match beldex_bridge_signer::ffi::ed25519_sign_detached(&bus_sign_key, &msg) {
-                        Ok(pub_sig) => match bus.publish_mint_payload(&payload, self_index, &pub_sig) {
-                            // `DUPLICATE` = a peer in the same quorum published it first.
-                            // Expected and desirable: one fan-out per deposit, not t+1.
-                            Ok(status) => println!("  published to mint bus: {status}"),
-                            Err(e) => {
-                                eprintln!("  mint-bus publish failed ({e}) — payload still logged")
-                            }
-                        },
-                        Err(e) => eprintln!("  mint-bus signing failed ({e}) — payload still logged"),
+                // Keep it BEFORE handing it off. Nothing re-runs a completed duty, so a
+                // hand-off that misses with no saved copy strands the deposit until a person
+                // finds the log line above.
+                let record = beldex_bridge_signer::mint_outbox::MintRecord {
+                    chain_id: ev.dst_chain.0,
+                    beldex_txid: hex(&ev.beldex_txid),
+                    output_index: ev.output_index,
+                    payload: payload.clone(),
+                    first_seen: beldex_bridge_signer::release_outbox::now_secs(),
+                    last_attempt: beldex_bridge_signer::release_outbox::now_secs(),
+                    attempts: 1,
+                    warned: false,
+                    gave_up: false,
+                };
+                match beldex_bridge_signer::mint_outbox::save(&mint_outbox_dir, &record) {
+                    Ok(path) => println!("  mint saved for re-delivery: {}", path.display()),
+                    Err(e) => {
+                        // Same rule as releases: never hand off what could not be re-sent.
+                        // A retry costs a signing round; the contract's replay guard makes
+                        // a second signature for this deposit harmless.
+                        eprintln!("  mint outbox write failed ({e}); not handing off yet");
+                        return ExecOutcome::Retry;
                     }
                 }
-                if let Some(cmd) = &relay_cmd {
-                    if relay_stagger_ms > 0 && self_index > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(
-                            relay_stagger_ms * self_index as u64,
-                        ));
-                    }
-                    match pipe_to_relay(cmd, &payload) {
-                        Ok(out) => println!("  relayed: {}", out.trim()),
-                        Err(e) => eprintln!(
-                            "  RELAY FAILED ({e}) — the MINT-PAYLOAD line above is still valid; \
-                             broadcast it with `beldex-bridge-relayer relay -`"
-                        ),
-                    }
-                }
+                mint_handoff.deliver(&payload);
                 ExecOutcome::Submitted
             }
             Duty::Release(_) => {
@@ -1950,6 +2024,9 @@ where
 
     // Re-send pacing in loop ticks. A Beldex block is ~30s, so re-sending every tick
     // would repeat before a block could even exist.
+    // Look at the mint outbox about once a minute; each record's own `due` paces its
+    // re-delivery, so this only bounds how late past its interval it goes out.
+    let mint_retry_ticks = std::cmp::max(1, 60 / poll_secs.max(1));
     let release_retry_ticks =
         std::cmp::max(1, beldex_bridge_signer::release_outbox::RETRY_INTERVAL_SECS / poll_secs.max(1));
     // Re-check queued duties against the chain about once a minute: often enough that a
@@ -2123,6 +2200,82 @@ where
                     ),
                     Err(e) => eprintln!("  rotation ack submission failed ({e}); will retry"),
                 }
+            }
+        }
+
+        // Re-deliver any signed mint the contract has not minted yet. Safe for ever — the
+        // contract refuses a deposit it already minted — so the only reasons to stop are
+        // that it landed, or that a week of re-delivery has not made it land.
+        if ticks % mint_retry_ticks == 0 {
+            use beldex_bridge_signer::mint_outbox as outbox;
+            let now = beldex_bridge_signer::release_outbox::now_secs();
+            for (_, mut rec) in outbox::load_all(&mint_outbox_for_sweep) {
+                if rec.gave_up || !rec.due(now) {
+                    continue;
+                }
+                let Some(beldex_txid) = config::parse_hex32(&rec.beldex_txid) else {
+                    continue;
+                };
+                let duty = Duty::Mint(beldex_bridge_signer::watch::MintEvent {
+                    beldex_txid,
+                    output_index: rec.output_index,
+                    dst_chain: beldex_bridge_signer::chain_registry::ChainId(rec.chain_id),
+                    to: [0u8; 20],
+                    amount: 0,
+                });
+                match reconciler.is_settled(&duty) {
+                    Some(true) => {
+                        println!(
+                            "mint landed on chain {} (deposit {} output {}) — no longer tracked",
+                            rec.chain_id, rec.beldex_txid, rec.output_index
+                        );
+                        outbox::remove(&mint_outbox_for_sweep, &rec);
+                        continue;
+                    }
+                    // The RPC could not say. Leave it for the next sweep rather than
+                    // re-deliver blind or give up on a transport error.
+                    None => continue,
+                    Some(false) => {}
+                }
+                if rec.should_give_up(now) {
+                    rec.gave_up = true;
+                    let _ = outbox::save(&mint_outbox_for_sweep, &rec);
+                    eprintln!(
+                        "!! MINT UNDELIVERED after {} days — chain {} deposit {} output {}\n   \
+                         payload kept in {}; NOT re-delivering further. If the wBDX signer \
+                         has rotated since it was signed, it can no longer mint and the \
+                         deposit needs a fresh signature.",
+                        outbox::GIVE_UP_AFTER_SECS / 86_400,
+                        rec.chain_id,
+                        rec.beldex_txid,
+                        rec.output_index,
+                        mint_outbox_for_sweep
+                    );
+                    continue;
+                }
+                if rec.is_stale(now) && !rec.warned {
+                    rec.warned = true;
+                    eprintln!(
+                        "!! mint still unminted after {}h — chain {} deposit {} output {}. \
+                         Re-delivering; check the relayers' gas, whether the contract is \
+                         paused, and whether its signer rotated.",
+                        outbox::STALE_AFTER_SECS / 3600,
+                        rec.chain_id,
+                        rec.beldex_txid,
+                        rec.output_index
+                    );
+                }
+                println!(
+                    "re-delivering mint (chain {} deposit {} output {}, attempt {})",
+                    rec.chain_id,
+                    rec.beldex_txid,
+                    rec.output_index,
+                    rec.attempts + 1
+                );
+                handoff_for_sweep.deliver(&rec.payload);
+                rec.last_attempt = beldex_bridge_signer::release_outbox::now_secs();
+                rec.attempts += 1;
+                let _ = outbox::save(&mint_outbox_for_sweep, &rec);
             }
         }
 

@@ -914,9 +914,9 @@ void omq_rpc::on_bridge_mint_sub_request(oxenmq::Message& m)
     std::vector<std::string> backlog;
     {
       std::lock_guard lk{bridge_mint_seen_mutex_};
-      backlog.reserve(bridge_mint_retained_.size());
-      for (const auto& [txid, payload] : bridge_mint_retained_)
-        backlog.push_back(payload);
+      backlog.reserve(bridge_mint_order_.size());
+      for (const auto& key : bridge_mint_order_)
+        backlog.push_back(bridge_mint_retained_.at(key).payload);
     }
     auto& omq = core_.get_omq();
     for (const auto& payload : backlog) {
@@ -974,6 +974,7 @@ void omq_rpc::on_bridge_mint_payload(oxenmq::Message& m)
 
   // Well-formedness + the dedup key.
   std::string beldex_txid;
+  uint32_t output_index = 0;
   try {
     const auto j = nlohmann::json::parse(payload);
     if (j.value("kind", "") != "mint") {
@@ -981,6 +982,8 @@ void omq_rpc::on_bridge_mint_payload(oxenmq::Message& m)
       return;
     }
     beldex_txid = j.value("beldex_txid", "");
+    if (j.contains("output_index"))
+      output_index = j.at("output_index").get<uint32_t>();
     if (beldex_txid.empty() || j.value("sig", "").empty()) {
       m.send_reply(OMQ_BAD_REQUEST, "bridge.mint_payload: missing beldex_txid or sig");
       return;
@@ -1028,21 +1031,35 @@ void omq_rpc::on_bridge_mint_payload(oxenmq::Message& m)
     }
   }
 
-  // Every member of the signing quorum produces the SAME payload for a deposit, so without
-  // this the bus would carry t+1 identical copies. The retained window doubles as the
-  // replay-on-subscribe backlog (see the header comment).
+  // Every member of the signing quorum produces the SAME payload for a deposit at about the
+  // same time, so without this the bus would carry t+1 identical copies. A publication after
+  // the quiet period is a signer re-delivering a mint that has not landed, and is fanned out
+  // again: suppressing it for as long as it stays retained would leave a relayer that missed
+  // the first delivery with no second one. The quiet period is well under the signers'
+  // re-delivery interval. The retained window doubles as the replay-on-subscribe backlog
+  // (see the header comment).
+  const std::string key = beldex_txid + ":" + std::to_string(output_index);
+  bool refan = false;
   {
     constexpr size_t MAX_RETAINED = 256; // ≤ 8 KiB each → ≤ 2 MiB worst case
+    constexpr auto REFAN_QUIET = 60s;
+    const auto now = std::chrono::steady_clock::now();
     std::lock_guard lk{bridge_mint_seen_mutex_};
-    if (!bridge_mint_seen_.insert(beldex_txid).second) {
-      MTRACE("bridge.mint_payload: duplicate for txid " << beldex_txid << ", not re-fanning");
-      m.send_reply(OMQ_OK, "DUPLICATE");
-      return;
-    }
-    bridge_mint_retained_.emplace_back(beldex_txid, payload);
-    while (bridge_mint_retained_.size() > MAX_RETAINED) {
-      bridge_mint_seen_.erase(bridge_mint_retained_.front().first);
-      bridge_mint_retained_.pop_front();
+    if (auto it = bridge_mint_retained_.find(key); it != bridge_mint_retained_.end()) {
+      if (now - it->second.fanned_at < REFAN_QUIET) {
+        MTRACE("bridge.mint_payload: duplicate for " << key << ", not re-fanning");
+        m.send_reply(OMQ_OK, "DUPLICATE");
+        return;
+      }
+      it->second = {payload, now};
+      refan = true;
+    } else {
+      bridge_mint_retained_.emplace(key, bridge_mint_entry{payload, now});
+      bridge_mint_order_.push_back(key);
+      while (bridge_mint_order_.size() > MAX_RETAINED) {
+        bridge_mint_retained_.erase(bridge_mint_order_.front());
+        bridge_mint_order_.pop_front();
+      }
     }
   }
 
@@ -1052,8 +1069,9 @@ void omq_rpc::on_bridge_mint_payload(oxenmq::Message& m)
     omq.send(conn, "notify.bridge_mint", payload);
     ++sent;
   });
-  MGINFO("bridge.mint_payload: committee index " << publisher_index << " published mint for txid "
-         << beldex_txid << "; fanned out to " << sent << " subscriber(s)");
+  MGINFO("bridge.mint_payload: committee index " << publisher_index
+         << (refan ? " re-delivered" : " published") << " mint for " << key << "; fanned out to "
+         << sent << " subscriber(s)");
   m.send_reply(OMQ_OK, std::to_string(sent));
 }
 

@@ -74,20 +74,29 @@ class omq_rpc final{
   std::unordered_map<oxenmq::ConnectionID, block_sub> block_subs_;
   std::unordered_map<oxenmq::ConnectionID, bridge_mint_sub> bridge_mint_subs_;
 
-  // Recently published mint payloads, keyed by beldex_txid. Serves two purposes:
+  // Recently published mint payloads, keyed by "beldex_txid:output_index" — one Beldex
+  // transaction can pay several gateway outputs, and each is its own mint. Serves three
+  // purposes:
   //  * de-duplication — the N committee members each produce the SAME payload for one
-  //    deposit; only the first fan-out happens;
+  //    deposit at about the same time; only the first fan-out within a short quiet period
+  //    happens;
+  //  * re-delivery — a publication of the same deposit AFTER that quiet period is fanned out
+  //    again. Signers re-publish payloads the contract has not minted yet, and a relayer that
+  //    missed or failed the first delivery depends on this to get another;
   //  * bounded RETENTION — a subscriber that connects (or reconnects after an outage) is
   //    replayed the retained backlog, so a relayer that was down does not permanently miss
   //    payloads published meanwhile. At-least-once by design: re-delivery is harmless
   //    because the wBDX contract's `processedDeposits` makes minting idempotent (a relayer
   //    detects the replay at gas estimation for the cost of an eth_call).
-  // This is a bounded convenience buffer, NOT durable storage — the durable artifacts are
-  // the signers' MINT-PAYLOAD logs, and the committee itself re-produces any unminted
-  // payload on restart via on-chain reconciliation.
+  // This is a bounded convenience buffer, NOT durable storage — the durable copy is each
+  // signer's mint outbox, which re-publishes until the mint lands.
+  struct bridge_mint_entry {
+    std::string payload;
+    std::chrono::steady_clock::time_point fanned_at;
+  };
   std::mutex bridge_mint_seen_mutex_;
-  std::deque<std::pair<std::string /*txid*/, std::string /*payload*/>> bridge_mint_retained_;
-  std::unordered_set<std::string> bridge_mint_seen_;
+  std::deque<std::string> bridge_mint_order_; // keys, oldest first
+  std::unordered_map<std::string, bridge_mint_entry> bridge_mint_retained_;
 
 public:
   omq_rpc(cryptonote::core& core, core_rpc_server& rpc, const boost::program_options::variables_map& vm);

@@ -114,6 +114,10 @@ pub mod coordinator;
 /// Inspection outages abstain (never NACK an honest leader). [`release_policy::DualPolicy`]
 /// composes mint + release for `serve --live`. std-only; multi-node tested.
 pub mod release_outbox;
+/// **Mint outbox** — each signed mint payload, kept on disk until `processedDeposits` shows
+/// it minted, so a missed hand-off is re-delivered instead of stranding the deposit.
+/// std-only.
+pub mod mint_outbox;
 pub mod release_policy;
 
 /// **On-chain reconciliation** — a restarted signer must not re-work duties consensus already
