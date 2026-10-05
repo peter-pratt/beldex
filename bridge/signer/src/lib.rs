@@ -135,6 +135,11 @@ pub mod reconcile;
 /// under the `tss-integration` feature (needs libsodium at link time).
 #[cfg(feature = "tss-integration")]
 pub mod ffi;
+/// **Share files at rest** — secret shares sealed under a key kept outside the share
+/// directory and bound to their file name; plaintext refused unless a test network
+/// allows it. Needs `ffi` (libsodium).
+#[cfg(feature = "tss-integration")]
+pub mod share_file;
 
 /// Group-key check for combined signatures, own or announced by a peer, before the
 /// coordinator stores or submits them. Needs k256 + libsodium (`tss-integration`).

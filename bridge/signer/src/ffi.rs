@@ -332,6 +332,14 @@ mod tests {
 
 // ---- authenticated encryption for share material at rest --------------------
 
+/// Fill `buf` from libsodium's CSPRNG (e.g. a fresh share key).
+pub fn random_bytes(buf: &mut [u8]) -> Result<(), &'static str> {
+    ensure_init()?;
+    // SAFETY: writes exactly buf.len() bytes into buf.
+    unsafe { sodium::randombytes_buf(buf.as_mut_ptr() as *mut _, buf.len()) };
+    Ok(())
+}
+
 /// Key length for [`aead_encrypt`] / [`aead_decrypt`] (XChaCha20-Poly1305).
 pub const AEAD_KEY_LEN: usize = 32;
 /// Nonce length. 24 bytes is wide enough to pick at random without a counter.
@@ -343,6 +351,13 @@ pub const AEAD_NONCE_LEN: usize = 24;
 /// rather than yielding a corrupted share. The nonce is random per call, which is
 /// safe at this width and needs no persisted counter.
 pub fn aead_encrypt(key: &[u8; AEAD_KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>, &'static str> {
+    aead_encrypt_ad(key, plaintext, &[])
+}
+
+/// [`aead_encrypt`] with associated data: `ad` is authenticated but not stored, so the
+/// ciphertext only opens with the same `ad` (e.g. the file's name, so one encrypted file
+/// cannot be swapped in for another).
+pub fn aead_encrypt_ad(key: &[u8; AEAD_KEY_LEN], plaintext: &[u8], ad: &[u8]) -> Result<Vec<u8>, &'static str> {
     ensure_init()?;
     let mut nonce = [0u8; AEAD_NONCE_LEN];
     // SAFETY: writes exactly NONCE_LEN bytes into a buffer of that size.
@@ -351,15 +366,15 @@ pub fn aead_encrypt(key: &[u8; AEAD_KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8
     let mut out = vec![0u8; plaintext.len() + sodium::crypto_aead_xchacha20poly1305_ietf_ABYTES as usize];
     let mut out_len: u64 = 0;
     // SAFETY: out is sized plaintext+ABYTES per the libsodium contract; all other
-    // pointers are valid for their stated lengths and the AD is empty.
+    // pointers are valid for their stated lengths (an empty AD is passed as null).
     let rc = unsafe {
         sodium::crypto_aead_xchacha20poly1305_ietf_encrypt(
             out.as_mut_ptr(),
             &mut out_len,
             plaintext.as_ptr(),
             plaintext.len() as u64,
-            std::ptr::null(),
-            0,
+            if ad.is_empty() { std::ptr::null() } else { ad.as_ptr() },
+            ad.len() as u64,
             std::ptr::null(),
             nonce.as_ptr(),
             key.as_ptr(),
@@ -377,6 +392,11 @@ pub fn aead_encrypt(key: &[u8; AEAD_KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8
 
 /// Reverse of [`aead_encrypt`]. Fails if the key is wrong or the bytes were altered.
 pub fn aead_decrypt(key: &[u8; AEAD_KEY_LEN], framed: &[u8]) -> Result<Vec<u8>, &'static str> {
+    aead_decrypt_ad(key, framed, &[])
+}
+
+/// Reverse of [`aead_encrypt_ad`]; fails unless `ad` matches what it was sealed with.
+pub fn aead_decrypt_ad(key: &[u8; AEAD_KEY_LEN], framed: &[u8], ad: &[u8]) -> Result<Vec<u8>, &'static str> {
     ensure_init()?;
     if framed.len() < AEAD_NONCE_LEN + sodium::crypto_aead_xchacha20poly1305_ietf_ABYTES as usize {
         return Err("aead ciphertext too short");
@@ -393,8 +413,8 @@ pub fn aead_decrypt(key: &[u8; AEAD_KEY_LEN], framed: &[u8]) -> Result<Vec<u8>, 
             std::ptr::null_mut(),
             ct.as_ptr(),
             ct.len() as u64,
-            std::ptr::null(),
-            0,
+            if ad.is_empty() { std::ptr::null() } else { ad.as_ptr() },
+            ad.len() as u64,
             nonce.as_ptr(),
             key.as_ptr(),
         )

@@ -35,3 +35,26 @@ sockbase_init() {
   echo "   socket paths routed via $SOCKBASE (the real path is ${#PWD} bytes, over the 107-byte unix limit)"
   return 0
 }
+
+# share_key_ready <node devnet dir> [share dir]
+#
+# Key shares are sealed at rest under a per-node key, and the signer refuses plaintext
+# ones. Sets SHARE_KEY_FILE to "<node devnet dir>/share.key" — beside the share trees, not
+# inside them — creating it (owner-only, via `$SIGNER new-share-key`) the first time. With
+# a share dir, also seals any shares in it that predate this (`protect-shares` is
+# idempotent), so an existing devnet keeps working. Needs SIGNER set.
+share_key_ready() {
+  SHARE_KEY_FILE="$1/share.key"
+  if [ ! -f "$SHARE_KEY_FILE" ]; then
+    "$SIGNER" new-share-key "$SHARE_KEY_FILE" >/dev/null || {
+      echo "!! could not create the share key $SHARE_KEY_FILE" >&2
+      return 1
+    }
+  fi
+  if [ -n "${2:-}" ] && [ -d "$2" ]; then
+    BRIDGE_SIGNER_SHARE_KEY_FILE="$SHARE_KEY_FILE" "$SIGNER" protect-shares "$2" >/dev/null || {
+      echo "!! could not seal the shares in $2 (wrong share key?)" >&2
+      return 1
+    }
+  fi
+}

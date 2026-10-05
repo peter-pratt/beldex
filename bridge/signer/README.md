@@ -235,6 +235,9 @@ SIGNER="$(git rev-parse --show-toplevel)/bridge/signer/target/debug/beldex-bridg
 ANY32=$(printf '11%.0s' {1..32})
 SHARE_DIR="$PWD/shares"
 [ -x "$SIGNER" ] || { echo "build first: cargo build --features live-dkg,live-pevm-dkg"; }
+# Shares are sealed at rest; the key lives OUTSIDE the share directory.
+SHARE_KEY_FILE="$PWD/share.key"
+[ -f "$SHARE_KEY_FILE" ] || "$SIGNER" new-share-key "$SHARE_KEY_FILE"
 
 # 1) DKG the Pgw key, persisting each node's share material to $SHARE_DIR
 pkill -f beldex-bridge-signer 2>/dev/null; sleep 1
@@ -248,6 +251,7 @@ for d in beldex-127.0.0.1-*/; do
   BRIDGE_SIGNER_MN_KEY_FILE="$key" BRIDGE_SIGNER_MESH_PORT_BASE=6000 \
   BRIDGE_SIGNER_MESH_USE_CURVE=false BRIDGE_SIGNER_DKG_TIMEOUT_SECS=180 \
   BRIDGE_SIGNER_DKG_LEG=pgw BRIDGE_SIGNER_SHARE_DIR="$SHARE_DIR" \
+  BRIDGE_SIGNER_SHARE_KEY_FILE="$SHARE_KEY_FILE" \
     "$SIGNER" dkg > "dkg-${d%/}.log" 2>&1 &
 done
 wait
@@ -266,6 +270,7 @@ for d in beldex-127.0.0.1-*/; do
   BRIDGE_SIGNER_MN_KEY_FILE="$key" BRIDGE_SIGNER_MESH_PORT_BASE=6000 \
   BRIDGE_SIGNER_MESH_USE_CURVE=false BRIDGE_SIGNER_SHARE_DIR="$SHARE_DIR" \
   BRIDGE_SIGNER_SIGN_DIGEST="$DIGEST" BRIDGE_SIGNER_SIGN_TIMEOUT_SECS=180 \
+  BRIDGE_SIGNER_SHARE_KEY_FILE="$SHARE_KEY_FILE" \
     "$SIGNER" sign > "sign-${d%/}.log" 2>&1 &
 done
 wait
@@ -278,6 +283,32 @@ The default signer set is the first `threshold` committee members; override with
 `BRIDGE_SIGNER_SIGN_SIGNERS="0,1,2,3"`. Nodes outside the set exit cleanly. Every
 signer aggregates the **same** signature independently and confirms libsodium (the
 consensus verifier) accepts it against the gateway `owner_key`.
+
+### Share files at rest
+
+`pgw-<i>.keypackage` and `pevm-<i>.keyshare` are this member's key shares; any four of
+them from different members control the bridge. They are always **sealed**
+(XChaCha20-Poly1305, bound to the file name) under a 32-byte share key, and the signer
+refuses to write or use a plaintext share. The public files beside them (`*.pubkeypackage`,
+`*.groupvk`, `*.groupkey`) stay readable, and the signer checks them against the group
+key inside the sealed share.
+
+The share key is looked up in this order, and must not live inside the share directory:
+
+| Source | Notes |
+|---|---|
+| `BRIDGE_SIGNER_SHARE_KEY_FILE` | 64 hex characters; a regular, owner-only (`0600`) file. Create one with `beldex-bridge-signer new-share-key <path>`. |
+| `$CREDENTIALS_DIRECTORY/bridge-share-key` | systemd `LoadCredential=` / `LoadCredentialEncrypted=`. |
+| `BRIDGE_SIGNER_SHARE_KEY` | Hex in the environment. Accepted, with a warning: any process of this user can read it. |
+
+Back the key up **separately** from the shares: without it they cannot be opened, and a
+backup holding both protects nothing. Shares written before sealing existed are refused
+until sealed in place with `beldex-bridge-signer protect-shares <share dir>` (idempotent;
+the devnet scripts do it automatically); copies of them made earlier should be treated as
+exposed. `BRIDGE_SIGNER_ALLOW_PLAINTEXT_SHARES=1` permits plaintext shares on a test network
+only. The key is still on the host, so this protects every copy that leaves the machine,
+not a running node an attacker controls; that needs non-exportable custody (vault, HSM,
+enclave).
 
 > The `Pevm` leg signs from a **complete** cggmp21 share (keygen + aux-info); the
 > aux-info-over-mesh phase is a follow-on, so `sign` runs the `Pgw` leg live. The

@@ -174,6 +174,8 @@ for d in beldex-127.0.0.1-*/; do
   fi
 
   echo "start ${d%/}: committee index $idx${node_relay:+  (relays mints)}"
+  share_key_ready "$SOCKBASE/${d}devnet" "$share" || exit 1
+  BRIDGE_SIGNER_SHARE_KEY_FILE="$SHARE_KEY_FILE" \
   BRIDGE_SIGNER_GENESIS_HASH="$BRIDGE_SIGNER_GENESIS_HASH" \
   BRIDGE_SIGNER_MINT_BUS_ENDPOINT="ipc://$SOCKBASE/beldex-127.0.0.1-19191/devnet/beldexd.sock" \
   BRIDGE_SIGNER_RELAY_CMD="$node_relay" \

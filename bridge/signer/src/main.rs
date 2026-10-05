@@ -59,6 +59,8 @@ fn print_status(cfg: &Config) {
         println!("subcommands:");
         println!("  dkg  — run the dual DKG over the mesh (persists Pgw share if SHARE_DIR set)");
         println!("  sign — run the Pgw FROST signing over the mesh (loads the persisted share)");
+        println!("  new-share-key <path> — create the key that seals shares (keep it outside the share dir)");
+        println!("  protect-shares [dir] — seal an existing share dir under the configured share key");
     } else {
         println!("(build with --features live-dkg for the `dkg` / `sign` subcommands)");
     }
@@ -219,6 +221,11 @@ fn run_dkg(cfg: &Config) -> Result<(), String> {
             share.parent().unwrap_or(std::path::Path::new(".")).join("dkg-executions")
         }
     };
+    // The shares this run produces must be sealable before the ceremony starts: finding
+    // out at the end would mean a finished DKG whose output cannot be saved.
+    if let Ok(share) = std::env::var("BRIDGE_SIGNER_SHARE_DIR") {
+        beldex_bridge_signer::share_file::require_key(Some(std::path::Path::new(&share)))?;
+    }
     {
         use beldex_bridge_signer::execution_ledger::reserve;
         if run_pgw {
@@ -463,18 +470,17 @@ fn run_dkg(_cfg: &Config) -> Result<(), String> {
     Err("the `dkg` subcommand requires a build with `--features live-dkg`".into())
 }
 
-/// Read secret material written by [`write_secret_file`], decrypting if it is marked
-/// encrypted. A plaintext file is returned as-is so an existing share tree still loads.
+/// Read a secret share file: it must be sealed under the share key (see
+/// [`beldex_bridge_signer::share_file`]); plaintext only on a test network that allows it.
 #[cfg(feature = "live-dkg")]
 fn read_secret_file(path: &str) -> Result<Vec<u8>, String> {
-    let raw = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
-    if !raw.starts_with(SHARE_MAGIC) {
-        return Ok(raw);
-    }
-    let key = share_encryption_key()?.ok_or_else(|| {
-        format!("{path} is encrypted but BRIDGE_SIGNER_SHARE_KEY is not set")
-    })?;
-    beldex_bridge_signer::ffi::aead_decrypt(&key, &raw[SHARE_MAGIC.len()..]).map_err(|e| format!("{path}: {e}"))
+    beldex_bridge_signer::share_file::read_secret(std::path::Path::new(path))
+}
+
+/// Read public group-key material written beside the shares.
+#[cfg(feature = "live-dkg")]
+fn read_public_file(path: &str) -> Result<Vec<u8>, String> {
+    beldex_bridge_signer::share_file::read_public(std::path::Path::new(path))
 }
 
 /// Create a directory for secret material, owner-only.
@@ -490,75 +496,18 @@ fn create_secret_dir(dir: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The at-rest encryption key, from `BRIDGE_SIGNER_SHARE_KEY` (64 hex chars).
-///
-/// A full-width random key rather than a passphrase: an environment variable set by
-/// the service manager is not a place a human types something memorable, and taking a
-/// raw key avoids choosing key-derivation parameters and the weak-passphrase problem
-/// entirely. Unset means shares stay in plaintext, which is the previous behaviour.
-///
-/// Worth being clear about the limit: this key sits on the same host, so it protects
-/// copies that leave the machine — backups, snapshots, log shippers — not an attacker
-/// who has already compromised the running node. That needs a vault or HSM.
-#[cfg(feature = "live-dkg")]
-fn share_encryption_key() -> Result<Option<[u8; 32]>, String> {
-    let hex = match std::env::var("BRIDGE_SIGNER_SHARE_KEY") {
-        Ok(h) if !h.trim().is_empty() => h,
-        _ => return Ok(None),
-    };
-    config::parse_hex32(hex.trim())
-        .map(Some)
-        .ok_or_else(|| "BRIDGE_SIGNER_SHARE_KEY must be 64 hex characters (32 bytes)".to_string())
-}
-
-/// Marks a share file as encrypted. A file without it is read as plaintext, so an
-/// existing share tree keeps working and can be re-encrypted by re-running the DKG.
-#[cfg(feature = "live-dkg")]
-const SHARE_MAGIC: &[u8; 8] = b"BXSHARE1";
-
-/// Write secret material owner-readable and atomically.
-///
-/// The mode matters: with the default umask a key share is world-readable, so any
-/// other account on the host — and every backup, snapshot or log shipper that walks
-/// the directory — can take a copy. The temp-file-and-rename matters because a crash
-/// part way through a plain write leaves a truncated share that is only discovered at
-/// the next signing round.
+/// Write a secret share file, sealed under the share key and bound to its name. Refused
+/// when no key is configured, unless a test network allows plaintext.
 #[cfg(feature = "live-dkg")]
 fn write_secret_file(path: &str, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write;
-    // Encrypt when a key is configured; otherwise write as before.
-    let owned;
-    let bytes: &[u8] = match share_encryption_key()? {
-        Some(key) => {
-            let mut framed = Vec::with_capacity(SHARE_MAGIC.len() + bytes.len() + 40);
-            framed.extend_from_slice(SHARE_MAGIC);
-            framed.extend_from_slice(&beldex_bridge_signer::ffi::aead_encrypt(&key, bytes).map_err(|e| e.to_string())?);
-            owned = framed;
-            &owned
-        }
-        None => bytes,
-    };
-    let tmp = format!("{path}.tmp");
-    {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&tmp).map_err(|e| format!("open {tmp}: {e}"))?;
-        f.write_all(bytes).map_err(|e| format!("write {tmp}: {e}"))?;
-        f.sync_all().map_err(|e| format!("fsync {tmp}: {e}"))?;
-    }
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename {tmp} -> {path}: {e}"))?;
-    // fsync the directory too, or the rename itself may not survive a power loss.
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        if let Ok(d) = std::fs::File::open(parent) {
-            let _ = d.sync_all();
-        }
-    }
-    Ok(())
+    beldex_bridge_signer::share_file::write_secret(std::path::Path::new(path), bytes)
+}
+
+/// Write public group-key material: readable (scripts compare it), owner-only, atomic.
+/// Members never trust it on its own; they check it against their sealed share.
+#[cfg(feature = "live-dkg")]
+fn write_public_file(path: &str, bytes: &[u8]) -> Result<(), String> {
+    beldex_bridge_signer::share_file::write_public(std::path::Path::new(path), bytes)
 }
 
 /// Write this node's `Pgw` DKG material to `<dir>/pgw-<index>.{keypackage,
@@ -572,12 +521,10 @@ fn persist_pgw_material(
     vk: &[u8; 32],
 ) -> Result<(), String> {
     create_secret_dir(dir)?;
-    let write = |suffix: &str, bytes: &[u8]| {
-        write_secret_file(&format!("{dir}/pgw-{self_index}.{suffix}"), bytes)
-    };
-    write("keypackage", kp)?;
-    write("pubkeypackage", pk)?;
-    write("groupvk", vk)?;
+    let path = |suffix: &str| format!("{dir}/pgw-{self_index}.{suffix}");
+    write_secret_file(&path("keypackage"), kp)?;
+    write_public_file(&path("pubkeypackage"), pk)?;
+    write_public_file(&path("groupvk"), vk)?;
     Ok(())
 }
 
@@ -592,7 +539,7 @@ fn persist_pevm_material(
 ) -> Result<(), String> {
     create_secret_dir(dir)?;
     write_secret_file(&format!("{dir}/pevm-{self_index}.keyshare"), keyshare)?;
-    write_secret_file(&format!("{dir}/pevm-{self_index}.groupkey"), x33)?;
+    write_public_file(&format!("{dir}/pevm-{self_index}.groupkey"), x33)?;
     Ok(())
 }
 
@@ -711,7 +658,6 @@ fn sign_pgw(
 ) -> Result<(), String> {
     use beldex_bridge_signer::ffi;
     use beldex_bridge_signer::frost_sign_driver::live::run_live_sign;
-    use frost_ed25519 as frost;
 
     let message: [u8; 32] = match std::env::var("BRIDGE_SIGNER_SIGN_DIGEST") {
         Ok(h) => config::parse_hex32(&h).ok_or("BRIDGE_SIGNER_SIGN_DIGEST must be 32-byte hex")?,
@@ -720,14 +666,7 @@ fn sign_pgw(
             [0x5au8; 32]
         }
     };
-    let read = |suffix: &str| {
-        read_secret_file(&format!("{dir}/pgw-{self_index}.{suffix}"))
-            .map_err(|e| format!("{e} (run `dkg` first with BRIDGE_SIGNER_SHARE_DIR set)"))
-    };
-    let key_package = frost::keys::KeyPackage::deserialize(&read("keypackage")?)
-        .map_err(|e| format!("bad keypackage: {e}"))?;
-    let pubkey_package = frost::keys::PublicKeyPackage::deserialize(&read("pubkeypackage")?)
-        .map_err(|e| format!("bad pubkeypackage: {e}"))?;
+    let (key_package, pubkey_package) = load_pgw_material(&dir, self_index)?;
     let group_vk: [u8; 32] = pubkey_package
         .verifying_key()
         .serialize()
@@ -869,6 +808,68 @@ fn run_sign(_cfg: &Config) -> Result<(), String> {
 /// `BRIDGE_SIGNER_EVM_CHAINS` and poll for finalized wBDX burns (E.2). Prints each
 /// finalized `ReleaseEvent` and its canonical id (what members agree on). Only built
 /// with `--features evm-watcher-http`.
+/// `protect-shares [dir]` (default `BRIDGE_SIGNER_SHARE_DIR`): bring a share directory to
+/// the current at-rest form under the configured share key — seal plaintext shares,
+/// re-seal older sealed ones with their file name bound, and make public group-key files
+/// readable. Run it once on every node whose shares predate this.
+#[cfg(feature = "live-dkg")]
+fn run_protect_shares(dir: Option<String>) -> Result<(), String> {
+    use beldex_bridge_signer::share_file;
+    let dir = dir
+        .or_else(|| std::env::var("BRIDGE_SIGNER_SHARE_DIR").ok())
+        .ok_or("usage: protect-shares <share dir> (or set BRIDGE_SIGNER_SHARE_DIR)")?;
+    let dir = std::path::Path::new(&dir);
+    let key = share_file::configured_key(Some(dir))?.ok_or(
+        "no share key configured: set BRIDGE_SIGNER_SHARE_KEY_FILE (see `new-share-key`)",
+    )?;
+    let r = share_file::protect_dir(dir, &key)?;
+    println!("{}:", dir.display());
+    println!("  sealed from plaintext : {:?}", r.sealed);
+    println!("  re-sealed (name bound): {:?}", r.upgraded);
+    println!("  already current       : {:?}", r.current);
+    println!("  public files unsealed : {:?}", r.unsealed_public);
+    if !r.sealed.is_empty() {
+        println!(
+            "  NOTE: copies of these shares made before now (backups, snapshots) still hold \
+             them in plaintext. Treat those as exposed: delete them, and rotate the keys if a \
+             copy may have left your control."
+        );
+    }
+    Ok(())
+}
+
+/// `new-share-key <path>`: create a fresh random share key file, owner-only, refusing to
+/// overwrite one (losing a key loses the shares sealed under it).
+#[cfg(feature = "live-dkg")]
+fn run_new_share_key(path: Option<String>) -> Result<(), String> {
+    use std::io::Write;
+    let path = path.ok_or("usage: new-share-key <path> (keep it outside the share directory)")?;
+    let mut key = [0u8; 32];
+    beldex_bridge_signer::ffi::random_bytes(&mut key).map_err(|e| e.to_string())?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&path).map_err(|e| format!("create {path}: {e} (an existing key is never overwritten)"))?;
+    f.write_all(format!("{}\n", hex(&key)).as_bytes()).map_err(|e| format!("write {path}: {e}"))?;
+    f.sync_all().map_err(|e| format!("fsync {path}: {e}"))?;
+    println!("share key written to {path}. Back it up separately from the shares: without it they cannot be opened.");
+    Ok(())
+}
+
+#[cfg(not(feature = "live-dkg"))]
+fn run_protect_shares(_dir: Option<String>) -> Result<(), String> {
+    Err("`protect-shares` requires a build with `--features live-dkg`".into())
+}
+
+#[cfg(not(feature = "live-dkg"))]
+fn run_new_share_key(_path: Option<String>) -> Result<(), String> {
+    Err("`new-share-key` requires a build with `--features live-dkg`".into())
+}
+
 /// Build a chain's watcher the way every live path needs it: holding the endpoint to the
 /// finality it has reported before (`BRIDGE_SIGNER_EVM_FINALITY_DIR`, default
 /// `evm-finality`), and refusing at startup an endpoint that cannot say what is final.
@@ -1402,13 +1403,51 @@ impl LiveSigners {
     }
 }
 
+/// Load this node's `Pgw` key package (sealed) and public key package (public), and
+/// require them to name the same group key. The public package is what the aggregator
+/// verifies signature shares and the final signature against, so it must belong to the
+/// share it sits beside.
+#[cfg(feature = "live-dkg")]
+fn load_pgw_material(
+    dir: &str,
+    self_index: u16,
+) -> Result<(frost_ed25519::keys::KeyPackage, frost_ed25519::keys::PublicKeyPackage), String> {
+    use frost_ed25519 as frost;
+    let path = |suffix: &str| format!("{dir}/pgw-{self_index}.{suffix}");
+    let key_package = frost::keys::KeyPackage::deserialize(
+        &read_secret_file(&path("keypackage"))
+            .map_err(|e| format!("pgw: {e} (run `dkg` first with BRIDGE_SIGNER_SHARE_DIR set)"))?,
+    )
+    .map_err(|e| format!("bad pgw keypackage: {e}"))?;
+    let pubkey_package = frost::keys::PublicKeyPackage::deserialize(&read_public_file(&path("pubkeypackage"))?)
+        .map_err(|e| format!("bad pgw pubkeypackage: {e}"))?;
+    if key_package.verifying_key() != pubkey_package.verifying_key() {
+        return Err(format!(
+            "{} names a different group key than the sealed share; the public file was \
+             altered or belongs to another key",
+            path("pubkeypackage")
+        ));
+    }
+    Ok((key_package, pubkey_package))
+}
+
+/// The compressed `Pevm` group key inside a cggmp21 key share.
+#[cfg(feature = "live-pevm-dkg")]
+fn pevm_group_key_of(share: &[u8]) -> Result<Vec<u8>, String> {
+    use cggmp21::key_share::AnyKeyShare;
+    let share: cggmp21::KeyShare<
+        cggmp21::supported_curves::Secp256k1,
+        cggmp21::security_level::SecurityLevel128,
+    > = serde_json::from_slice(share).map_err(|e| format!("deserialize Pevm key share: {e}"))?;
+    Ok(share.shared_public_key().to_bytes(true).as_ref().to_vec())
+}
+
 /// Build the [`LiveSigners`] context: fetch the committee, resolve this node's index + signer
 /// set, load both legs' key material (`dkg` output under `BRIDGE_SIGNER_SHARE_DIR`), and derive
 /// the mesh identity from the MN key. Mirrors the `sign` subcommand's setup.
 #[cfg(feature = "serve-live")]
 fn build_live_signers(cfg: &Config) -> Result<LiveSigners, String> {
     use beldex_bridge_signer::ffi;
-    use frost_ed25519 as frost;
     use std::time::Duration;
 
     let dir = std::env::var("BRIDGE_SIGNER_SHARE_DIR")
@@ -1480,14 +1519,7 @@ fn build_live_signers(cfg: &Config) -> Result<LiveSigners, String> {
             }
         }
     }
-    let read = |suffix: &str| {
-        read_secret_file(&format!("{dir}/pgw-{self_index}.{suffix}"))
-            .map_err(|e| format!("pgw: {e} (run `dkg` first with BRIDGE_SIGNER_SHARE_DIR set)"))
-    };
-    let pgw_key_package = frost::keys::KeyPackage::deserialize(&read("keypackage")?)
-        .map_err(|e| format!("bad pgw keypackage: {e}"))?;
-    let pgw_pubkey_package = frost::keys::PublicKeyPackage::deserialize(&read("pubkeypackage")?)
-        .map_err(|e| format!("bad pgw pubkeypackage: {e}"))?;
+    let (pgw_key_package, pgw_pubkey_package) = load_pgw_material(&dir, self_index)?;
     let pgw_group_vk: [u8; 32] = pgw_pubkey_package
         .verifying_key()
         .serialize()
@@ -1495,20 +1527,24 @@ fn build_live_signers(cfg: &Config) -> Result<LiveSigners, String> {
         .and_then(|v| v.try_into().ok())
         .ok_or("cannot serialize pgw group verifying key")?;
 
-    // Pevm cggmp21 keyshare (raw bytes; the driver deserializes).
-    let pevm_key_share = std::fs::read(format!("{dir}/pevm-{self_index}.keyshare"))
-        .map_err(|e| format!("read pevm keyshare: {e} (run `dkg` first with BRIDGE_SIGNER_SHARE_DIR set)"))?;
+    // Pevm cggmp21 keyshare (sealed; the driver deserializes the opened bytes).
+    let pevm_key_share = read_secret_file(&format!("{dir}/pevm-{self_index}.keyshare"))
+        .map_err(|e| format!("pevm: {e} (run `dkg` first with BRIDGE_SIGNER_SHARE_DIR set)"))?;
     // The wBDX signer address this share set signs as — what the contract's `currentSigner`
-    // reads while this key is the live one.
+    // reads while this key is the live one. Taken from the sealed share, not the public
+    // group-key file beside it, which only has to agree.
     let pevm_address = {
         use k256::ecdsa::VerifyingKey;
-        use sha3::{Digest, Keccak256};
-        let x33 = read_secret_file(&format!("{dir}/pevm-{self_index}.groupkey"))?;
-        let vk = VerifyingKey::from_sec1_bytes(&x33).map_err(|e| format!("bad pevm groupkey: {e}"))?;
-        let h = Keccak256::digest(&vk.to_encoded_point(false).as_bytes()[1..]);
-        let mut a = [0u8; 20];
-        a.copy_from_slice(&h[12..]);
-        a
+        let x33 = pevm_group_key_of(&pevm_key_share)?;
+        let on_disk = read_public_file(&format!("{dir}/pevm-{self_index}.groupkey"))?;
+        if on_disk != x33 {
+            return Err(format!(
+                "{dir}/pevm-{self_index}.groupkey does not match the group key in the sealed \
+                 share; the public file was altered or belongs to another key"
+            ));
+        }
+        let vk = VerifyingKey::from_sec1_bytes(&x33).map_err(|e| format!("bad pevm group key: {e}"))?;
+        beldex_bridge_signer::aggregate_signature::eth_address(&vk)
     };
 
     Ok(LiveSigners {
@@ -2508,6 +2544,22 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    if matches!(subcommand.as_deref(), Some("protect-shares") | Some("new-share-key")) {
+        let arg = std::env::args().nth(2);
+        let r = if subcommand.as_deref() == Some("protect-shares") {
+            run_protect_shares(arg)
+        } else {
+            run_new_share_key(arg)
+        };
+        return match r {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{}: {e}", subcommand.unwrap_or_default());
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     if subcommand.as_deref() == Some("relay-watch") {
         return match run_relay_watch_standalone() {
             Ok(()) => ExitCode::SUCCESS,
@@ -2568,98 +2620,63 @@ fn main() -> ExitCode {
 mod secret_file_tests {
     use super::*;
 
-    /// `BRIDGE_SIGNER_SHARE_KEY` is process-global, so these tests must not run
-    /// concurrently or one will observe another's key.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// A key share written with the default umask is world-readable, so any other
-    /// account on the host — and every backup or log shipper that walks the
-    /// directory — can take a copy.
+    /// The share directory is owner-only: other accounts on the host cannot list it.
+    /// (Sealing, key handling and plaintext refusal are tested in `share_file`.)
     #[cfg(unix)]
     #[test]
-    fn a_share_is_written_owner_only() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    fn a_share_dir_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("bx-secret-{}", std::process::id()));
         let d = dir.to_str().unwrap();
         create_secret_dir(d).unwrap();
-        let path = format!("{d}/share");
-        std::env::remove_var("BRIDGE_SIGNER_SHARE_KEY");
-        write_secret_file(&path, b"key material").unwrap();
-
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "share must not be readable by anyone else");
         let dmode = std::fs::metadata(d).unwrap().permissions().mode() & 0o777;
         assert_eq!(dmode, 0o700, "share directory must not be listable by others");
-        assert_eq!(std::fs::read(&path).unwrap(), b"key material");
         let _ = std::fs::remove_dir_all(d);
     }
 
-    /// With a key set, the share must not be on disk in the clear, and must come back
-    /// intact. This is what makes a stolen backup or snapshot useless on its own.
+    /// End to end with real FROST material: `dkg`'s writer seals the share and leaves the
+    /// public package readable; the loader opens it and accepts the pair; a public package
+    /// from another key put in its place is refused rather than trusted.
     #[test]
-    fn an_encrypted_share_round_trips_and_is_not_plaintext_on_disk() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("bx-enc-{}", std::process::id()));
+    fn pgw_material_is_sealed_and_its_public_package_must_match() {
+        use frost_ed25519 as frost;
+        let root = std::env::temp_dir().join(format!("bx-pgw-material-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = root.join("shares");
         let d = dir.to_str().unwrap();
-        create_secret_dir(d).unwrap();
-        let path = format!("{d}/share");
-        let secret = b"the key share bytes";
+        let key_file = root.join("share.key");
+        std::fs::write(&key_file, "5a".repeat(32)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        std::env::set_var("BRIDGE_SIGNER_SHARE_KEY_FILE", &key_file);
 
-        std::env::set_var("BRIDGE_SIGNER_SHARE_KEY", "11".repeat(32));
-        write_secret_file(&path, secret).unwrap();
+        let deal = || {
+            let (shares, pk) = frost::keys::generate_with_dealer(6, 4, frost::keys::IdentifierList::Default, &mut rand::rngs::OsRng)
+                .unwrap();
+            let kp = frost::keys::KeyPackage::try_from(shares.into_values().next().unwrap()).unwrap();
+            (kp, pk)
+        };
+        let (kp, pk) = deal();
+        let vk: [u8; 32] = pk.verifying_key().serialize().unwrap().try_into().unwrap();
+        persist_pgw_material(d, 0, &kp.serialize().unwrap(), &pk.serialize().unwrap(), &vk).unwrap();
 
-        let on_disk = std::fs::read(&path).unwrap();
-        assert!(on_disk.starts_with(SHARE_MAGIC), "must be marked encrypted");
-        assert!(
-            !on_disk.windows(secret.len()).any(|w| w == secret),
-            "the share must not appear in the clear on disk"
-        );
-        assert_eq!(read_secret_file(&path).unwrap(), secret);
+        let on_disk = std::fs::read(dir.join("pgw-0.keypackage")).unwrap();
+        assert!(on_disk.starts_with(beldex_bridge_signer::share_file::MAGIC_V2), "the share is sealed");
+        assert_eq!(std::fs::read(dir.join("pgw-0.groupvk")).unwrap(), vk, "public file readable");
+        let (loaded, _) = load_pgw_material(d, 0).unwrap();
+        assert_eq!(loaded.verifying_key(), kp.verifying_key());
 
-        // The wrong key must fail loudly rather than return rubbish.
-        std::env::set_var("BRIDGE_SIGNER_SHARE_KEY", "22".repeat(32));
-        assert!(read_secret_file(&path).is_err());
+        let (_, other) = deal();
+        std::fs::write(dir.join("pgw-0.pubkeypackage"), other.serialize().unwrap()).unwrap();
+        let e = load_pgw_material(d, 0).unwrap_err();
+        assert!(e.contains("different group key"), "{e}");
 
-        // And an encrypted share with no key configured must say so plainly.
-        std::env::remove_var("BRIDGE_SIGNER_SHARE_KEY");
-        let err = read_secret_file(&path).unwrap_err();
-        assert!(err.contains("BRIDGE_SIGNER_SHARE_KEY"), "got: {err}");
-        let _ = std::fs::remove_dir_all(d);
-    }
-
-    /// A share tree written before encryption existed must still load, so enabling the
-    /// key does not strand a node that already holds shares.
-    #[test]
-    fn an_existing_plaintext_share_still_loads() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("bx-plain-{}", std::process::id()));
-        let d = dir.to_str().unwrap();
-        create_secret_dir(d).unwrap();
-        let path = format!("{d}/share");
-        std::env::remove_var("BRIDGE_SIGNER_SHARE_KEY");
-        std::fs::write(&path, b"legacy share").unwrap();
-        assert_eq!(read_secret_file(&path).unwrap(), b"legacy share");
-        let _ = std::fs::remove_dir_all(d);
-    }
-
-    /// Overwriting must not leave a truncated share behind: the content is replaced
-    /// in one step, and no temp file survives.
-    #[test]
-    fn overwriting_a_share_is_atomic() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("bx-atomic-{}", std::process::id()));
-        let d = dir.to_str().unwrap();
-        create_secret_dir(d).unwrap();
-        let path = format!("{d}/share");
-
-        std::env::remove_var("BRIDGE_SIGNER_SHARE_KEY");
-        write_secret_file(&path, &vec![0xAA; 4096]).unwrap();
-        write_secret_file(&path, b"short").unwrap();
-
-        assert_eq!(std::fs::read(&path).unwrap(), b"short", "content fully replaced");
-        assert!(!std::path::Path::new(&format!("{path}.tmp")).exists(), "no temp file left");
-        let _ = std::fs::remove_dir_all(d);
+        std::env::remove_var("BRIDGE_SIGNER_SHARE_KEY_FILE");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A burn naming an address the daemon cannot parse can never be paid, so retrying it

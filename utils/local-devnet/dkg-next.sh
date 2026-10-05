@@ -149,6 +149,8 @@ for d in beldex-127.0.0.1-*/; do
   # the node cannot join the authenticated mesh.
   [ -S "$sock" ] && [ -f "$key" ] || continue
   mkdir -p "$share"
+  share_key_ready "$SOCKBASE/${d}devnet" "$share" || exit 1
+  BRIDGE_SIGNER_SHARE_KEY_FILE="$SHARE_KEY_FILE" \
   BRIDGE_SIGNER_BELDEXD_RPC_URL="http://127.0.0.1:19191" \
   BRIDGE_SIGNER_OXENMQ_ENDPOINT="ipc://$sock" \
   BRIDGE_SIGNER_GATEWAY_ID="$ANY32" BRIDGE_SIGNER_SELF_MN_PUBKEY="$ANY32" \
