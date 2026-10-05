@@ -23,11 +23,12 @@ RPC="${RPC:-http://127.0.0.1:8545}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTRACTS_DIR="${CONTRACTS_DIR:-$SCRIPT_DIR/../../../../bridge-contract}"
 
-# Caps in 9-decimal wBDX units (1 unit == 1 atomic BDX). WINDOW_MINT_CAP <= BOND_BACKING_CAP_LIMIT.
+# Caps in 9-decimal wBDX units (1 unit == 1 atomic BDX). WINDOW_MINT_CAP <= BOND_BACKING_CAP_LIMIT / 2:
+# the backing covers the two full windows a key can mint across a window boundary.
 export INITIAL_SIGNER
 export WINDOW_MINT_CAP="${WINDOW_MINT_CAP:-1000000000000000}"     # 1,000,000 wBDX
 export PER_TX_MAX="${PER_TX_MAX:-100000000000000}"               # 100,000 wBDX
-export BOND_BACKING_CAP_LIMIT="${BOND_BACKING_CAP_LIMIT:-1400000000000000}"
+export BOND_BACKING_CAP_LIMIT="${BOND_BACKING_CAP_LIMIT:-2000000000000000}"  # 2,000,000 wBDX
 export EPOCH_SECONDS="${EPOCH_SECONDS:-86400}"
 export ROTATE_TIMELOCK="${ROTATE_TIMELOCK:-172800}"
 
