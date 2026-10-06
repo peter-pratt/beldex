@@ -1729,6 +1729,9 @@ where
         None
     };
     let bus_sign_key = ls.ed25519_secret;
+    // Named in every publication, so the daemon can authenticate a member of a committee
+    // it has since moved past with one lookup and one signature check.
+    let bus_master_node = ls.committee.members[ls.self_index as usize];
 
     // Where signed releases are kept until they are known to have landed. A release that
     // cannot be re-sent is a payout that can go missing silently.
@@ -1784,7 +1787,7 @@ where
                     use beldex_bridge_signer::omq_client::mint_publish_message;
                     let msg = mint_publish_message(&bus_genesis, &payload);
                     match beldex_bridge_signer::ffi::ed25519_sign_detached(&bus_sign_key, &msg) {
-                        Ok(pub_sig) => match bus.publish_mint_payload(&payload, self_index, &pub_sig) {
+                        Ok(pub_sig) => match bus.publish_mint_payload(&payload, self_index, &pub_sig, &bus_master_node) {
                             // `DUPLICATE` = a peer in the same quorum published it first.
                             // Expected and desirable: one fan-out per deposit, not t+1.
                             Ok(status) => println!("  published to mint bus: {status}"),
@@ -1930,9 +1933,9 @@ where
         cfg.oxenmq_endpoint.clone(),
     );
     let mut committee_changed = false;
-    let key_probe_evm: Vec<(u64, HttpJsonRpc, [u8; 20])> = configs
+    let key_probe_evm: Vec<(u64, HttpJsonRpc, [u8; 20], u64)> = configs
         .iter()
-        .map(|c| (c.chain_id, HttpJsonRpc::new(c.rpc_url.clone()), c.contract))
+        .map(|c| (c.chain_id, HttpJsonRpc::new(c.rpc_url.clone()), c.contract, c.confirmations))
         .collect();
     let key_probe_gw = HttpJsonRpc::new(format!("{}/json_rpc", beldexd_rpc.trim_end_matches('/')));
     let mut mint_key_replaced: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
@@ -1974,17 +1977,27 @@ where
             }
         }
         // Is this node's key still the live one? Same cadence. An unreadable answer is not a
-        // replacement — only a signer / owner that reads back and differs counts.
+        // replacement — only a signer / owner that reads back and differs counts. The wBDX
+        // signer is read at the watcher's confirmation depth, not the tip: stopping is not
+        // undone, so it must not act on an activation a reorg can still take back.
         if ticks % 12 == 0 {
             use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
             use sha3::{Digest, Keccak256};
             let ours = format!("0x{}", hex(&ls.pevm_address));
             let selector = format!("0x{}", hex(&Keccak256::digest(b"currentSigner()")[..4]));
-            for (chain_id, client, contract) in &key_probe_evm {
+            for (chain_id, client, contract, confirmations) in &key_probe_evm {
                 if mint_key_replaced.contains(chain_id) {
                     continue;
                 }
-                let params = serde_json::json!([{ "to": format!("0x{}", hex(contract)), "data": selector }, "latest"]);
+                let Ok(tip) = client.call("eth_blockNumber", serde_json::json!([])) else { continue };
+                let Some(tip) = tip.as_str().and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok()) else {
+                    continue;
+                };
+                let Some(at) = tip.checked_sub(*confirmations) else { continue };
+                let params = serde_json::json!([
+                    { "to": format!("0x{}", hex(contract)), "data": selector },
+                    format!("0x{at:x}")
+                ]);
                 let Ok(word) = client.call("eth_call", params) else { continue };
                 let Some(word) = word.as_str().filter(|w| w.len() == 66) else { continue };
                 let live = format!("0x{}", &word[26..]).to_lowercase();

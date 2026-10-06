@@ -2297,6 +2297,22 @@ namespace master_nodes
       return true;
     }
 
+    // The bridge reserve gateway a network's bridge pays out of (hex gateway id). Anyone may
+    // register a gateway carrying the bridge_reserve flag, so only THIS one's owner changes
+    // count as the gateway's side of a committee rotation — the hand-over a departing seat's
+    // bond waits for. Empty = not pinned: the first bridge-reserve gateway registered on the
+    // chain is the one. That is fine on a local network; pin it before a public network's
+    // bridge launches, or whoever registers a flagged gateway first decides which one counts.
+    std::string_view bridge_gateway_id(cryptonote::network_type nettype)
+    {
+      switch (nettype)
+      {
+        case cryptonote::network_type::MAINNET: return "";
+        case cryptonote::network_type::TESTNET: return "";
+        default:                                return "";
+      }
+    }
+
     // Does a baseline name at least one wBDX chain? A seated seat holds a share of every
     // wBDX key, so a baseline without one records none of the hand-offs its bond must
     // wait for; the gateway entry (the reserved id) covers only the gateway's side.
@@ -2586,7 +2602,8 @@ namespace master_nodes
     return true;
   }
 
-  bool master_node_list::state_t::process_bridge_gateway_owner_tx(const cryptonote::transaction &tx)
+  bool master_node_list::state_t::process_bridge_gateway_owner_tx(cryptonote::network_type nettype,
+                                                                  const cryptonote::transaction &tx)
   {
     // The gateway's side of a committee rotation: its owner key handed to the incoming
     // committee's Pgw (the hand-over update), or taken by governance (a re-point). Consensus
@@ -2604,10 +2621,15 @@ namespace master_nodes
                              [&](const bridge_gateway_owner &g) { return g.gateway_id == gateway_id; });
       if (it == bridge_gateway_owners.end())
       {
-        // Only a bridge-reserve gateway is tracked; the flag is sticky, so every later
-        // descriptor of such a gateway carries it too. First sight is its registration —
-        // nothing is handed over yet.
-        if (desc.is_bridge_reserve())
+        // Only THE bridge gateway is tracked (bridge_gateway_id): the pinned one, or with
+        // none pinned the first bridge-reserve gateway seen. Any other flagged gateway is
+        // anyone's, and its owner changes say nothing about the bridge's key. The flag is
+        // sticky, so every later descriptor of the bridge gateway carries it too. First
+        // sight is its registration — nothing is handed over yet.
+        const auto pinned = bridge_gateway_id(nettype);
+        const bool is_the_bridge_gateway =
+            pinned.empty() ? bridge_gateway_owners.empty() : tools::type_to_hex(gateway_id) == pinned;
+        if (desc.is_bridge_reserve() && is_the_bridge_gateway)
           bridge_gateway_owners.push_back(bridge_gateway_owner{gateway_id, owner_hash(desc.owner_key)});
         return;
       }
@@ -2902,7 +2924,7 @@ namespace master_nodes
       // HF23: a bridge-reserve gateway handed to a new owner key — the gateway's side of a
       // committee rotation (register / update ride their own tx types; a re-point any).
       if (hf_version >= cryptonote::hf::hf23_bridge)
-        process_bridge_gateway_owner_tx(tx);
+        process_bridge_gateway_owner_tx(nettype, tx);
     }
 
     // HF23: release any elapsed unbonds, then (re)assign bridge seats

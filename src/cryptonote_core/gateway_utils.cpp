@@ -447,6 +447,14 @@ bool verify_bridge_rotation_evidence(const tx_extra_bridge_rotation_ack& ack,
     reason = "rotation ack: new_signer must be exactly 20 bytes";
     return false;
   }
+  // The gateway's slot is not a wBDX chain. Consensus applies the gateway's owner changes
+  // itself and counts them there; no committee's word may move that count, or a bond
+  // waiting on the gateway hand-over could be released by attestation alone.
+  if (ack.chain_id == BRIDGE_GATEWAY_CHAIN_ID)
+  {
+    reason = "rotation ack: chain id 0 is the native gateway, which consensus observes itself";
+    return false;
+  }
   if (threshold == 0)
   {
     reason = "zero rotation threshold";

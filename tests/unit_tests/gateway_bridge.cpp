@@ -924,7 +924,7 @@ TEST(GatewayBridgeRotation, bond_waits_for_two_hand_overs_on_every_side_includin
   const crypto::public_key key_a = rand_pubkey(), key_b = rand_pubkey(), key_c = rand_pubkey();
 
   // The bridge gateway registered under key A: tracked, nothing handed over yet.
-  EXPECT_FALSE(cur.process_bridge_gateway_owner_tx(gateway_tx(gateway_descriptor_op_type::register_address, key_a)));
+  EXPECT_FALSE(cur.process_bridge_gateway_owner_tx(NET_FC, gateway_tx(gateway_descriptor_op_type::register_address, key_a)));
   EXPECT_EQ(observed_epoch(cur, BRIDGE_GATEWAY_CHAIN_ID), 0u);
   ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 1, {0, 1, 2, 3}, 3), 5000));
 
@@ -945,16 +945,16 @@ TEST(GatewayBridgeRotation, bond_waits_for_two_hand_overs_on_every_side_includin
   EXPECT_FALSE(released()) << "the gateway was never handed over — the bond must wait";
 
   // An update that keeps the owner is not a hand-over.
-  EXPECT_FALSE(cur.process_bridge_gateway_owner_tx(gateway_tx(gateway_descriptor_op_type::update_address, key_a)));
+  EXPECT_FALSE(cur.process_bridge_gateway_owner_tx(NET_FC, gateway_tx(gateway_descriptor_op_type::update_address, key_a)));
   EXPECT_FALSE(released());
 
   // One gateway hand-over (A -> B): the seat may still hold a share of B.
-  EXPECT_TRUE(cur.process_bridge_gateway_owner_tx(gateway_tx(gateway_descriptor_op_type::update_address, key_b)));
+  EXPECT_TRUE(cur.process_bridge_gateway_owner_tx(NET_FC, gateway_tx(gateway_descriptor_op_type::update_address, key_b)));
   EXPECT_EQ(observed_epoch(cur, BRIDGE_GATEWAY_CHAIN_ID), 1u);
   EXPECT_FALSE(released()) << "one hand-over can land on a key the seat still holds";
 
   // The second (B -> C) lands on a key generated without it.
-  EXPECT_TRUE(cur.process_bridge_gateway_owner_tx(gateway_tx(gateway_descriptor_op_type::update_address, key_c)));
+  EXPECT_TRUE(cur.process_bridge_gateway_owner_tx(NET_FC, gateway_tx(gateway_descriptor_op_type::update_address, key_c)));
   EXPECT_TRUE(released()) << "two hand-overs on every side: the bond is released";
 }
 
@@ -1031,6 +1031,89 @@ TEST(GatewayBridgeRotation, queued_seat_leaves_on_the_window_alone)
   cur.finalize_bridge_unbonds(unlock);
   EXPECT_FALSE(cur.master_nodes_infos.at(queued)->bridge_seat.registered)
       << "released when the window closes, with no rotation at all";
+}
+
+// Only THE bridge gateway counts. Anyone may register a bridge-reserve gateway of their own;
+// handing THAT one over must not pass for the bridge's gateway hand-over, or a departing seat
+// still holding the real gateway key could release its own bond.
+TEST(GatewayBridgeRotation, only_the_bridge_gateway_counts_as_a_hand_over)
+{
+  master_node_list::state_t cur(nullptr);
+  auto flagged = [](gateway_descriptor_op_type type, const crypto::public_key& id, const crypto::public_key& owner) {
+    tx_extra_gateway_descriptor_operation op{};
+    op.op_type              = type;
+    op.address_id           = id;
+    op.descriptor.version   = 1;
+    op.descriptor.owner_key = owner;
+    op.descriptor.flags     = GATEWAY_FLAG_BRIDGE_RESERVE;
+    transaction tx{};
+    add_gateway_descriptor_operation_to_tx_extra(tx.extra, op);
+    return tx;
+  };
+  const crypto::public_key bridge_gw = rand_pubkey(), other_gw = rand_pubkey();
+  using op = gateway_descriptor_op_type;
+
+  EXPECT_FALSE(cur.process_bridge_gateway_owner_tx(NET_FC, flagged(op::register_address, bridge_gw, rand_pubkey())));
+  // Someone else registers a flagged gateway and hands it over twice.
+  EXPECT_FALSE(cur.process_bridge_gateway_owner_tx(NET_FC, flagged(op::register_address, other_gw, rand_pubkey())));
+  EXPECT_FALSE(cur.process_bridge_gateway_owner_tx(NET_FC, flagged(op::update_address, other_gw, rand_pubkey())));
+  EXPECT_FALSE(cur.process_bridge_gateway_owner_tx(NET_FC, flagged(op::update_address, other_gw, rand_pubkey())));
+  EXPECT_EQ(observed_epoch(cur, BRIDGE_GATEWAY_CHAIN_ID), 0u) << "another gateway's owner changes do not count";
+  EXPECT_EQ(cur.bridge_gateway_owners.size(), 1u) << "only the bridge gateway is tracked";
+
+  // The bridge gateway's own hand-over still counts.
+  EXPECT_TRUE(cur.process_bridge_gateway_owner_tx(NET_FC, flagged(op::update_address, bridge_gw, rand_pubkey())));
+  EXPECT_EQ(observed_epoch(cur, BRIDGE_GATEWAY_CHAIN_ID), 1u);
+}
+
+// No committee's word may move the gateway's count — consensus observes the gateway's owner
+// changes itself. An ack naming the gateway's slot is refused however many members sign it.
+TEST(GatewayBridgeRotation, an_ack_for_the_gateway_slot_is_refused)
+{
+  const size_t N = cryptonote::bridge_committee_size(NET_FC);
+  auto c = make_committee(N);
+  master_node_list::state_t cur(nullptr);
+  cur.height = 5000;
+  for (size_t i = 0; i < N; ++i) seat_member(cur, c.mn[i], c.ed_pub[i], 100 + i);
+
+  const auto ack = sign_rotation_ack(c, BRIDGE_GATEWAY_CHAIN_ID, 5, {0, 1, 2, 3, 4, 5}, 3);
+  std::string reason;
+  EXPECT_FALSE(verify_bridge_rotation_evidence(ack, c.ed_pub, 4, NET_FC, reason));
+  EXPECT_NE(reason.find("gateway"), std::string::npos) << reason;
+  EXPECT_FALSE(run_rotation_ack(cur, c, ack, 5000));
+  EXPECT_EQ(observed_epoch(cur, BRIDGE_GATEWAY_CHAIN_ID), 0u);
+}
+
+// The tracked bridge gateway owner survives a daemon restart: the master node state is saved
+// to and reloaded from the database as state_serialized. A state saved before the field
+// existed still loads, with nothing tracked.
+TEST(GatewayBridgeRotation, bridge_gateway_owner_survives_state_serialization)
+{
+  master_node_list::state_serialized s{};
+  s.version = master_node_list::state_serialized::get_version(hf::hf23_bridge);
+  s.height  = 7;
+  master_nodes::bridge_gateway_owner g{};
+  g.gateway_id = rand_pubkey();
+  g.owner      = crypto::cn_fast_hash("owner", 5);
+  s.bridge_gateway_owners.push_back(g);
+  bridge_chain_epoch e{};
+  e.chain_id  = BRIDGE_GATEWAY_CHAIN_ID;
+  e.key_epoch = 2;
+  s.observed_key_epoch.push_back(e);
+
+  master_node_list::state_serialized got{};
+  ASSERT_NO_THROW(serialization::parse_binary(serialization::dump_binary(s), got));
+  ASSERT_EQ(got.bridge_gateway_owners.size(), 1u);
+  EXPECT_EQ(got.bridge_gateway_owners[0].gateway_id, g.gateway_id);
+  EXPECT_EQ(got.bridge_gateway_owners[0].owner, g.owner);
+  ASSERT_EQ(got.observed_key_epoch.size(), 1u);
+  EXPECT_EQ(got.observed_key_epoch[0].key_epoch, 2u);
+
+  s.version = master_node_list::state_serialized::version_t::version_2_bridge_rotation;
+  master_node_list::state_serialized older{};
+  ASSERT_NO_THROW(serialization::parse_binary(serialization::dump_binary(s), older));
+  EXPECT_TRUE(older.bridge_gateway_owners.empty());
+  EXPECT_EQ(older.observed_key_epoch.size(), 1u);
 }
 
 TEST(GatewayBridgeRotation, gate_never_releases_a_seated_baseline_without_a_wbdx_chain)

@@ -814,7 +814,8 @@ namespace master_nodes
       // committee-attested rotation-ack tx. Carried block-to-block like the other state
       // and snapshotted per height into state_history, so it is reorg-safe for free.
       std::vector<bridge_chain_epoch>        observed_key_epoch;
-      // The owner key of each bridge-reserve gateway, as last set on chain. A change of it
+      // The owner key of THE bridge gateway (at most one entry: the pinned gateway, or the
+      // first bridge-reserve gateway registered), as last set on chain. A change of it
       // advances `observed_key_epoch` for BRIDGE_GATEWAY_CHAIN_ID — the gateway's side of a
       // rotation, which a departing seat's bond waits for alongside the wBDX chains'.
       std::vector<bridge_gateway_owner>      bridge_gateway_owners;
@@ -870,9 +871,9 @@ namespace master_nodes
       bool process_bridge_rotation_ack_tx(cryptonote::network_type nettype, cryptonote::block const &block,
                                           const cryptonote::transaction& tx,
                                           const bridge_committee_resolver& resolve_committee);
-      // Returns true if a bridge-reserve gateway's owner key changed (the gateway was handed
-      // to a new key), which advances observed_key_epoch for BRIDGE_GATEWAY_CHAIN_ID (HF23).
-      bool process_bridge_gateway_owner_tx(const cryptonote::transaction& tx);
+      // Returns true if the bridge gateway's owner key changed (the gateway was handed to a
+      // new key), which advances observed_key_epoch for BRIDGE_GATEWAY_CHAIN_ID (HF23).
+      bool process_bridge_gateway_owner_tx(cryptonote::network_type nettype, const cryptonote::transaction& tx);
       // Release (clear) any bridge seat whose bond unlock height has been reached.
       void finalize_bridge_unbonds(uint64_t block_height);
       // Number of currently seated (not merely queued) bridge operators.

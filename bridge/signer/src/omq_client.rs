@@ -112,7 +112,9 @@ impl OmqCommitteeClient {
     /// must be this node's `signer_ed25519` signature over
     /// [`mint_publish_message`]`(genesis, payload)`, and `self_index` its committee index.
     /// See [`mint_publish_message`] for the byte layout (it must match the C++
-    /// `bridge_mint_publish_message` exactly).
+    /// `bridge_mint_publish_message` exactly). `master_node` is this node's master node
+    /// pubkey: it lets the daemon authenticate a member of the committee that holds the live
+    /// key after consensus has selected another one, by looking up that one registered seat.
     ///
     /// Returns the daemon's status word: the subscriber count, or `DUPLICATE` when another
     /// member of the same signing quorum already published this deposit's payload — every
@@ -123,6 +125,7 @@ impl OmqCommitteeClient {
         payload: &str,
         self_index: u16,
         signature: &[u8; 64],
+        master_node: &[u8; 32],
     ) -> Result<String, String> {
         let sock = self.ctx.socket(zmq::DEALER).map_err(|e| format!("socket: {e}"))?;
         sock.set_linger(0).map_err(|e| format!("set_linger: {e}"))?;
@@ -130,6 +133,7 @@ impl OmqCommitteeClient {
             .map_err(|e| format!("connect {}: {e}", self.endpoint))?;
         let idx = self_index.to_string();
         let sig_hex: String = signature.iter().map(|b| format!("{b:02x}")).collect();
+        let mn_hex: String = master_node.iter().map(|b| format!("{b:02x}")).collect();
         sock.send_multipart(
             [
                 b"bridge.mint_payload".as_slice(),
@@ -137,6 +141,7 @@ impl OmqCommitteeClient {
                 payload.as_bytes(),
                 idx.as_bytes(),
                 sig_hex.as_bytes(),
+                mn_hex.as_bytes(),
             ],
             0,
         )
