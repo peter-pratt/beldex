@@ -646,7 +646,14 @@ def run(fresh=False):
             vprint("--fresh: wiping '{}'".format(datadirectory))
             shutil.rmtree(datadirectory + "/", ignore_errors=False, onerror=None)
         vprint("new MNN")
-        mnn = MNNetwork(datadir=datadirectory + "/")
+        # DEVNET_MNS / DEVNET_BRIDGE_SEATS: more bonded operators than the 6-member committee
+        # (e.g. 7/7) leave a queued seat, so an operator can leave and another take its
+        # place without the bridge dropping below its activation floor. Defaults: 6 / 6.
+        mnn = MNNetwork(
+            datadir=datadirectory + "/",
+            mns=int(os.environ.get("DEVNET_MNS", 6)),
+            bridge_seats=int(os.environ.get("DEVNET_BRIDGE_SEATS", 6)),
+        )
     else:
         vprint("reusing MNN")
         mnn.alice.new_wallet()

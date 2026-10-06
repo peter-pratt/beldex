@@ -155,6 +155,13 @@ PROBE_BYTES="${PROBE_BYTES:-0x$(printf 'ab%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14
 
 mkdir -p "$WORK"
 STATE="$WORK/state"
+# The state belongs to ONE ceremony. A fresh run (from step 1) sets it aside and starts
+# empty: carried over, the previous rotation's ARCHIVE would make a resumed step 8 sign
+# "as the retired committee" from the generation retired one rotation ago, and pass with
+# the wrong key. A resume (--from N > 1) keeps it: that is the run it is resuming.
+if [ "$FROM" = "1" ] && [ -s "$STATE" ]; then
+  mv "$STATE" "$STATE.$(date +%Y%m%d-%H%M%S)"
+fi
 [ -f "$STATE" ] || : > "$STATE"
 state_put() { sed -i.bak "/^$1=/d" "$STATE" 2>/dev/null || true; rm -f "$STATE.bak"; printf '%s=%s\n' "$1" "$2" >> "$STATE"; }
 state_get() { envget "$STATE" "$1"; }
