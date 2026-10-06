@@ -3062,6 +3062,8 @@ namespace cryptonote::rpc {
   ///   on this having moved past the baseline taken when it asked to leave, so it is what
   ///   distinguishes a bond that is merely waiting from one whose acknowledgement never
   ///   landed.
+  /// - `chain_contracts` -- per-chain {chain_id, contract}: the wBDX contract that chain's
+  ///   rotation acknowledgements are bound to, set by the first one accepted.
   /// - `status` -- Generic RPC error code. "OK" is the success value.
   struct BRIDGE_GET_SEATS : PUBLIC
   {

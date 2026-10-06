@@ -195,7 +195,11 @@ pub fn decode_get_logs(result: &Value, chain: ChainId, contract: [u8; 20]) -> Ve
 pub struct RotationEvent {
     /// The EVM tx that emitted the event (for the watcher's reorg/finality tracking).
     pub evm_txid: [u8; 32],
+    /// The log's index within its block: with `evm_txid`, the exact event an ack cites.
+    pub log_index: u32,
     pub chain: ChainId,
+    /// The wBDX contract that emitted it — the one this watcher is configured for.
+    pub contract: [u8; 20],
     /// The contract's new monotonic key epoch after this rotation.
     pub key_epoch: u64,
     /// The incoming `Pevm` address the contract now trusts as mint authority.
@@ -237,6 +241,9 @@ pub fn decode_rotated_log(
     let inclusion_height = hex_to_u64(field("blockNumber")?).ok_or(DecodeError::BadHex)?;
     let block_hash = hex_to_fixed32(field("blockHash")?).ok_or(DecodeError::BadHex)?;
     let evm_txid = hex_to_fixed32(field("transactionHash")?).ok_or(DecodeError::BadHex)?;
+    // An index past u32 is refused, not truncated: a truncated one would cite another log.
+    let log_index = u32::try_from(hex_to_u64(field("logIndex")?).ok_or(DecodeError::BadHex)?)
+        .map_err(|_| DecodeError::BadHex)?;
 
     // data = abi.encode(uint64 newKeyEpoch): one 32-byte word, value in the low 8 bytes.
     let data = hex_to_bytes(field("data")?).ok_or(DecodeError::BadHex)?;
@@ -249,7 +256,7 @@ pub fn decode_rotated_log(
     let key_epoch = u64::from_be_bytes(data[24..32].try_into().unwrap());
 
     Ok(Observation {
-        event: RotationEvent { evm_txid, chain, key_epoch, new_signer },
+        event: RotationEvent { evm_txid, log_index, chain, contract, key_epoch, new_signer },
         inclusion_height,
         block_hash,
     })
@@ -1025,6 +1032,7 @@ mod tests {
             "blockNumber": to_hex_quantity(block),
             "blockHash": to_hex_bytes(&block_hash),
             "transactionHash": to_hex_bytes(&txid),
+            "logIndex": to_hex_quantity(2),
         })
     }
 
@@ -1039,6 +1047,13 @@ mod tests {
         assert_eq!(obs.event.key_epoch, 7);
         assert_eq!(obs.event.new_signer, signer);
         assert_eq!(obs.event.evm_txid, [0x02u8; 32]);
+        assert_eq!(obs.event.log_index, 2);
+        assert_eq!(obs.event.contract, [0x22; 20]);
+
+        // A log index past u32 is refused, never truncated into another log's.
+        let mut big = log.clone();
+        big["logIndex"] = json!(to_hex_quantity(1u64 << 32));
+        assert!(decode_rotated_log(&big, ChainId(42), [0x22; 20]).is_err());
     }
 
     #[test]

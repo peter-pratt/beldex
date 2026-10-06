@@ -109,6 +109,10 @@ SIGN_SIGNERS="${SIGN_SIGNERS:-0,1,2,3,4,5}"
 #   * unrecognised keys are silently dropped, so a typo'd or invented key (this
 #     block used to carry an `epoch_blocks` that nothing ever read) looks applied
 #     and is not. `start_block` is the real name for "skip ahead".
+# ACK_WALLET_RPC: a funded wallet RPC (beldex-wallet-rpc --disable-rpc-login, bound to
+# 127.0.0.1) that pays for rotation acknowledgements, e.g. http://127.0.0.1:19092/json_rpc.
+# Without it each completed ack is printed for someone to submit by hand, and departing
+# operators' bonds stay locked until they do.
 # Caps gate resolve_mint, not the contract — adjust to taste.
 #
 # depth_only_finality: anvil has no finality of its own (its `finalized` tag always names
@@ -197,6 +201,7 @@ for d in beldex-127.0.0.1-*/; do
   BRIDGE_SIGNER_BELDEX_CONFIRMATIONS="$BELDEX_CONFIRMATIONS" \
   BRIDGE_SIGNER_EVM_CHAINS="$EVM_CHAINS" \
   BRIDGE_SIGNER_EVM_FINALITY_DIR="$SOCKBASE/${d}devnet/evm-finality" \
+  BRIDGE_SIGNER_ACK_WALLET_RPC="${ACK_WALLET_RPC:-}" \
   BRIDGE_SIGNER_WATCH_POLL_SECS="$POLL_SECS" \
   BRIDGE_SIGNER_RELEASE_GATEWAY="$RELEASE_GATEWAY" \
   BRIDGE_SIGNER_RELEASE_FEE="$RELEASE_FEE" \

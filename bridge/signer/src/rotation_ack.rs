@@ -16,12 +16,16 @@
 //! chain stood at when the seat requested unbond — so signing in your successor becomes a
 //! precondition for reclaiming your 100k bond.
 //!
-//! The signed bytes are the **objective, epoch-independent fact** (`chain_id`, `key_epoch`,
-//! `new_signer`) — unlike a slash report, which is inherently session/epoch-specific. The
-//! L1 committee `epoch` that observed it rides alongside as an unsigned resolver hint (it
-//! only selects which committee's keys the verifier checks; a wrong epoch simply yields the
-//! wrong keys and fails). Advancing L1's observed key epoch is monotonic and idempotent, so
-//! a replayed ack is harmless.
+//! The signed bytes are the **objective, epoch-independent fact**: the chain, the wBDX
+//! contract, the new key epoch and signer, and the exact `Rotated` log (transaction and
+//! log index) — unlike a slash report, which is inherently session/epoch-specific. Members
+//! only pool signatures over the same event of the same contract, consensus holds every
+//! ack for a chain to the contract its first ack named, and anyone can look the cited log
+//! up on the EVM chain. The L1 committee `epoch` that observed it rides alongside as an
+//! unsigned resolver hint (it only selects which committee's keys the verifier checks; a
+//! wrong epoch simply yields the wrong keys and fails). Consensus counts only observers
+//! whose bridge bond is still at stake (not released, not slashed), and accepts only the
+//! next key epoch for a chain, so a replayed ack is a no-op.
 //!
 //! Built under `tss-integration` (libsodium ed25519), mirroring [`crate::slash`].
 
@@ -30,18 +34,42 @@ use crate::ffi::{ed25519_sign_detached, ed25519_verify_consensus};
 
 /// Domain tag for the rotation-ack signature (S6). MUST match the C++
 /// `hashkey::BRIDGE_ROTATION_ACK`.
-pub const ROTATION_ACK_DOMAIN: &[u8] = b"bridge_rotation_ack_v1";
+pub const ROTATION_ACK_DOMAIN: &[u8] = b"bridge_rotation_ack_v2";
 
-/// The objective on-chain fact an ack attests: chain `chain_id`'s wBDX `currentSigner`
-/// moved to `new_signer` at contract key generation `key_epoch`.
+/// The ack layout these bytes describe. MUST match the C++
+/// `tx_extra_bridge_rotation_ack::CURRENT_VERSION`; consensus accepts no other.
+pub const ROTATION_ACK_VERSION: u8 = 1;
+
+/// The objective on-chain fact an ack attests: `contract` on chain `chain_id` emitted
+/// `Rotated(new_signer, key_epoch)` in transaction `evm_txid` at log `log_index`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RotationAck {
     /// EVM chain id (the E.3 registry key).
     pub chain_id: u64,
+    /// The wBDX proxy that emitted the event.
+    pub contract: [u8; 20],
     /// The contract's new monotonic key epoch after the rotation.
     pub key_epoch: u64,
     /// The incoming `Pevm` address the contract now trusts as mint authority.
     pub new_signer: [u8; 20],
+    /// The EVM transaction carrying the `Rotated` log, and that log's index.
+    pub evm_txid: [u8; 32],
+    pub log_index: u32,
+}
+
+impl RotationAck {
+    /// The fact a finalized `Rotated` event states.
+    #[cfg(feature = "evm-watcher")]
+    pub fn from_event(ev: &crate::evm_watcher::RotationEvent) -> RotationAck {
+        RotationAck {
+            chain_id: ev.chain.0,
+            contract: ev.contract,
+            key_epoch: ev.key_epoch,
+            new_signer: ev.new_signer,
+            evm_txid: ev.evm_txid,
+            log_index: ev.log_index,
+        }
+    }
 }
 
 impl RotationAck {
@@ -58,14 +86,19 @@ impl RotationAck {
     /// verifies. Domain-separated (S6); the genesis binding prevents replay across
     /// networks/forks (S14). Epoch-independent — the fact is objective.
     ///
-    /// Layout: `DOMAIN ‖ genesis(32) ‖ chain_id(u64 LE) ‖ key_epoch(u64 LE) ‖ new_signer(20)`.
+    /// Layout: `DOMAIN ‖ genesis(32) ‖ version(u8) ‖ chain_id(u64 LE) ‖ contract(20) ‖
+    /// key_epoch(u64 LE) ‖ new_signer(20) ‖ evm_txid(32) ‖ log_index(u32 LE)`.
     pub fn canonical(&self, genesis: &[u8; 32]) -> Vec<u8> {
-        let mut v = Vec::with_capacity(ROTATION_ACK_DOMAIN.len() + 32 + 8 + 8 + 20);
+        let mut v = Vec::with_capacity(ROTATION_ACK_DOMAIN.len() + 32 + 1 + 8 + 20 + 8 + 20 + 32 + 4);
         v.extend_from_slice(ROTATION_ACK_DOMAIN);
         v.extend_from_slice(genesis);
+        v.push(ROTATION_ACK_VERSION);
         v.extend_from_slice(&self.chain_id.to_le_bytes());
+        v.extend_from_slice(&self.contract);
         v.extend_from_slice(&self.key_epoch.to_le_bytes());
         v.extend_from_slice(&self.new_signer);
+        v.extend_from_slice(&self.evm_txid);
+        v.extend_from_slice(&self.log_index.to_le_bytes());
         v
     }
 }
@@ -177,8 +210,8 @@ impl SignedRotationAck {
         observers.sort_by_key(|(i, _)| *i);
         observers.dedup_by_key(|(i, _)| *i);
 
-        let hex64 = |b: &[u8; 64]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-        let hex20 = |b: &[u8; 20]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let hexs = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let hex64 = |b: &[u8; 64]| hexs(b);
 
         let entries: Vec<String> = observers
             .iter()
@@ -187,12 +220,16 @@ impl SignedRotationAck {
 
         format!(
             concat!(
-                r#"{{"version":0,"chain_id":{},"key_epoch":{},"new_signer":"{}","#,
-                r#""epoch":{},"observers":[{}]}}"#
+                r#"{{"version":{},"chain_id":{},"contract":"{}","key_epoch":{},"new_signer":"{}","#,
+                r#""evm_txid":"{}","log_index":{},"epoch":{},"observers":[{}]}}"#
             ),
+            ROTATION_ACK_VERSION,
             self.ack.chain_id,
+            hexs(&self.ack.contract),
             self.ack.key_epoch,
-            hex20(&self.ack.new_signer),
+            hexs(&self.ack.new_signer),
+            hexs(&self.ack.evm_txid),
+            self.ack.log_index,
             self.epoch,
             entries.join(","),
         )
@@ -226,7 +263,14 @@ mod tests {
     }
 
     fn sample_ack() -> RotationAck {
-        RotationAck { chain_id: 42, key_epoch: 8, new_signer: [0xCD; 20] }
+        RotationAck {
+            chain_id: 42,
+            contract: [0x22; 20],
+            key_epoch: 8,
+            new_signer: [0xCD; 20],
+            evm_txid: [0xEE; 32],
+            log_index: 3,
+        }
     }
 
     #[test]
@@ -274,11 +318,42 @@ mod tests {
         let other_chain = RotationAck { chain_id: 43, ..sample_ack() }.canonical(&genesis);
         let other_epoch = RotationAck { key_epoch: 9, ..sample_ack() }.canonical(&genesis);
         let other_signer = RotationAck { new_signer: [0xEE; 20], ..sample_ack() }.canonical(&genesis);
+        let other_contract = RotationAck { contract: [0x33; 20], ..sample_ack() }.canonical(&genesis);
+        let other_tx = RotationAck { evm_txid: [0x01; 32], ..sample_ack() }.canonical(&genesis);
+        let other_log = RotationAck { log_index: 4, ..sample_ack() }.canonical(&genesis);
         assert_ne!(base, other_chain);
         assert_ne!(base, other_epoch);
         assert_ne!(base, other_signer);
+        assert_ne!(base, other_contract, "the contract is signed");
+        assert_ne!(base, other_tx, "the cited transaction is signed");
+        assert_ne!(base, other_log, "the cited log is signed");
         // Leads with the domain tag (S6).
         assert_eq!(&base[..ROTATION_ACK_DOMAIN.len()], ROTATION_ACK_DOMAIN);
+    }
+
+    /// The exact bytes a rotation ack signs, as the daemon builds them for mainnet. The C++
+    /// test `GatewayBridgeRotation.rotation_ack_message_is_pinned` asserts the same hex, so
+    /// the two cannot drift apart without one of them failing.
+    #[test]
+    fn canonical_bytes_match_the_daemon() {
+        const PIN: &str = "6272696467655f726f746174696f6e5f61636b5f76326ea477622339f61c5fba036dc75c08b6efcf9ee09c108e5c5591fcc233d17b2001380000000000000022222222222222222222222222222222222222220700000000000000cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f04030201";
+        let pin: Vec<u8> = (0..PIN.len()).step_by(2).map(|i| u8::from_str_radix(&PIN[i..i + 2], 16).unwrap()).collect();
+        // The mainnet genesis binding sits right after the domain tag.
+        let mut genesis = [0u8; 32];
+        genesis.copy_from_slice(&pin[ROTATION_ACK_DOMAIN.len()..ROTATION_ACK_DOMAIN.len() + 32]);
+        let mut evm_txid = [0u8; 32];
+        for (i, b) in evm_txid.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let ack = RotationAck {
+            chain_id: 56,
+            contract: [0x22; 20],
+            key_epoch: 7,
+            new_signer: [0xCD; 20],
+            evm_txid,
+            log_index: 0x01020304,
+        };
+        assert_eq!(ack.canonical(&genesis), pin);
     }
 
     #[test]
@@ -306,6 +381,10 @@ mod tests {
         assert!(json.contains(r#""key_epoch":8"#));
         assert!(json.contains(r#""epoch":7"#));
         assert!(json.contains(&format!(r#""new_signer":"{}""#, "cd".repeat(20))));
+        assert!(json.contains(r#""version":1"#), "the daemon accepts only the current version");
+        assert!(json.contains(&format!(r#""contract":"{}""#, "22".repeat(20))));
+        assert!(json.contains(&format!(r#""evm_txid":"{}""#, "ee".repeat(32))));
+        assert!(json.contains(r#""log_index":3"#));
         for sig_hex in json.split(r#""signature":""#).skip(1) {
             assert_eq!(sig_hex.split('"').next().unwrap().len(), 128);
         }
@@ -340,7 +419,14 @@ mod merge_tests {
     }
 
     fn ack(key_epoch: u64) -> RotationAck {
-        RotationAck { chain_id: 56, key_epoch, new_signer: [0xAB; 20] }
+        RotationAck {
+            chain_id: 56,
+            contract: [0x22; 20],
+            key_epoch,
+            new_signer: [0xAB; 20],
+            evm_txid: [key_epoch as u8; 32],
+            log_index: 0,
+        }
     }
 
     /// Members observe the rotation independently and each signs its own copy, so the
@@ -544,6 +630,183 @@ impl RotationAckCollector {
     pub fn pending_len(&self) -> usize {
         self.pending.len()
     }
+
+    /// This node's own signature for each acknowledgement still collecting, as
+    /// `(mesh_key, body)`: re-broadcast periodically so a member that started late, or
+    /// missed the first broadcast, still receives it.
+    pub fn own_signatures(&self, self_index: u16, genesis: &[u8; 32]) -> Vec<([u8; 32], Vec<u8>)> {
+        self.pending
+            .iter()
+            .filter_map(|p| {
+                let (_, sig) = p.observers.iter().find(|(i, _)| *i == self_index)?;
+                Some((p.ack.mesh_key(genesis), encode_ack_sig(self_index, sig)))
+            })
+            .collect()
+    }
+
+    /// Forget an acknowledgement that L1 has already applied (its chain's observed key
+    /// epoch reached it), so nothing keeps collecting for it.
+    pub fn forget_observed(&mut self, observed: impl Fn(u64) -> Option<u64>) {
+        self.pending
+            .retain(|p| observed(p.ack.chain_id).is_none_or(|have| have < p.ack.key_epoch));
+    }
+}
+
+/// Seconds between attempts to put a completed acknowledgement on chain.
+pub const ACK_RETRY_SECS: u64 = 120;
+
+/// Completed acknowledgements waiting to be applied on L1.
+///
+/// An acknowledgement is done only when L1's observed key epoch for its chain reaches it,
+/// not when it is handed to the daemon: a wallet can be empty, a transaction can be
+/// dropped, a member can restart. So each one is retried until the chain shows it, and
+/// only the next epoch per chain is attempted, since consensus accepts no other.
+#[derive(Debug, Default)]
+pub struct AckSubmissions {
+    waiting: Vec<(SignedRotationAck, u64)>, // (ack, unix secs of the last attempt; 0 = never)
+}
+
+impl AckSubmissions {
+    pub fn new() -> AckSubmissions {
+        AckSubmissions::default()
+    }
+
+    /// Add a completed acknowledgement (a repeat of one already waiting is ignored).
+    pub fn add(&mut self, ack: SignedRotationAck) {
+        if !self.waiting.iter().any(|(w, _)| w.ack == ack.ack) {
+            self.waiting.push((ack, 0));
+        }
+    }
+
+    /// Drop what L1 has already applied.
+    pub fn forget_observed(&mut self, observed: impl Fn(u64) -> Option<u64>) {
+        self.waiting.retain(|(w, _)| observed(w.ack.chain_id).is_none_or(|have| have < w.ack.key_epoch));
+    }
+
+    /// What to attempt now: per chain, the one acknowledgement consensus would accept next
+    /// (exactly the next key epoch, or the lowest if the chain has none yet), if a retry
+    /// interval has passed since its last attempt.
+    pub fn due(&self, observed: impl Fn(u64) -> Option<u64>, now: u64) -> Vec<SignedRotationAck> {
+        let mut chains: Vec<u64> = self.waiting.iter().map(|(w, _)| w.ack.chain_id).collect();
+        chains.sort_unstable();
+        chains.dedup();
+        let mut out = Vec::new();
+        for chain in chains {
+            let next = match observed(chain) {
+                Some(have) => self.waiting.iter().find(|(w, _)| w.ack.chain_id == chain && w.ack.key_epoch == have + 1),
+                None => self
+                    .waiting
+                    .iter()
+                    .filter(|(w, _)| w.ack.chain_id == chain)
+                    .min_by_key(|(w, _)| w.ack.key_epoch),
+            };
+            if let Some((w, last)) = next {
+                if now.saturating_sub(*last) >= ACK_RETRY_SECS {
+                    out.push(w.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Record an attempt, whatever its outcome; only L1 decides when it is done.
+    pub fn attempted(&mut self, ack: &RotationAck, now: u64) {
+        if let Some((_, last)) = self.waiting.iter_mut().find(|(w, _)| &w.ack == ack) {
+            *last = now;
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.waiting.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.waiting.is_empty()
+    }
+}
+
+/// L1's observed key epoch per chain, from a `bridge_get_seats` JSON-RPC result.
+#[cfg(feature = "evm-watcher")]
+pub fn parse_observed_key_epochs(result: &serde_json::Value) -> Option<std::collections::BTreeMap<u64, u64>> {
+    let mut out = std::collections::BTreeMap::new();
+    for e in result.get("observed_key_epoch")?.as_array()? {
+        out.insert(e.get("chain_id")?.as_u64()?, e.get("key_epoch")?.as_u64()?);
+    }
+    Some(out)
+}
+
+/// The `rotation_hex` from the daemon's `bridge.rotation_ack` reply.
+#[cfg(feature = "evm-watcher")]
+pub fn rotation_hex_from_reply(reply: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(reply).ok()?;
+    v.get("rotation_hex")?.as_str().map(str::to_string)
+}
+
+#[cfg(test)]
+mod submission_tests {
+    use super::*;
+
+    fn signed(chain_id: u64, key_epoch: u64) -> SignedRotationAck {
+        SignedRotationAck::new(
+            RotationAck {
+                chain_id,
+                contract: [0x22; 20],
+                key_epoch,
+                new_signer: [0xAB; 20],
+                evm_txid: [key_epoch as u8; 32],
+                log_index: 0,
+            },
+            7,
+        )
+    }
+
+    /// Only the epoch consensus would accept next is attempted, per chain, so an ack that
+    /// completed out of order waits instead of being rejected over and over.
+    #[test]
+    fn only_the_next_epoch_per_chain_is_attempted() {
+        let mut s = AckSubmissions::new();
+        s.add(signed(56, 4));
+        s.add(signed(56, 3));
+        s.add(signed(1, 9));
+        let observed = |c: u64| if c == 56 { Some(2) } else { None };
+        let mut due: Vec<(u64, u64)> = s.due(observed, 1_000).iter().map(|a| (a.ack.chain_id, a.ack.key_epoch)).collect();
+        due.sort();
+        assert_eq!(due, vec![(1, 9), (56, 3)], "chain 1 has no epoch yet: its lowest; chain 56: 3, not 4");
+
+        // Once L1 has 3, 4 is next.
+        let after = |c: u64| if c == 56 { Some(3) } else { None };
+        s.forget_observed(after);
+        let due: Vec<u64> = s.due(after, 1_000).iter().filter(|a| a.ack.chain_id == 56).map(|a| a.ack.key_epoch).collect();
+        assert_eq!(due, vec![4]);
+    }
+
+    /// Retried until L1 shows it, at most once per interval; done only when observed.
+    #[test]
+    fn an_ack_is_retried_until_l1_has_applied_it() {
+        let mut s = AckSubmissions::new();
+        s.add(signed(56, 3));
+        s.add(signed(56, 3)); // a repeat is not a second entry
+        assert_eq!(s.len(), 1);
+        let observed = |_: u64| Some(2);
+        assert_eq!(s.due(observed, 10_000).len(), 1);
+        s.attempted(&signed(56, 3).ack, 10_000);
+        assert!(s.due(observed, 10_000 + ACK_RETRY_SECS - 1).is_empty(), "not before the interval");
+        assert_eq!(s.due(observed, 10_000 + ACK_RETRY_SECS).len(), 1, "then again");
+        s.forget_observed(|_| Some(3));
+        assert!(s.is_empty(), "applied on L1: done");
+    }
+
+    #[cfg(feature = "evm-watcher")]
+    #[test]
+    fn replies_are_parsed() {
+        let seats = serde_json::json!({"observed_key_epoch": [{"chain_id": 56, "key_epoch": 3}, {"chain_id": 1, "key_epoch": 9}]});
+        let m = parse_observed_key_epochs(&seats).unwrap();
+        assert_eq!(m.get(&56), Some(&3));
+        assert_eq!(m.get(&1), Some(&9));
+        assert!(parse_observed_key_epochs(&serde_json::json!({})).is_none());
+        assert_eq!(rotation_hex_from_reply(r#"{"rotation_hex":"0a0b","chain_id":56}"#).as_deref(), Some("0a0b"));
+        assert_eq!(rotation_hex_from_reply("not json"), None);
+    }
 }
 
 #[cfg(test)]
@@ -573,7 +836,14 @@ mod collector_tests {
         )
     }
     fn ack(key_epoch: u64) -> RotationAck {
-        RotationAck { chain_id: 56, key_epoch, new_signer: [0xAB; 20] }
+        RotationAck {
+            chain_id: 56,
+            contract: [0x22; 20],
+            key_epoch,
+            new_signer: [0xAB; 20],
+            evm_txid: [key_epoch as u8; 32],
+            log_index: 0,
+        }
     }
 
     /// The whole point: independent observations converge into one submittable

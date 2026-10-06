@@ -1116,6 +1116,16 @@ KV_SERIALIZE_MAP_CODE_BEGIN(BRIDGE_UNBOND::request)
 KV_SERIALIZE_MAP_CODE_END()
 
 
+KV_SERIALIZE_MAP_CODE_BEGIN(BRIDGE_ROTATION_ACK::request)
+  KV_SERIALIZE(rotation_hex);
+  KV_SERIALIZE_OPT(priority,        (uint32_t)0)
+  KV_SERIALIZE(get_tx_key)
+  KV_SERIALIZE_OPT(do_not_relay,    false)
+  KV_SERIALIZE_OPT(get_tx_hex,      false)
+  KV_SERIALIZE_OPT(get_tx_metadata, false)
+KV_SERIALIZE_MAP_CODE_END()
+
+
 KV_SERIALIZE_MAP_CODE_BEGIN(REQUEST_STAKE_UNLOCK::request)
   KV_SERIALIZE(master_node_key);
 KV_SERIALIZE_MAP_CODE_END()

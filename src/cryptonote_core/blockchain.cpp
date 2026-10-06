@@ -3488,6 +3488,8 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
         ack_reason = "no bridge committee for epoch " + std::to_string(ack.epoch);
       else if (!cryptonote::verify_bridge_rotation_evidence(ack, signer_keys, threshold, m_nettype, ack_reason))
         { /* reason set by the verifier */ }
+      else if (!m_master_node_list.check_bridge_rotation_ack(ack, ack_reason))
+        { /* reason set by the check: wrong chain/contract, or not the next key epoch */ }
 
       if (!ack_reason.empty())
       {

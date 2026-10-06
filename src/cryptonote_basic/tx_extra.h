@@ -826,17 +826,28 @@ namespace cryptonote
   // the >= t+1 committee ed25519 signatures over the canonical, genesis-bound fact and
   // advances its per-chain observed key epoch, which gates the release of an outgoing
   // bridge seat's bond (a departing operator's 100k bond unlocks only once every chain
-  // has rotated past the epoch it was serving at unbond time). The observed fact is
-  // objective (chain_id, key_epoch, new_signer); `epoch` is the observing committee's
-  // L1 epoch — a resolver hint that is NOT part of the signed bytes.
+  // has rotated past the epoch it was serving at unbond time).
+  //
+  // The signed fact names the contract and the exact `Rotated` log (transaction, log
+  // index), not just the chain: observers only pool signatures over the same event of the
+  // same contract, consensus holds every ack for a chain to the contract its first ack
+  // named, and anyone can check the cited log on the EVM chain. `epoch` is the observing
+  // committee's L1 epoch, the resolver hint for which committee's keys to check — not
+  // part of the signed bytes. Only `CURRENT_VERSION` is accepted.
   struct tx_extra_bridge_rotation_ack
   {
-    uint8_t              version = 0;
+    static constexpr uint8_t CURRENT_VERSION = 1;
+
+    uint8_t              version = CURRENT_VERSION;
     uint64_t             chain_id = 0;      // EVM chain id (E.3 registry key)
     uint64_t             key_epoch = 0;     // the contract's new key epoch after the rotation
     std::vector<uint8_t> new_signer;        // the incoming Pevm address (exactly 20 bytes)
     uint64_t             epoch = 0;         // observing L1 committee epoch (unsigned resolver hint)
     std::vector<bridge_rotation_signature> observers; // >= t+1 distinct committee signers
+    // version >= 1:
+    std::vector<uint8_t> contract;          // the wBDX proxy that emitted it (exactly 20 bytes)
+    crypto::hash         evm_txid{};        // the EVM transaction carrying the Rotated log
+    uint32_t             log_index = 0;     // that log's index within its block
 
     BEGIN_SERIALIZE()
       FIELD(version)
@@ -845,6 +856,12 @@ namespace cryptonote
       FIELD(new_signer)
       VARINT_FIELD(epoch)
       FIELD(observers)
+      if (version >= 1)
+      {
+        FIELD(contract)
+        FIELD(evm_txid)
+        VARINT_FIELD(log_index)
+      }
     END_SERIALIZE()
   };
 

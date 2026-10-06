@@ -247,6 +247,21 @@ namespace master_nodes
     END_SERIALIZE()
   };
 
+  // The wBDX contract a chain's rotation acks are about, recorded by the first ack consensus
+  // accepts for that chain. Every later ack for the chain must name the same contract, so
+  // signatures over another deployment (a test contract, a redeploy, an attacker's look-
+  // alike emitting `Rotated`) can never move this chain's observed key epoch.
+  struct bridge_chain_contract
+  {
+    uint64_t             chain_id = 0;
+    std::vector<uint8_t> contract; // 20 bytes
+
+    BEGIN_SERIALIZE_OBJECT()
+      VARINT_FIELD(chain_id)
+      FIELD(contract)
+    END_SERIALIZE()
+  };
+
   struct master_node_info // registration information
   {
     enum class version_t : uint8_t
@@ -564,6 +579,15 @@ namespace master_nodes
       std::lock_guard lock{m_mn_mutex};
       return m_state.observed_key_epoch;
     }
+    /// HF23 H.6.3: the wBDX contract each chain's rotation acks are bound to.
+    std::vector<bridge_chain_contract> get_bridge_chain_contracts() const
+    {
+      std::lock_guard lock{m_mn_mutex};
+      return m_state.bridge_chain_contracts;
+    }
+    /// Whether a rotation ack (whose signatures have already been verified) may advance the
+    /// current state: see state_t::check_bridge_rotation_ack.
+    bool check_bridge_rotation_ack(const cryptonote::tx_extra_bridge_rotation_ack& ack, std::string& reason) const;
     bool is_master_node(const crypto::public_key& pubkey, bool require_active = true) const;
     bool is_key_image_locked(crypto::key_image const &check_image, uint64_t *unlock_height = nullptr, master_node_info::contribution_t *the_locked_contribution = nullptr) const;
     uint64_t height() const { return m_state.height; }
@@ -752,8 +776,8 @@ namespace master_nodes
 
     struct state_serialized
     {
-      enum struct version_t : uint8_t { version_0, version_1_serialize_hash, version_2_bridge_rotation, version_3_bridge_gateway_owner, count, };
-      static version_t get_version(cryptonote::hf /*hf_version*/) { return version_t::version_3_bridge_gateway_owner; }
+      enum struct version_t : uint8_t { version_0, version_1_serialize_hash, version_2_bridge_rotation, version_3_bridge_gateway_owner, version_4_bridge_chain_contract, count, };
+      static version_t get_version(cryptonote::hf /*hf_version*/) { return version_t::version_4_bridge_chain_contract; }
 
       version_t                              version;
       uint64_t                               height;
@@ -764,6 +788,7 @@ namespace master_nodes
       crypto::hash                           block_hash;
       std::vector<bridge_chain_epoch>        observed_key_epoch; // HF23 H.6.3
       std::vector<bridge_gateway_owner>      bridge_gateway_owners; // HF23: gateway hand-over
+      std::vector<bridge_chain_contract>     bridge_chain_contracts; // HF23: rotation-ack binding
 
       BEGIN_SERIALIZE()
         ENUM_FIELD(version, version < version_t::count)
@@ -779,6 +804,8 @@ namespace master_nodes
           FIELD(observed_key_epoch);
         if (version >= version_t::version_3_bridge_gateway_owner)
           FIELD(bridge_gateway_owners);
+        if (version >= version_t::version_4_bridge_chain_contract)
+          FIELD(bridge_chain_contracts);
       END_SERIALIZE()
     };
 
@@ -818,6 +845,8 @@ namespace master_nodes
       // advances `observed_key_epoch` for BRIDGE_GATEWAY_CHAIN_ID — the gateway's side of a
       // rotation, which a departing seat's bond waits for alongside the wBDX chains'.
       std::vector<bridge_gateway_owner>      bridge_gateway_owners;
+      // The contract each chain's rotation acks are bound to (first accepted ack pins it).
+      std::vector<bridge_chain_contract>     bridge_chain_contracts;
       master_node_list*                     mn_list;
 
       state_t(master_node_list* mnl) : mn_list{mnl} {}
@@ -870,6 +899,11 @@ namespace master_nodes
       bool process_bridge_rotation_ack_tx(cryptonote::network_type nettype, cryptonote::block const &block,
                                           const cryptonote::transaction& tx,
                                           const bridge_committee_resolver& resolve_committee);
+      // Whether a rotation ack whose signatures verified may advance this state: a
+      // supported chain, the contract the chain is bound to, and exactly the next key
+      // epoch once the chain has one. False with `reason` otherwise.
+      bool check_bridge_rotation_ack(const cryptonote::tx_extra_bridge_rotation_ack& ack,
+                                     cryptonote::network_type nettype, std::string& reason) const;
       // Returns true if a bridge-reserve gateway's owner key changed (the gateway was handed
       // to a new key), which advances observed_key_epoch for BRIDGE_GATEWAY_CHAIN_ID (HF23).
       bool process_bridge_gateway_owner_tx(const cryptonote::transaction& tx);

@@ -4402,6 +4402,12 @@ namespace cryptonote::rpc {
     for (const auto &ce : m_core.get_master_node_list().get_observed_key_epoch())
       observed.push_back(json{{"chain_id", ce.chain_id}, {"key_epoch", ce.key_epoch}});
     cmd.response["observed_key_epoch"] = std::move(observed);
+    // The wBDX contract each chain's rotation acks are bound to (set by its first ack).
+    auto contracts = json::array();
+    for (const auto &cc : m_core.get_master_node_list().get_bridge_chain_contracts())
+      contracts.push_back(json{{"chain_id", cc.chain_id},
+                               {"contract", oxenc::to_hex(cc.contract.begin(), cc.contract.end())}});
+    cmd.response["chain_contracts"] = std::move(contracts);
     cmd.response["status"]             = STATUS_OK;
   }
 

@@ -34,6 +34,7 @@
 #include <chrono>
 #include <fmt/core.h>
 #include <oxenc/endian.h>
+#include <oxenc/hex.h>
 #include <date/date.h>
 
 extern "C" {
@@ -207,7 +208,10 @@ namespace master_nodes
       // Zero key for a member we can no longer key (seat released/expired): it can
       // never verify (small-order point), so it drops out as a possible accuser
       // without invalidating the rest of the historical committee.
+      // A slashed seat stays registered (its bond is burned, not returned) but has
+      // nothing left at stake, so it counts for nothing either.
       signer_keys.push_back(it != m_state.master_nodes_infos.end() && it->second->bridge_seat.registered
+                                    && !it->second->bridge_seat.is_forfeited()
                                 ? it->second->bridge_seat.signer_ed25519
                                 : crypto::ed25519_public_key::null());
     }
@@ -2572,18 +2576,77 @@ namespace master_nodes
       return false;
     }
 
-    // Advance this state's observed key epoch for the chain (monotonic). A stale/duplicate
-    // ack (epoch not newer than what we already recorded) verifies fine but is a no-op.
-    if (!chain_epoch_advance(observed_key_epoch, op.chain_id, op.key_epoch))
+    if (!check_bridge_rotation_ack(op, nettype, reason))
     {
-      LOG_PRINT_L1("Bridge rotation-ack TX: chain " << op.chain_id << " already at key epoch >= "
-                   << op.key_epoch << " (no-op) at height " << block_height);
+      LOG_PRINT_L1("Bridge rotation-ack TX: " << reason << " at height " << block_height);
       return false;
+    }
+
+    chain_epoch_advance(observed_key_epoch, op.chain_id, op.key_epoch);
+    if (std::none_of(bridge_chain_contracts.begin(), bridge_chain_contracts.end(),
+                     [&](const bridge_chain_contract &c) { return c.chain_id == op.chain_id; }))
+    {
+      bridge_chain_contracts.push_back(bridge_chain_contract{op.chain_id, op.contract});
+      MGINFO("Bridge chain " << op.chain_id << " bound to wBDX contract "
+             << oxenc::to_hex(op.contract.begin(), op.contract.end()));
     }
 
     MGINFO("Bridge rotation observed: chain " << op.chain_id << " advanced to key epoch "
            << op.key_epoch << " (epoch " << op.epoch << ") at height " << block_height);
     return true;
+  }
+
+  bool master_node_list::state_t::check_bridge_rotation_ack(const cryptonote::tx_extra_bridge_rotation_ack &ack,
+                                                             cryptonote::network_type nettype,
+                                                             std::string &reason) const
+  {
+    // A chain the bridge serves on this network. An ack for any other chain would add an
+    // observed epoch that every later unbond snapshots and then waits on for ever. (The
+    // test network has no list; its tests pick arbitrary chain ids.)
+    if (nettype != cryptonote::network_type::FAKECHAIN)
+    {
+      const auto *chain = cryptonote::find_bridge_chain(ack.chain_id);
+      if (!chain || chain->nettype != nettype)
+      {
+        reason = "chain " + std::to_string(ack.chain_id) + " is not a bridge chain on this network";
+        return false;
+      }
+    }
+    if (ack.chain_id == cryptonote::BRIDGE_GATEWAY_CHAIN_ID)
+    {
+      reason = "the gateway's key epoch is advanced by its owner hand-over, not by an ack";
+      return false;
+    }
+    // The contract this chain's acks are bound to, once one has been accepted.
+    for (const auto &c : bridge_chain_contracts)
+      if (c.chain_id == ack.chain_id && c.contract != ack.contract)
+      {
+        reason = "ack names contract " + oxenc::to_hex(ack.contract.begin(), ack.contract.end())
+                 + " but chain " + std::to_string(ack.chain_id) + " is bound to "
+                 + oxenc::to_hex(c.contract.begin(), c.contract.end());
+        return false;
+      }
+    // The contract moves its key epoch by exactly one per hand-over, and the bond gate
+    // counts hand-overs by this number. So once a chain has an observed epoch, only the
+    // next one is accepted: an ack that skipped would count one hand-over as several.
+    if (chain_epoch_present(observed_key_epoch, ack.chain_id))
+    {
+      const uint64_t have = chain_epoch_get(observed_key_epoch, ack.chain_id);
+      if (ack.key_epoch != have + 1)
+      {
+        reason = "chain " + std::to_string(ack.chain_id) + " is at key epoch " + std::to_string(have)
+                 + "; only " + std::to_string(have + 1) + " can follow, not " + std::to_string(ack.key_epoch);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool master_node_list::check_bridge_rotation_ack(const cryptonote::tx_extra_bridge_rotation_ack &ack,
+                                                   std::string &reason) const
+  {
+    std::lock_guard lock(m_mn_mutex);
+    return m_state.check_bridge_rotation_ack(ack, m_blockchain.nettype(), reason);
   }
 
   bool master_node_list::state_t::process_bridge_gateway_owner_tx(const cryptonote::transaction &tx)
@@ -2852,7 +2915,9 @@ namespace master_nodes
         // Zero key for a member we can no longer key: a zero ed25519 key is a
         // small-order point libsodium rejects, so that member simply cannot be
         // counted as an accuser — the rest of the committee stays verifiable.
+        // A slashed seat has nothing left at stake, so it counts for nothing either.
         signer_keys.push_back(it != master_nodes_infos.end() && it->second->bridge_seat.registered
+                                      && !it->second->bridge_seat.is_forfeited()
                                   ? it->second->bridge_seat.signer_ed25519
                                   : crypto::ed25519_public_key::null());
       }
@@ -3474,6 +3539,7 @@ namespace master_nodes
     result.block_hash          = state.block_hash;
     result.observed_key_epoch  = state.observed_key_epoch; // HF23 H.6.3
     result.bridge_gateway_owners = state.bridge_gateway_owners;
+    result.bridge_chain_contracts = state.bridge_chain_contracts;
     return result;
   }
 
@@ -4118,6 +4184,7 @@ namespace master_nodes
   , block_hash{state.block_hash}
   , observed_key_epoch{std::move(state.observed_key_epoch)} // HF23 H.6.3
   , bridge_gateway_owners{std::move(state.bridge_gateway_owners)}
+  , bridge_chain_contracts{std::move(state.bridge_chain_contracts)}
   , mn_list{mnl}
   {
     if (!mn_list)

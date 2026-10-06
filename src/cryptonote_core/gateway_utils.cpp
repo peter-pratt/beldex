@@ -427,12 +427,17 @@ std::string bridge_rotation_ack_message(network_type nettype, const tx_extra_bri
 {
   const crypto::hash& genesis = gateway_chain_binding(nettype);
   std::string buf;
-  buf.reserve(hashkey::BRIDGE_ROTATION_ACK.size() + sizeof(genesis) + 8 + 8 + ack.new_signer.size());
+  buf.reserve(hashkey::BRIDGE_ROTATION_ACK.size() + sizeof(genesis) + 1 + 8 + 20 + 8 + 20 + 32 + 4);
   buf.append(hashkey::BRIDGE_ROTATION_ACK);
   buf.append(reinterpret_cast<const char*>(&genesis), sizeof(genesis));
+  buf.push_back(static_cast<char>(ack.version));
   append_u64_le(buf, ack.chain_id);
+  buf.append(reinterpret_cast<const char*>(ack.contract.data()), ack.contract.size());
   append_u64_le(buf, ack.key_epoch);
   buf.append(reinterpret_cast<const char*>(ack.new_signer.data()), ack.new_signer.size());
+  buf.append(reinterpret_cast<const char*>(ack.evm_txid.data), sizeof(ack.evm_txid.data));
+  for (int i = 0; i < 4; ++i)
+    buf.push_back(static_cast<char>((ack.log_index >> (8 * i)) & 0xff));
   return buf;
 }
 
@@ -440,11 +445,23 @@ bool verify_bridge_rotation_evidence(const tx_extra_bridge_rotation_ack& ack,
                                      const std::vector<crypto::ed25519_public_key>& signer_keys,
                                      size_t threshold, network_type nettype, std::string& reason)
 {
-  // The incoming Pevm address must be a well-formed 20-byte EVM address; the signed
-  // bytes append it raw, so a wrong length would silently change the message.
+  // Only the current layout: an older ack signed less (no contract, no log), and an
+  // unknown one cannot be interpreted.
+  if (ack.version != tx_extra_bridge_rotation_ack::CURRENT_VERSION)
+  {
+    reason = "rotation ack: unsupported version " + std::to_string(ack.version);
+    return false;
+  }
+  // The addresses are appended raw to the signed bytes, so a wrong length would silently
+  // change the message.
   if (ack.new_signer.size() != 20)
   {
     reason = "rotation ack: new_signer must be exactly 20 bytes";
+    return false;
+  }
+  if (ack.contract.size() != 20)
+  {
+    reason = "rotation ack: contract must be exactly 20 bytes";
     return false;
   }
   if (threshold == 0)

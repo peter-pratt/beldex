@@ -2128,6 +2128,26 @@ where
         println!("  rotation acks DISABLED: BRIDGE_SIGNER_GENESIS_HASH is unset, and the \
                   acknowledgement is genesis-bound");
     }
+    // Completed acknowledgements, retried until L1's observed key epoch shows them. Handing
+    // one to the daemon is not the end: it still has to be paid for and mined, and until it
+    // is, departing members' bonds stay locked. With a wallet RPC configured
+    // (BRIDGE_SIGNER_ACK_WALLET_RPC, e.g. http://127.0.0.1:19092/json_rpc, a local wallet
+    // RPC run with --disable-rpc-login), this node pays for it itself. The mempool keeps
+    // one per (chain, key epoch), so several members doing so pays only once.
+    let mut ack_submissions = beldex_bridge_signer::rotation_ack::AckSubmissions::new();
+    let ack_wallet = std::env::var("BRIDGE_SIGNER_ACK_WALLET_RPC")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(HttpJsonRpc::new);
+    match &ack_wallet {
+        Some(_) => println!("  rotation acks: submitted and paid for by the configured wallet RPC"),
+        None => println!(
+            "  rotation acks: NO wallet RPC (BRIDGE_SIGNER_ACK_WALLET_RPC); each one is printed \
+             for someone to submit with `bridge_rotation_ack`"
+        ),
+    }
+    // L1's observed key epoch per chain, refreshed with the ack sweep.
+    let mut l1_observed: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
 
     // Re-send pacing in loop ticks. A Beldex block is ~30s, so re-sending every tick
     // would repeat before a block could even exist.
@@ -2140,6 +2160,8 @@ where
     // member which missed a completion stops within a round or two, rare enough that it is
     // one extra RPC per duty per minute rather than per tick.
     let reconcile_recheck_ticks = std::cmp::max(1, 60 / poll_secs.max(1));
+    // The rotation-ack sweep: about once a minute.
+    let ack_sweep_ticks = std::cmp::max(1, 60 / poll_secs.max(1));
 
     let mut ticks = 0u64;
     loop {
@@ -2246,11 +2268,12 @@ where
         // Observe: a settled key change on any watched chain. Sign it and tell the mesh.
         if bus_genesis != [0u8; 32] {
             for r in src.poll_rotations() {
-                let ack = beldex_bridge_signer::rotation_ack::RotationAck {
-                    chain_id: r.chain.0,
-                    key_epoch: r.key_epoch,
-                    new_signer: r.new_signer,
-                };
+                // Already applied on L1 (seen again after a restart re-scanned the chain):
+                // nothing left to acknowledge.
+                if l1_observed.get(&r.chain.0).is_some_and(|have| *have >= r.key_epoch) {
+                    continue;
+                }
+                let ack = beldex_bridge_signer::rotation_ack::RotationAck::from_event(&r);
                 let key = ack.mesh_key(&bus_genesis);
                 match ack_collector.observe_and_sign(
                     ack,
@@ -2294,18 +2317,82 @@ where
                 ack_collector.absorb(&key, &body, &bus_genesis);
             }
 
-            // Submit anything that has reached threshold. The daemon verifies and returns a
-            // tx_extra for a wallet to broadcast — it does not submit the transaction.
             for done in ack_collector.take_complete(&ls.committee, &bus_genesis) {
-                let json = done.to_submission_json();
-                match committee_probe.submit_rotation_ack(&json) {
-                    Ok(reply) => println!(
-                        "rotation ack accepted for chain {} key epoch {}: {reply}\n  \
-                         submit this tx_extra from a funded wallet to advance L1's observed \
-                         key epoch — until it is mined, departed members' bonds stay locked",
-                        done.ack.chain_id, done.ack.key_epoch
-                    ),
-                    Err(e) => eprintln!("  rotation ack submission failed ({e}); will retry"),
+                println!(
+                    "rotation ack complete for chain {} key epoch {}: queued for L1",
+                    done.ack.chain_id, done.ack.key_epoch
+                );
+                ack_submissions.add(done);
+            }
+
+            // About once a minute: learn what L1 has applied, stop working on that, re-send
+            // this node's own signatures for anything still collecting (a member that started
+            // late missed them), and put the next acknowledgement per chain on chain.
+            if ticks % ack_sweep_ticks == 0 {
+                use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
+                use beldex_bridge_signer::rotation_ack::{parse_observed_key_epochs, rotation_hex_from_reply};
+                match key_probe_gw.call("bridge_get_seats", serde_json::json!({})) {
+                    Ok(v) => match parse_observed_key_epochs(&v) {
+                        Some(m) => l1_observed = m,
+                        None => eprintln!("  bridge_get_seats: no observed_key_epoch in the reply"),
+                    },
+                    Err(e) => eprintln!("  bridge_get_seats failed ({e:?}); keeping the last view"),
+                }
+                let observed = |chain: u64| l1_observed.get(&chain).copied();
+                ack_collector.forget_observed(observed);
+                ack_submissions.forget_observed(observed);
+
+                for (key, body) in ack_collector.own_signatures(ls.self_index, &bus_genesis) {
+                    let msg = beldex_bridge_signer::wire::WireMsg {
+                        leg: Leg::Pgw,
+                        epoch: ls.committee.epoch,
+                        payload_hash: key,
+                        attempt: 0,
+                        from: ls.self_index,
+                        body: beldex_bridge_signer::wire::SessionMsg::RotationAckSig(body),
+                    };
+                    use beldex_bridge_signer::wire::SessionTransport as _;
+                    beldex_bridge_signer::wire::note_send_failure("rotation-ack", net.broadcast(&msg));
+                }
+
+                let now = beldex_bridge_signer::release_outbox::now_secs();
+                for done in ack_submissions.due(observed, now) {
+                    ack_submissions.attempted(&done.ack, now);
+                    let (chain, epoch) = (done.ack.chain_id, done.ack.key_epoch);
+                    // The daemon re-checks the evidence and the chain's binding, and leaves
+                    // out any observer that is no longer bonded.
+                    let reply = match committee_probe.submit_rotation_ack(&done.to_submission_json()) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("  rotation ack chain {chain} key epoch {epoch}: daemon refused ({e}); will retry");
+                            continue;
+                        }
+                    };
+                    let Some(rotation_hex) = rotation_hex_from_reply(&reply) else {
+                        eprintln!("  rotation ack chain {chain} key epoch {epoch}: no rotation_hex in {reply}");
+                        continue;
+                    };
+                    match &ack_wallet {
+                        Some(w) => match w.call(
+                            "bridge_rotation_ack",
+                            serde_json::json!({ "rotation_hex": rotation_hex }),
+                        ) {
+                            Ok(r) => println!(
+                                "rotation ack chain {chain} key epoch {epoch} submitted: tx {}",
+                                r.get("tx_hash").and_then(serde_json::Value::as_str).unwrap_or("?")
+                            ),
+                            // Includes "already in the pool" when another member got there
+                            // first; the next sweep sees L1 apply it and stops.
+                            Err(e) => eprintln!(
+                                "  rotation ack chain {chain} key epoch {epoch}: wallet did not submit ({e:?}); will retry"
+                            ),
+                        },
+                        None => println!(
+                            "rotation ack chain {chain} key epoch {epoch} is ready but no wallet RPC is configured; \
+                             submit it with `bridge_rotation_ack {rotation_hex}` from any funded wallet. \
+                             Until it is mined, departing members' bonds stay locked."
+                        ),
+                    }
                 }
             }
         }

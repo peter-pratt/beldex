@@ -753,8 +753,9 @@ void omq_rpc::on_bridge_rotation_ack(oxenmq::Message& m)
   // One data part: the JSON ack the off-chain signer produced, matching the Rust
   // `SignedRotationAck::to_submission_json` wire shape:
   //
-  //   { "version": 0, "chain_id": 42, "key_epoch": 8, "new_signer": "<40 hex>",
-  //     "epoch": 7, "observers": [ { "voter_index": 0, "signature": "<128 hex>" }, ... ] }
+  //   { "version": 1, "chain_id": 42, "contract": "<40 hex>", "key_epoch": 8,
+  //     "new_signer": "<40 hex>", "evm_txid": "<64 hex>", "log_index": 3, "epoch": 7,
+  //     "observers": [ { "voter_index": 0, "signature": "<128 hex>" }, ... ] }
   //
   // The daemon verifies the committee evidence and hands back `rotation_hex` for the
   // (any) submitting wallet; it does not build the tx (it cannot pay a fee).
@@ -768,19 +769,30 @@ void omq_rpc::on_bridge_rotation_ack(oxenmq::Message& m)
   try
   {
     auto req = nlohmann::json::parse(m.data[0]);
-    ack.version   = req.value("version", 0);
+    ack.version   = req.at("version").get<uint8_t>();
     ack.chain_id  = req.at("chain_id").get<uint64_t>();
     ack.key_epoch = req.at("key_epoch").get<uint64_t>();
     ack.epoch     = req.at("epoch").get<uint64_t>();
+    ack.log_index = req.at("log_index").get<uint32_t>();
 
-    const std::string ns_hex = req.at("new_signer").get<std::string>();
-    if (ns_hex.size() != 40 || !oxenc::is_hex(ns_hex))
+    auto hex_bytes = [&](const char* field, size_t len, std::vector<uint8_t>& out) {
+      const std::string h = req.at(field).get<std::string>();
+      if (h.size() != 2 * len || !oxenc::is_hex(h))
+        return false;
+      const std::string b = oxenc::from_hex(h);
+      out.assign(b.begin(), b.end());
+      return true;
+    };
+    if (!hex_bytes("new_signer", 20, ack.new_signer) || !hex_bytes("contract", 20, ack.contract))
     {
-      m.send_reply(OMQ_BAD_REQUEST, "bridge.rotation_ack: new_signer must be 20-byte hex");
+      m.send_reply(OMQ_BAD_REQUEST, "bridge.rotation_ack: new_signer and contract must be 20-byte hex");
       return;
     }
-    const std::string ns = oxenc::from_hex(ns_hex);
-    ack.new_signer.assign(ns.begin(), ns.end());
+    if (!tools::hex_to_type(req.at("evm_txid").get<std::string>(), ack.evm_txid))
+    {
+      m.send_reply(OMQ_BAD_REQUEST, "bridge.rotation_ack: evm_txid must be 32-byte hex");
+      return;
+    }
 
     for (const auto& o : req.at("observers"))
     {
@@ -813,14 +825,29 @@ void omq_rpc::on_bridge_rotation_ack(oxenmq::Message& m)
     return;
   }
 
-  // The same verification consensus will apply — reject here so a bad ack never reaches a
+  // A member whose seat has since been released, or slashed, has no key here (it can no
+  // longer vouch for anything). Its signature would fail verification and sink the whole
+  // ack, so leave it out; the rest must still reach the threshold on their own.
+  const size_t submitted = ack.observers.size();
+  ack.observers.erase(std::remove_if(ack.observers.begin(), ack.observers.end(),
+                                     [&](const bridge_rotation_signature& o) {
+                                       return o.voter_index < signer_keys.size()
+                                           && signer_keys[o.voter_index] == crypto::ed25519_public_key::null();
+                                     }),
+                      ack.observers.end());
+
+  // The same checks consensus will apply — reject here so a bad ack never reaches a
   // wallet, let alone the mempool.
   std::string reason;
-  if (!cryptonote::verify_bridge_rotation_evidence(ack, signer_keys, threshold, nettype, reason))
+  if (!cryptonote::verify_bridge_rotation_evidence(ack, signer_keys, threshold, nettype, reason)
+      || !core_.get_master_node_list().check_bridge_rotation_ack(ack, reason))
   {
     m.send_reply(OMQ_BAD_REQUEST, "bridge.rotation_ack: " + reason);
     return;
   }
+  if (ack.observers.size() != submitted)
+    MGINFO("bridge.rotation_ack: left out " << submitted - ack.observers.size()
+           << " observer(s) no longer bonded");
 
   std::vector<uint8_t> extra;
   if (!cryptonote::add_bridge_rotation_ack_to_tx_extra(extra, ack))

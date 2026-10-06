@@ -111,12 +111,14 @@ bool verify_bridge_slash_evidence(const tx_extra_bridge_slash& slash,
 // The canonical, genesis-bound bytes an observing committee signs to attest a wBDX
 // signer rotation (HF23, plan §12 H.6.3). MUST match the off-chain signer's
 // `rotation_ack.rs::RotationAck::canonical` byte-for-byte:
-//   BRIDGE_ROTATION_ACK ‖ genesis ‖ chain_id(u64 LE) ‖ key_epoch(u64 LE) ‖ new_signer(20)
-// The observed fact is objective (chain/epoch/signer); the observing committee's L1
-// `epoch` is NOT part of these bytes. ed25519 signs the message directly.
+//   BRIDGE_ROTATION_ACK ‖ genesis ‖ version(u8) ‖ chain_id(u64 LE) ‖ contract(20) ‖
+//   key_epoch(u64 LE) ‖ new_signer(20) ‖ evm_txid(32) ‖ log_index(u32 LE)
+// The observing committee's L1 `epoch` is NOT part of these bytes. ed25519 signs the
+// message directly.
 std::string bridge_rotation_ack_message(network_type nettype, const tx_extra_bridge_rotation_ack& ack);
 
-// Verify a bridge rotation ack: co-signed by ≥ `threshold` distinct, strictly-ascending
+// Verify a bridge rotation ack: the current version, a 20-byte contract and new_signer,
+// co-signed by ≥ `threshold` distinct, strictly-ascending
 // committee members, each ed25519 signature valid over `bridge_rotation_ack_message`
 // under that member's `signer_ed25519`. `signer_keys` is the observing committee's
 // per-member signer_ed25519, ordered by committee index. Returns false (with `reason`)

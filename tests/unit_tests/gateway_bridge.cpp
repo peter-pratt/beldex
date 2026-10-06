@@ -228,8 +228,8 @@ TEST(GatewayBridgeRotation, verify_evidence_threshold_and_binding)
   for (uint16_t i = 0; i < n; ++i) crypto_sign_ed25519_keypair(pubs[i].data, secs[i].data);
 
   tx_extra_bridge_rotation_ack ack{};
-  ack.version   = 0;
   ack.chain_id  = 42;
+  ack.contract  = addr20(0x22);
   ack.key_epoch = 8;
   ack.new_signer = addr20(0xCD);
   ack.epoch     = 7;
@@ -277,6 +277,7 @@ TEST(GatewayBridgeRotation, non_ascending_and_bad_length_rejected)
 
   tx_extra_bridge_rotation_ack ack{};
   ack.chain_id = 1; ack.key_epoch = 2; ack.new_signer = addr20(0x11); ack.epoch = 3;
+  ack.contract = addr20(0x22);
   const std::string msg = bridge_rotation_ack_message(NET_R, ack);
   auto sig_of = [&](uint16_t idx) {
     bridge_rotation_signature s{}; s.voter_index = idx;
@@ -310,6 +311,7 @@ TEST(GatewayBridgeRotation, tx_extra_round_trip_and_dispatch)
 
   tx_extra_bridge_rotation_ack ack{};
   ack.chain_id = 42; ack.key_epoch = 8; ack.new_signer = addr20(0xCD); ack.epoch = 7;
+  ack.contract = addr20(0x22); ack.log_index = 3; ack.evm_txid.data[0] = 0xEE;
   const std::string msg = bridge_rotation_ack_message(NET_R, ack);
   for (uint16_t idx : {0, 1, 3, 4})
   {
@@ -331,6 +333,9 @@ TEST(GatewayBridgeRotation, tx_extra_round_trip_and_dispatch)
   EXPECT_EQ(back.key_epoch, ack.key_epoch);
   EXPECT_EQ(back.epoch, ack.epoch);
   EXPECT_EQ(back.new_signer, ack.new_signer);
+  EXPECT_EQ(back.contract, ack.contract);
+  EXPECT_EQ(back.evm_txid, ack.evm_txid);
+  EXPECT_EQ(back.log_index, ack.log_index);
   ASSERT_EQ(back.observers.size(), ack.observers.size());
   for (size_t i = 0; i < back.observers.size(); ++i)
   {
@@ -523,7 +528,9 @@ namespace
         for (const auto& pk : members)
         {
           auto mit = cur.master_nodes_infos.find(pk);
+          // Mirrors the daemon's resolver: a released or slashed seat counts for nothing.
           signer_keys.push_back(mit != cur.master_nodes_infos.end() && mit->second->bridge_seat.registered
+                                        && !mit->second->bridge_seat.is_forfeited()
                                     ? mit->second->bridge_seat.signer_ed25519
                                     : crypto::ed25519_public_key::null());
         }
@@ -569,8 +576,12 @@ namespace
                                                  uint64_t epoch)
   {
     tx_extra_bridge_rotation_ack ack{};
-    ack.version = 0; ack.chain_id = chain_id; ack.key_epoch = key_epoch; ack.epoch = epoch;
+    ack.chain_id = chain_id; ack.key_epoch = key_epoch; ack.epoch = epoch;
     ack.new_signer = std::vector<uint8_t>(20, 0xCD);
+    // Each chain's wBDX contract, and a distinct cited log per rotation.
+    ack.contract = std::vector<uint8_t>(20, static_cast<uint8_t>(0x20 + chain_id));
+    ack.evm_txid.data[0] = static_cast<char>(key_epoch);
+    ack.log_index = static_cast<uint32_t>(key_epoch);
     const std::string msg = bridge_rotation_ack_message(NET_FC, ack);
     for (uint16_t idx : observers)
     {
@@ -606,7 +617,9 @@ namespace
         for (const auto& pk : members)
         {
           auto mit = cur.master_nodes_infos.find(pk);
+          // Mirrors the daemon's resolver: a released or slashed seat counts for nothing.
           signer_keys.push_back(mit != cur.master_nodes_infos.end() && mit->second->bridge_seat.registered
+                                        && !mit->second->bridge_seat.is_forfeited()
                                     ? mit->second->bridge_seat.signer_ed25519
                                     : crypto::ed25519_public_key::null());
         }
@@ -814,6 +827,158 @@ TEST(GatewayBridgeSlash, exiting_seat_frees_its_slot_and_is_not_a_candidate)
 // observed_key_epoch; finalize_bridge_unbonds withholds a bond until every chain in the
 // seat's baseline has rotated past it; grandfathering exempts later-added chains.
 // --------------------------------------------------------------------------
+// The exact bytes a rotation ack signs, pinned. The Rust signer's
+// `rotation_ack::tests::canonical_bytes_match_the_daemon` asserts the same hex, so the two
+// cannot drift apart without one of them failing.
+TEST(GatewayBridgeRotation, rotation_ack_message_is_pinned)
+{
+  tx_extra_bridge_rotation_ack ack{};
+  ack.chain_id = 56; ack.key_epoch = 7; ack.log_index = 0x01020304;
+  ack.contract = addr20(0x22); ack.new_signer = addr20(0xCD);
+  for (size_t i = 0; i < sizeof(ack.evm_txid.data); ++i) ack.evm_txid.data[i] = static_cast<char>(i);
+  const std::string msg = bridge_rotation_ack_message(network_type::MAINNET, ack);
+  EXPECT_EQ(oxenc::to_hex(msg.begin(), msg.end()),
+            "6272696467655f726f746174696f6e5f61636b5f76326ea477622339f61c5fba036dc75c08b6efcf9ee09c108e5c5591fcc233d17b2001380000000000000022222222222222222222222222222222222222220700000000000000cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f04030201");
+}
+
+// H-06 / L-03: only the current ack layout is accepted, and it must name the contract.
+TEST(GatewayBridgeRotation, only_the_current_ack_version_with_a_contract_verifies)
+{
+  const network_type NET_R = network_type::MAINNET;
+  const uint16_t n = 6, t_plus_1 = 4;
+  std::vector<crypto::ed25519_public_key> pubs(n);
+  std::vector<crypto::ed25519_secret_key> secs(n);
+  for (uint16_t i = 0; i < n; ++i) crypto_sign_ed25519_keypair(pubs[i].data, secs[i].data);
+
+  auto signed_ack = [&](uint8_t version, std::vector<uint8_t> contract) {
+    tx_extra_bridge_rotation_ack ack{};
+    ack.version = version; ack.chain_id = 56; ack.key_epoch = 2; ack.epoch = 3;
+    ack.new_signer = addr20(0x11); ack.contract = std::move(contract);
+    const std::string msg = bridge_rotation_ack_message(NET_R, ack);
+    for (uint16_t idx : {0, 1, 2, 3})
+    {
+      bridge_rotation_signature s{}; s.voter_index = idx;
+      crypto_sign_detached(s.signature.data, nullptr,
+                           reinterpret_cast<const unsigned char*>(msg.data()), msg.size(), secs[idx].data);
+      ack.observers.push_back(s);
+    }
+    return ack;
+  };
+  std::string reason;
+  EXPECT_TRUE(verify_bridge_rotation_evidence(signed_ack(1, addr20(0x22)), pubs, t_plus_1, NET_R, reason)) << reason;
+  for (uint8_t v : {0, 2, 255})
+  {
+    EXPECT_FALSE(verify_bridge_rotation_evidence(signed_ack(v, addr20(0x22)), pubs, t_plus_1, NET_R, reason));
+    EXPECT_NE(reason.find("unsupported version"), std::string::npos) << reason;
+  }
+  EXPECT_FALSE(verify_bridge_rotation_evidence(signed_ack(1, {}), pubs, t_plus_1, NET_R, reason));
+  EXPECT_FALSE(verify_bridge_rotation_evidence(signed_ack(1, std::vector<uint8_t>(19, 0x22)), pubs, t_plus_1, NET_R, reason));
+
+  // The contract and the cited log are signed: changing either breaks every signature.
+  auto ack = signed_ack(1, addr20(0x22));
+  auto moved = ack; moved.contract = addr20(0x33);
+  EXPECT_FALSE(verify_bridge_rotation_evidence(moved, pubs, t_plus_1, NET_R, reason));
+  auto relog = ack; relog.log_index = 9;
+  EXPECT_FALSE(verify_bridge_rotation_evidence(relog, pubs, t_plus_1, NET_R, reason));
+  auto retx = ack; retx.evm_txid.data[5] = 1;
+  EXPECT_FALSE(verify_bridge_rotation_evidence(retx, pubs, t_plus_1, NET_R, reason));
+}
+
+// The first accepted ack binds the chain to its contract; acks about any other contract
+// on that chain are refused and move nothing.
+TEST(GatewayBridgeRotation, a_chain_is_bound_to_the_contract_of_its_first_ack)
+{
+  const size_t N = cryptonote::bridge_committee_size(NET_FC);
+  auto c = make_committee(N);
+  master_node_list::state_t cur(nullptr);
+  cur.height = 5000;
+  for (size_t i = 0; i < N; ++i) seat_member(cur, c.mn[i], c.ed_pub[i], 100 + i);
+
+  ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 1, {0, 1, 2, 3}, 3), 5000));
+  ASSERT_EQ(cur.bridge_chain_contracts.size(), 1u);
+  EXPECT_EQ(cur.bridge_chain_contracts[0].contract, std::vector<uint8_t>(20, 0x21));
+
+  // Re-sign the next rotation over a different contract on the same chain.
+  auto other = sign_rotation_ack(c, 1, 2, {}, 3);
+  other.contract = std::vector<uint8_t>(20, 0x99);
+  const std::string msg = bridge_rotation_ack_message(NET_FC, other);
+  for (uint16_t idx : {0, 1, 2, 3})
+  {
+    bridge_rotation_signature s{}; s.voter_index = idx;
+    crypto_sign_detached(s.signature.data, nullptr,
+                         reinterpret_cast<const unsigned char*>(msg.data()), msg.size(), c.ed_sec[idx].data);
+    other.observers.push_back(s);
+  }
+  std::string reason;
+  EXPECT_FALSE(cur.check_bridge_rotation_ack(other, NET_FC, reason));
+  EXPECT_NE(reason.find("bound to"), std::string::npos) << reason;
+  EXPECT_FALSE(run_rotation_ack(cur, c, other, 5001));
+  EXPECT_EQ(observed_epoch(cur, 1), 1u) << "an ack about another contract moves nothing";
+
+  // The real contract's next rotation is accepted, and another chain gets its own binding.
+  EXPECT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 2, {0, 1, 2, 3}, 3), 5002));
+  EXPECT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 2, 1, {0, 1, 2, 3}, 3), 5002));
+  EXPECT_EQ(cur.bridge_chain_contracts.size(), 2u);
+}
+
+// The contract moves its key epoch by exactly one, and the bond gate counts hand-overs by
+// it, so an ack that skips an epoch would count one hand-over as several.
+TEST(GatewayBridgeRotation, an_ack_must_name_exactly_the_next_key_epoch)
+{
+  const size_t N = cryptonote::bridge_committee_size(NET_FC);
+  auto c = make_committee(N);
+  master_node_list::state_t cur(nullptr);
+  cur.height = 5000;
+  for (size_t i = 0; i < N; ++i) seat_member(cur, c.mn[i], c.ed_pub[i], 100 + i);
+
+  ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 2, {0, 1, 2, 3}, 3), 5000));
+  EXPECT_FALSE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 4, {0, 1, 2, 3}, 3), 5001)) << "skips 3";
+  EXPECT_FALSE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 2, {0, 1, 2, 3}, 3), 5001)) << "repeats 2";
+  EXPECT_EQ(observed_epoch(cur, 1), 2u);
+  EXPECT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 3, {0, 1, 2, 3}, 3), 5002));
+  EXPECT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 4, {0, 1, 2, 3}, 3), 5003)) << "now 4 is next";
+  EXPECT_EQ(observed_epoch(cur, 1), 4u);
+}
+
+// Only chains the bridge serves on this network, and never the gateway's reserved id
+// (its epoch moves with its owner hand-over).
+TEST(GatewayBridgeRotation, an_ack_must_be_for_a_bridge_chain_of_this_network)
+{
+  master_node_list::state_t st(nullptr);
+  tx_extra_bridge_rotation_ack ack{};
+  ack.key_epoch = 2; ack.contract = addr20(0x22); ack.new_signer = addr20(0x11);
+  std::string reason;
+  ack.chain_id = 56;    EXPECT_TRUE(st.check_bridge_rotation_ack(ack, network_type::MAINNET, reason)) << reason;
+  ack.chain_id = 31337; EXPECT_FALSE(st.check_bridge_rotation_ack(ack, network_type::MAINNET, reason));
+  ack.chain_id = 31337; EXPECT_TRUE(st.check_bridge_rotation_ack(ack, network_type::DEVNET, reason)) << reason;
+  ack.chain_id = 56;    EXPECT_FALSE(st.check_bridge_rotation_ack(ack, network_type::TESTNET, reason));
+  ack.chain_id = 999999; EXPECT_FALSE(st.check_bridge_rotation_ack(ack, network_type::MAINNET, reason));
+  ack.chain_id = cryptonote::BRIDGE_GATEWAY_CHAIN_ID;
+  EXPECT_FALSE(st.check_bridge_rotation_ack(ack, NET_FC, reason));
+}
+
+// A slashed seat has nothing left at stake, so its signature is no voucher: like a
+// released one, it gets no key, cannot verify, and cannot make up the threshold.
+TEST(GatewayBridgeRotation, a_slashed_member_cannot_vouch_for_an_ack)
+{
+  const size_t N = cryptonote::bridge_committee_size(NET_FC);
+  auto c = make_committee(N);
+  master_node_list::state_t cur(nullptr);
+  cur.height = 5000;
+  for (size_t i = 0; i < N; ++i) seat_member(cur, c.mn[i], c.ed_pub[i], 100 + i);
+  {
+    auto info = std::make_shared<master_node_info>(*cur.master_nodes_infos.at(c.mn[3]));
+    info->bridge_seat.requested_unbond_height = 5000;
+    info->bridge_seat.bond_unlock_height = std::numeric_limits<uint64_t>::max(); // forfeited
+    cur.master_nodes_infos[c.mn[3]] = info;
+  }
+  ASSERT_TRUE(cur.master_nodes_infos.at(c.mn[3])->bridge_seat.is_forfeited());
+
+  EXPECT_FALSE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 1, {0, 1, 2, 3}, 3), 5000))
+      << "three bonded signers and a slashed one are not four";
+  EXPECT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 1, {0, 1, 2, 4}, 3), 5000));
+}
+
 TEST(GatewayBridgeRotation, ack_advances_observed_key_epoch_monotonically)
 {
   const size_t N = cryptonote::bridge_committee_size(NET_FC); // 6
