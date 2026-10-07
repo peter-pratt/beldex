@@ -50,6 +50,12 @@ const CGGMP_HELLO: u8 = 9;
 
 /// A stable 32-byte signing-session tag: the keccak digest being signed (what
 /// `ecrecover` checks), so all signers route this signing's frames to one session.
+/// Whether `msg` is the echo round's message: what a signer sends only when reliable
+/// broadcast is enforced.
+fn is_reliability_check(msg: &SigningMsg) -> bool {
+    matches!(msg, cggmp21::signing::msg::Msg::ReliabilityCheck(_))
+}
+
 fn sign_tag(digest32: &[u8; 32]) -> [u8; 32] {
     *digest32
 }
@@ -203,12 +209,22 @@ pub fn run_cggmp21_sign_over_transport<T: SessionTransport>(
         let data = DataToSign::<Secp256k1>::digest::<Keccak256>(&preimage_owned);
         let mut state = wrap_protocol(|party| async move {
             cggmp21::signing(eid, self_pos, &parties_for_proto, &key_share)
+                // Round 1 must reach every signer identically. The mesh's broadcast is a send
+                // to each peer, so a signer could hand peers different round-1 messages; the
+                // extra echo round makes every signer confirm it saw what the others saw.
+                // cggmp21 0.6.3 defaults this on; it is set here so the protection does not
+                // rest on a library default.
+                .enforce_reliable_broadcast(true)
                 .sign(&mut rng, party, data)
                 .await
         });
+        // Whether this signer sent the echo round's message. A signature finished without
+        // it was produced over an unchecked broadcast, so it is refused (see below).
+        let mut sent_reliability_check = false;
         loop {
             match state.proceed() {
                 ProceedResult::SendMsg(msg) => {
+                    sent_reliability_check |= is_reliability_check(&msg.msg);
                     if out_tx.send(msg).is_err() {
                         return Err("outgoing channel closed".into());
                     }
@@ -224,6 +240,14 @@ pub fn run_cggmp21_sign_over_transport<T: SessionTransport>(
                 ProceedResult::Yielded => {}
                 ProceedResult::Output(out) => {
                     let sig = out.map_err(|e| format!("signing failed: {e}"))?;
+                    // Checked on every run, not assumed: if a cggmp21 upgrade ignored or
+                    // renamed the option, signing would otherwise go on without the echo
+                    // round and nothing would say so.
+                    if !sent_reliability_check {
+                        return Err("signing finished without the reliable-broadcast echo round; \
+                                    refusing the signature"
+                            .into());
+                    }
                     let mut rs = [0u8; 64];
                     rs[..32].copy_from_slice(sig.r.to_be_bytes().as_ref());
                     rs[32..].copy_from_slice(sig.s.to_be_bytes().as_ref());
@@ -424,6 +448,17 @@ mod tests {
     /// the real driver** → the aggregate `ecrecover`s to the wBDX signer address.
     /// (The share source is orthogonal; the no-dealer chain is `cggmp21_dkg_sign`.)
     /// Ignored (heavy MPC + threads).
+    /// The check that refuses a signature made without the echo round must recognise the
+    /// echo round's message; pinned here so a cggmp21 upgrade that renames or reshapes it
+    /// fails to build or fails this test, rather than every signing at run time.
+    #[test]
+    fn the_echo_round_message_is_recognised() {
+        let echo: SigningMsg = cggmp21::signing::msg::Msg::ReliabilityCheck(
+            cggmp21::signing::msg::MsgReliabilityCheck(Default::default()),
+        );
+        assert!(is_reliability_check(&echo));
+    }
+
     #[test]
     #[ignore = "runs the full cggmp21 signing MPC across threads"]
     fn cggmp21_signing_over_the_mesh_recovers_wbdx_address() {

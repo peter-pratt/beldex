@@ -126,6 +126,7 @@ fn real_dkg_aux_info_sign_recovers_wbdx_address() {
         let data = data.clone();
         async move {
             cggmp21::signing(eid, i, &parties, &key_share)
+                .enforce_reliable_broadcast(true)
                 .sign(&mut rand::rngs::OsRng, party, data)
                 .await
         }
