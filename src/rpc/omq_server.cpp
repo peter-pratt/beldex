@@ -961,7 +961,7 @@ void omq_rpc::on_bridge_mint_sub_request(oxenmq::Message& m)
 
 void omq_rpc::on_bridge_mint_payload(oxenmq::Message& m)
 {
-  // Wire: [ payload_json, publisher_index (ascii), signature (128 hex) ]
+  // Wire: [ payload_json, publisher_index (ascii), signature (128 hex), master_node (64 hex, optional) ]
   //
   // The publisher must be a **seated bridge committee member**, proven by signing
   //     BRIDGE_MINT_PUBLISH ‖ genesis ‖ payload
@@ -974,9 +974,9 @@ void omq_rpc::on_bridge_mint_payload(oxenmq::Message& m)
   // authorizes the mint, and only the wBDX contract can check that. So a subscriber still
   // trusts nothing from this bus — this check exists to keep the daemon from relaying spam.
   constexpr size_t MAX_PAYLOAD = 8 * 1024;
-  if (m.data.size() != 3) {
+  if (m.data.size() != 3 && m.data.size() != 4) {
     m.send_reply(OMQ_BAD_REQUEST,
-                 "bridge.mint_payload: expected [payload, publisher_index, signature]");
+                 "bridge.mint_payload: expected [payload, publisher_index, signature, master_node]");
     return;
   }
   const std::string payload{m.data[0]};
@@ -997,6 +997,15 @@ void omq_rpc::on_bridge_mint_payload(oxenmq::Message& m)
   if (!tools::hex_to_type(std::string{m.data[2]}, publisher_sig)) {
     m.send_reply(OMQ_BAD_REQUEST, "bridge.mint_payload: signature must be 128-char hex");
     return;
+  }
+  std::optional<crypto::public_key> publisher_mn;
+  if (m.data.size() == 4) {
+    crypto::public_key pk{};
+    if (!tools::hex_to_type(std::string{m.data[3]}, pk)) {
+      m.send_reply(OMQ_BAD_REQUEST, "bridge.mint_payload: master_node must be 64-char hex");
+      return;
+    }
+    publisher_mn = pk;
   }
 
   // Well-formedness + the dedup key.
@@ -1024,8 +1033,10 @@ void omq_rpc::on_bridge_mint_payload(oxenmq::Message& m)
   // case. That committee is not the only legitimate publisher: the committee holding the
   // live key keeps signing, and publishing, after consensus has selected its successor,
   // until the rotation replacing that key lands, and by then its index in the current
-  // committee means nothing. So a signature from any REGISTERED bridge seat is also
-  // accepted. Every registered seat is bonded, so the bus is still no open amplifier.
+  // committee means nothing. So a publisher that names its master node is also accepted
+  // if that node holds a REGISTERED bridge seat whose key verifies the signature. Every
+  // registered seat is bonded, so the bus is still no open amplifier; and it is one lookup
+  // and one signature check, so a bad publication cannot make the daemon try every seat.
   {
     const auto nettype = core_.get_nettype();
     const uint64_t top = core_.get_current_blockchain_height();
@@ -1044,12 +1055,10 @@ void omq_rpc::on_bridge_mint_payload(oxenmq::Message& m)
     size_t threshold = 0;
     bool authentic = core_.get_master_node_list().get_bridge_committee(epoch_height, members, signer_keys, threshold)
                      && publisher_index < signer_keys.size() && verifies(signer_keys[publisher_index]);
-    if (!authentic)
-      for (const auto& e : core_.get_master_node_list_state({}))
-        if (e.info->bridge_seat.registered && verifies(e.info->bridge_seat.signer_ed25519)) {
-          authentic = true;
-          break;
-        }
+    if (!authentic && publisher_mn)
+      for (const auto& e : core_.get_master_node_list_state({*publisher_mn}))
+        if (e.pubkey == *publisher_mn && e.info->bridge_seat.registered)
+          authentic = verifies(e.info->bridge_seat.signer_ed25519);
     if (!authentic) {
       MWARNING("bridge.mint_payload: rejected publication claiming committee index "
                << publisher_index << " from " << m.remote << " — bad signature");
