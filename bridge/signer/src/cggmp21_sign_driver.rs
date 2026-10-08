@@ -46,18 +46,108 @@ type SigningMsg = cggmp21::signing::msg::Msg<Secp256k1, sha2::Sha256>;
 
 const CGGMP_BCAST: u8 = 1;
 const CGGMP_P2P: u8 = 2;
+/// Connection barrier. Body: the sender's run contribution ([`RUN_CONTRIBUTION_LEN`] bytes).
 const CGGMP_HELLO: u8 = 9;
 
-/// A stable 32-byte signing-session tag: the keccak digest being signed (what
-/// `ecrecover` checks), so all signers route this signing's frames to one session.
+/// Fresh randomness each signer adds to a run's execution id.
+///
+/// Everything else in the id (committee, signer set, attempt, message) repeats whenever the
+/// same duty is signed again: after a restart the coordinator's attempt counter starts from
+/// 0, and the `sign` subcommand always passes 0. cggmp21 requires the id to be unique per
+/// execution, so each signer draws a new contribution for every run and announces it in its
+/// barrier HELLO, and the id is derived from all of them. One honest signer's fresh
+/// contribution is enough to make the id new; none can be held back to force an old one.
+const RUN_CONTRIBUTION_LEN: usize = 32;
+
 /// Whether `msg` is the echo round's message: what a signer sends only when reliable
 /// broadcast is enforced.
 fn is_reliability_check(msg: &SigningMsg) -> bool {
     matches!(msg, cggmp21::signing::msg::Msg::ReliabilityCheck(_))
 }
 
+/// A stable 32-byte signing-session tag: the keccak digest being signed (what
+/// `ecrecover` checks), so all signers route this signing's barrier frames to one session.
 fn sign_tag(digest32: &[u8; 32]) -> [u8; 32] {
     *digest32
+}
+
+/// The execution id of one signing run.
+///
+/// Unique per run: the committee, the exact signer set, the retry attempt and the payload
+/// identify the duty, and `contributions` (one per signer, in `parties` order) make this
+/// run of it new. Two runs of the same duty never share a transcript.
+fn signing_execution_id(
+    committee_identity: &[u8],
+    parties: &[u16],
+    attempt: u32,
+    preimage: &[u8],
+    contributions: &[[u8; RUN_CONTRIBUTION_LEN]],
+) -> [u8; 32] {
+    let parties_bytes: Vec<u8> = parties.iter().flat_map(|p| p.to_le_bytes()).collect();
+    let contributions_bytes: Vec<u8> = contributions.concat();
+    crate::committee::execution_id(
+        b"beldex-pevm-sign-v2",
+        &[committee_identity, &parties_bytes, &attempt.to_le_bytes(), preimage, &contributions_bytes],
+    )
+}
+
+/// The `payload_hash` the protocol rounds of one run travel under. Derived from the
+/// execution id, so frames from any other run of the same duty (a run before a restart, a
+/// peer still finishing an abandoned one) are not this run's and are never ingested.
+fn round_tag(execution_id: &[u8; 32]) -> [u8; 32] {
+    crate::committee::execution_id(b"beldex-pevm-sign-rounds-v1", &[execution_id])
+}
+
+/// A protocol frame that arrived during the barrier, kept with its tag until this run's
+/// round tag is known: `(payload_hash, from, kind, body)`.
+type EarlyFrame = ([u8; 32], u16, u8, Vec<u8>);
+
+/// Drain the transport during the connection barrier: record each signer's run
+/// contribution from its HELLO, and keep protocol frames for later.
+///
+/// A signer that announces two different contributions has started this signing twice
+/// (it restarted) or is telling peers different things. Either way the signers could derive
+/// different execution ids, so the run is abandoned and the coordinator retries it.
+fn poll_barrier<T: SessionTransport>(
+    transport: &mut T,
+    epoch: u64,
+    tag: [u8; 32],
+    attempt: u32,
+    signer_set: &BTreeSet<u16>,
+    contributions: &mut std::collections::BTreeMap<u16, [u8; RUN_CONTRIBUTION_LEN]>,
+    early: &mut Vec<EarlyFrame>,
+) -> Result<(), DriverError> {
+    while let Ok(Some(w)) = transport.poll() {
+        if w.leg != Leg::Pevm || w.epoch != epoch || w.attempt != attempt || !signer_set.contains(&w.from) {
+            continue; // not this duty, or not a signer
+        }
+        let SessionMsg::Round(payload) = &w.body else { continue };
+        let Some((kind, rest)) = payload.split_first() else { continue };
+        if *kind != CGGMP_HELLO {
+            early.push((w.payload_hash, w.from, *kind, rest.to_vec()));
+            continue;
+        }
+        if w.payload_hash != tag {
+            continue;
+        }
+        let Ok(c) = <[u8; RUN_CONTRIBUTION_LEN]>::try_from(rest) else {
+            continue; // a HELLO without a contribution cannot take part
+        };
+        match contributions.get(&w.from) {
+            Some(prev) if *prev != c => {
+                return Err(DriverError::Protocol(format!(
+                    "signer {} announced two different run contributions for this signing (it \
+                     restarted mid-run, or it is equivocating); abandoning the run so it is retried",
+                    w.from
+                )));
+            }
+            Some(_) => {}
+            None => {
+                contributions.insert(w.from, c);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn wire(epoch: u64, tag: [u8; 32], attempt: u32, from: u16, kind: u8, msg_bytes: &[u8]) -> WireMsg {
@@ -83,9 +173,10 @@ fn wire(epoch: u64, tag: [u8; 32], attempt: u32, from: u16, kind: u8, msg_bytes:
 /// this node's serialized **complete** `KeyShare`. `preimage` is hashed with keccak
 /// (as the contract does) to form the signed digest.
 /// `attempt` namespaces the mesh frames for this signing round (the coordinator's session
-/// attempt). A retried round MUST pass a fresh attempt: for a mint the message — and hence
-/// `tag` — is deterministic, so without it a retry would reuse the failed attempt's namespace
-/// and could ingest its stale round messages.
+/// attempt), so concurrent attempts of one duty keep apart. It does not have to be new for
+/// the run to be: the attempt counter restarts from 0 with the process, so the execution id
+/// and the round frames are also bound to fresh per-run contributions from every signer
+/// (see [`RUN_CONTRIBUTION_LEN`]), and a run never ingests another run's rounds.
 #[allow(clippy::too_many_arguments)]
 pub fn run_cggmp21_sign_over_transport<T: SessionTransport>(
     committee: &CommitteeView,
@@ -129,29 +220,18 @@ pub fn run_cggmp21_sign_over_transport<T: SessionTransport>(
     };
 
     // --- connection barrier (signer peers only) -------------------------------
-    let hello = wire(epoch, tag, attempt, self_index, CGGMP_HELLO, &[]);
-    let mut seen: BTreeSet<u16> = BTreeSet::new();
-    let mut early: Vec<(u16, u8, Vec<u8>)> = Vec::new();
-    let need_peers = parties.len() as u16 - 1;
+    // Each HELLO carries this run's contribution to the execution id (see
+    // RUN_CONTRIBUTION_LEN); the barrier ends once every signer's is known.
+    let mut own_contribution = [0u8; RUN_CONTRIBUTION_LEN];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut own_contribution);
+    let hello = wire(epoch, tag, attempt, self_index, CGGMP_HELLO, &own_contribution);
+    let mut contributions = std::collections::BTreeMap::from([(self_index, own_contribution)]);
+    let mut early: Vec<EarlyFrame> = Vec::new();
     let barrier_deadline = Instant::now() + timeout.min(Duration::from_secs(60));
     loop {
         crate::wire::note_send_failure("sign", transport.broadcast(&hello));
-        while let Ok(Some(w)) = transport.poll() {
-            if w.leg != Leg::Pevm || w.epoch != epoch || w.payload_hash != tag || w.attempt != attempt {
-                continue;
-            }
-            if !signer_set.contains(&w.from) {
-                continue; // only signers take part
-            }
-            let SessionMsg::Round(payload) = &w.body else { continue };
-            let Some((kind, rest)) = payload.split_first() else { continue };
-            if *kind == CGGMP_HELLO {
-                seen.insert(w.from);
-            } else {
-                early.push((w.from, *kind, rest.to_vec()));
-            }
-        }
-        if seen.len() as u16 >= need_peers {
+        poll_barrier(transport, epoch, tag, attempt, &signer_set, &mut contributions, &mut early)?;
+        if contributions.len() >= parties.len() {
             break;
         }
         if Instant::now() >= barrier_deadline {
@@ -161,26 +241,17 @@ pub fn run_cggmp21_sign_over_transport<T: SessionTransport>(
         }
         std::thread::sleep(Duration::from_millis(150));
     }
+    // Keep announcing for peers still in their barrier, and keep checking that nobody
+    // announces a second contribution.
     for _ in 0..6 {
         crate::wire::note_send_failure("sign", transport.broadcast(&hello));
-        while let Ok(Some(w)) = transport.poll() {
-            if w.leg == Leg::Pevm
-                && w.epoch == epoch
-                && w.payload_hash == tag
-                && w.attempt == attempt
-                && signer_set.contains(&w.from)
-            {
-                if let SessionMsg::Round(payload) = &w.body {
-                    if let Some((kind, rest)) = payload.split_first() {
-                        if *kind != CGGMP_HELLO {
-                            early.push((w.from, *kind, rest.to_vec()));
-                        }
-                    }
-                }
-            }
-        }
+        poll_barrier(transport, epoch, tag, attempt, &signer_set, &mut contributions, &mut early)?;
         std::thread::sleep(Duration::from_millis(100));
     }
+
+    let ordered: Vec<[u8; RUN_CONTRIBUTION_LEN]> = parties.iter().map(|p| contributions[p]).collect();
+    let eid_bytes = signing_execution_id(&committee.identity_bytes(), &parties, attempt, preimage, &ordered);
+    let rtag = round_tag(&eid_bytes);
 
     // Channels bridge the protocol thread and this (mesh-pump) thread.
     let (out_tx, out_rx) = mpsc::channel::<Outgoing<SigningMsg>>();
@@ -189,19 +260,6 @@ pub fn run_cggmp21_sign_over_transport<T: SessionTransport>(
     // Protocol thread: drive the cggmp21 signing state machine synchronously.
     let parties_for_proto = parties.clone();
     let preimage_owned = preimage.to_vec();
-    // Unique per run: the committee, the exact signer set, the retry attempt and the
-    // payload. Two runs of the same duty under different signers or attempts are
-    // separate executions and must not share a transcript.
-    let parties_bytes: Vec<u8> = parties.iter().flat_map(|p| p.to_le_bytes()).collect();
-    let eid_bytes = crate::committee::execution_id(
-        b"beldex-pevm-sign-v1",
-        &[
-            &committee.identity_bytes(),
-            &parties_bytes,
-            &attempt.to_le_bytes(),
-            preimage,
-        ],
-    );
 
     let proto = std::thread::spawn(move || -> Result<[u8; 64], String> {
         let mut rng = rand::rngs::OsRng;
@@ -268,20 +326,24 @@ pub fn run_cggmp21_sign_over_transport<T: SessionTransport>(
             .map_err(|e| DriverError::Protocol(format!("serialize outgoing: {e}")))?;
         match out.recipient {
             MessageDestination::AllParties => {
-                crate::wire::note_send_failure("sign", transport.broadcast(&wire(epoch, tag, attempt, self_index, CGGMP_BCAST, &bytes)));
+                crate::wire::note_send_failure("sign", transport.broadcast(&wire(epoch, rtag, attempt, self_index, CGGMP_BCAST, &bytes)));
             }
             MessageDestination::OneParty(pos) => {
                 if let Some(&peer_idx) = parties.get(pos as usize) {
                     let _ = transport
-                        .send_to(peer_idx, &wire(epoch, tag, attempt, self_index, CGGMP_P2P, &bytes));
+                        .send_to(peer_idx, &wire(epoch, rtag, attempt, self_index, CGGMP_P2P, &bytes));
                 }
             }
         }
         Ok(())
     };
 
-    // Replay barrier-buffered frames first (mapping sender committee idx → position).
-    for (from, kind, bytes) in early.drain(..) {
+    // Replay barrier-buffered frames first (mapping sender committee idx → position). Only
+    // this run's: a frame under another round tag belongs to another run of the duty.
+    for (frame_tag, from, kind, bytes) in early.drain(..) {
+        if frame_tag != rtag {
+            continue;
+        }
         if let (Some(sender_pos), Ok(msg)) = (
             parties.iter().position(|&x| x == from),
             serde_json::from_slice::<SigningMsg>(&bytes),
@@ -302,7 +364,8 @@ pub fn run_cggmp21_sign_over_transport<T: SessionTransport>(
                 Ok(None) => break,
                 Err(_) => break,
             };
-            if w.leg != Leg::Pevm || w.epoch != epoch || w.payload_hash != tag || w.attempt != attempt {
+            // Barrier HELLOs travel under `tag`, so this also drops any late ones.
+            if w.leg != Leg::Pevm || w.epoch != epoch || w.payload_hash != rtag || w.attempt != attempt {
                 continue;
             }
             let Some(sender_pos) = parties.iter().position(|&x| x == w.from) else {
@@ -413,6 +476,8 @@ mod tests {
     #[derive(Clone)]
     struct SharedBus {
         inboxes: Arc<Vec<Mutex<VecDeque<WireMsg>>>>,
+        /// Every frame delivered, with its recipient: a recording of the run.
+        log: Arc<Mutex<Vec<(u16, WireMsg)>>>,
     }
     struct BusEndpoint {
         bus: SharedBus,
@@ -420,7 +485,10 @@ mod tests {
     }
     impl SharedBus {
         fn new(n: u16) -> SharedBus {
-            SharedBus { inboxes: Arc::new((0..n).map(|_| Mutex::new(VecDeque::new())).collect()) }
+            SharedBus {
+                inboxes: Arc::new((0..n).map(|_| Mutex::new(VecDeque::new())).collect()),
+                log: Arc::new(Mutex::new(Vec::new())),
+            }
         }
         fn endpoint(&self, me: u16) -> BusEndpoint {
             BusEndpoint { bus: self.clone(), me }
@@ -431,12 +499,14 @@ mod tests {
             for (i, inbox) in self.bus.inboxes.iter().enumerate() {
                 if i as u16 != self.me {
                     inbox.lock().unwrap().push_back(msg.clone());
+                    self.bus.log.lock().unwrap().push((i as u16, msg.clone()));
                 }
             }
             Ok(())
         }
         fn send_to(&mut self, peer: u16, msg: &WireMsg) -> Result<(), MeshError> {
             self.bus.inboxes[peer as usize].lock().unwrap().push_back(msg.clone());
+            self.bus.log.lock().unwrap().push((peer, msg.clone()));
             Ok(())
         }
         fn poll(&mut self) -> Result<Option<WireMsg>, MeshError> {
@@ -527,5 +597,141 @@ mod tests {
             expected.iter().map(|b| format!("{b:02x}")).collect::<String>(),
             27 + recovered.unwrap()
         );
+    }
+
+    #[test]
+    fn every_run_of_a_duty_has_its_own_execution_id() {
+        let c = committee(3, 2).identity_bytes();
+        let parties = [0u16, 1];
+        let pre = b"mint";
+        let id = |cs: &[[u8; 32]]| signing_execution_id(&c, &parties, 0, pre, cs);
+
+        // Same duty, same attempt, same signers: only the runs' contributions differ.
+        let first = id(&[[1; 32], [2; 32]]);
+        assert_eq!(first, id(&[[1; 32], [2; 32]]), "every signer derives the same id from the same inputs");
+        assert_ne!(first, id(&[[1; 32], [3; 32]]), "a fresh contribution from one signer makes a new id");
+        assert_ne!(first, id(&[[2; 32], [1; 32]]), "contributions are bound to the signer that made them");
+
+        // The duty's own identity still separates ids as before.
+        assert_ne!(first, signing_execution_id(&c, &parties, 1, pre, &[[1; 32], [2; 32]]));
+        assert_ne!(first, signing_execution_id(&c, &[0, 2], 0, pre, &[[1; 32], [2; 32]]));
+        assert_ne!(first, signing_execution_id(&c, &parties, 0, b"other", &[[1; 32], [2; 32]]));
+
+        // Rounds travel under a tag of the run, distinct from the barrier's.
+        assert_ne!(round_tag(&first), round_tag(&id(&[[1; 32], [3; 32]])));
+        assert_ne!(round_tag(&first), first);
+    }
+
+    fn hello(from: u16, attempt: u32, tag: [u8; 32], body: &[u8]) -> WireMsg {
+        wire(2, tag, attempt, from, CGGMP_HELLO, body)
+    }
+
+    #[test]
+    fn the_barrier_collects_each_signers_contribution_and_keeps_round_frames() {
+        let tag = [7u8; 32];
+        let bus = SharedBus::new(4);
+        let mut me = bus.endpoint(0);
+        let mut peer1 = bus.endpoint(1);
+        let mut outsider = bus.endpoint(3);
+        let signer_set: BTreeSet<u16> = [0u16, 1, 2].into_iter().collect();
+
+        peer1.send_to(0, &hello(1, 0, tag, &[11; 32])).unwrap();
+        peer1.send_to(0, &hello(1, 0, tag, &[11; 32])).unwrap(); // repeated, as the barrier does
+        peer1.send_to(0, &hello(1, 0, tag, &[])).unwrap(); // no contribution: ignored
+        peer1.send_to(0, &hello(1, 1, tag, &[99; 32])).unwrap(); // another attempt: ignored
+        outsider.send_to(0, &hello(3, 0, tag, &[33; 32])).unwrap(); // not a signer: ignored
+        peer1.send_to(0, &wire(2, [5; 32], 0, 1, CGGMP_BCAST, b"round")).unwrap();
+
+        let mut contributions = std::collections::BTreeMap::new();
+        let mut early = Vec::new();
+        poll_barrier(&mut me, 2, tag, 0, &signer_set, &mut contributions, &mut early).unwrap();
+        assert_eq!(contributions, std::collections::BTreeMap::from([(1u16, [11u8; 32])]));
+        assert_eq!(early, vec![([5u8; 32], 1u16, CGGMP_BCAST, b"round".to_vec())]);
+    }
+
+    #[test]
+    fn a_signer_announcing_a_second_contribution_abandons_the_run() {
+        let tag = [7u8; 32];
+        let bus = SharedBus::new(3);
+        let mut me = bus.endpoint(0);
+        let mut peer1 = bus.endpoint(1);
+        let signer_set: BTreeSet<u16> = [0u16, 1, 2].into_iter().collect();
+
+        // Peer 1 restarted mid-run: its HELLO from before the restart, then a new one.
+        peer1.send_to(0, &hello(1, 0, tag, &[11; 32])).unwrap();
+        peer1.send_to(0, &hello(1, 0, tag, &[12; 32])).unwrap();
+
+        let mut contributions = std::collections::BTreeMap::new();
+        let mut early = Vec::new();
+        let e = poll_barrier(&mut me, 2, tag, 0, &signer_set, &mut contributions, &mut early).unwrap_err();
+        assert!(matches!(&e, DriverError::Protocol(m) if m.contains("two different run contributions")), "{e:?}");
+    }
+
+    /// The restart case end to end. A duty is signed once; then the same duty is signed
+    /// again with the same attempt and signers — what happens after a restart, when the
+    /// attempt counter is back at 0 — while every round frame of the first run is delivered
+    /// to the signers again ahead of the second run's. The second run must ignore them all
+    /// and produce a valid signature of its own. With an execution id that did not change
+    /// between runs, those frames carried the same id and tags and were taken as this run's.
+    #[test]
+    #[ignore = "runs the full cggmp21 signing MPC across threads, twice"]
+    fn a_rerun_of_the_same_duty_ignores_the_earlier_runs_frames() {
+        let (n, t) = (3u16, 2u16);
+        let mut rng = rand::rngs::OsRng;
+        let shares = cggmp21::trusted_dealer::builder::<Secp256k1, SecurityLevel128>(n)
+            .set_threshold(Some(t))
+            .generate_shares(&mut rng)
+            .expect("dealer shares");
+        let blobs: Vec<Vec<u8>> =
+            shares.iter().map(|s| serde_json::to_vec(s).expect("serialize share")).collect();
+        let preimage = b"the same mint, signed twice".to_vec();
+        let signers = vec![0u16, 1u16];
+        let committee = committee(n, t);
+
+        let run = |bus: &SharedBus| -> Vec<([u8; 64], [u8; 33])> {
+            let handles: Vec<_> = signers
+                .iter()
+                .map(|&idx| {
+                    let mut ep = bus.endpoint(idx);
+                    let (c, blob, signers, pre) =
+                        (committee.clone(), blobs[idx as usize].clone(), signers.clone(), preimage.clone());
+                    std::thread::spawn(move || {
+                        run_cggmp21_sign_over_transport(&c, idx, &signers, &blob, &pre, 0, &mut ep, Duration::from_secs(120))
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap().expect("node signing")).collect()
+        };
+
+        let first_bus = SharedBus::new(n);
+        let first = run(&first_bus);
+
+        // The second run's signers find the first run's protocol rounds already waiting.
+        let second_bus = SharedBus::new(n);
+        let stale: Vec<(u16, WireMsg)> = first_bus.log.lock().unwrap().clone();
+        let mut replayed = 0;
+        for (to, msg) in stale {
+            let SessionMsg::Round(p) = &msg.body else { continue };
+            if p.first() != Some(&CGGMP_HELLO) {
+                second_bus.inboxes[to as usize].lock().unwrap().push_back(msg);
+                replayed += 1;
+            }
+        }
+        assert!(replayed > 0, "the first run's rounds were recorded");
+        let second = run(&second_bus);
+
+        let digest32: [u8; 32] = Keccak256::digest(&preimage).into();
+        let x33 = second[0].1;
+        assert!(second.iter().all(|r| *r == second[0]), "the signers agree on the second signature");
+        assert_eq!(x33, first[0].1);
+        let sig = K256Sig::from_slice(&second[0].0).expect("k256 sig");
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let recovers = [0u8, 1].iter().any(|&v| {
+            VerifyingKey::recover_from_prehash(&digest32, &sig, RecoveryId::from_byte(v).unwrap())
+                .map(|vk| eth_addr_from_x33(&vk.to_encoded_point(true).as_bytes().try_into().unwrap()) == eth_addr_from_x33(&x33))
+                .unwrap_or(false)
+        });
+        assert!(recovers, "the second run's signature recovers to the wBDX signer");
+        assert_ne!(first[0].0, second[0].0, "fresh nonces: a new signature, not the first one again");
     }
 }
