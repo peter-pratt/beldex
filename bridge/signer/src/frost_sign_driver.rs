@@ -291,9 +291,9 @@ where
         attempt,
         rng,
     )?;
-    send_all(transport, first);
-
     let deadline = Instant::now() + timeout;
+    send_all(transport, first, signers, self_index, deadline)?;
+
     while !driver.is_complete() {
         if Instant::now() >= deadline {
             return Err(DriverError::Timeout);
@@ -301,7 +301,7 @@ where
         match transport.poll() {
             Ok(Some(msg)) => {
                 let outs = driver.on_wire(&msg)?;
-                send_all(transport, outs);
+                send_all(transport, outs, signers, self_index, deadline)?;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(_) => std::thread::sleep(Duration::from_millis(20)),
@@ -310,13 +310,31 @@ where
     driver.signature().ok_or(DriverError::BadCommittee)
 }
 
-fn send_all<T: SessionTransport>(transport: &mut T, outs: Vec<Outbound>) {
+/// Send a step's frames. The commitments and signature shares go out once each, so
+/// every one must arrive: see [`crate::dkg_driver::send_round`].
+///
+/// A "broadcast" goes to this round's other signers, not to the whole committee mesh: only
+/// they take part, and a member outside the round being offline must not stop it.
+fn send_all<T: SessionTransport>(
+    transport: &mut T,
+    outs: Vec<Outbound>,
+    signers: &[u16],
+    self_index: u16,
+    deadline: Instant,
+) -> Result<(), DriverError> {
+    use crate::dkg_driver::send_round;
+    use crate::wire::Dest;
     for o in outs {
-        let _ = match o {
-            Outbound::Broadcast(m) => transport.broadcast(&m),
-            Outbound::To(idx, m) => transport.send_to(idx, &m),
-        };
+        match o {
+            Outbound::Broadcast(m) => {
+                for &peer in signers.iter().filter(|&&p| p != self_index) {
+                    send_round(transport, "pgw sign", Dest::One(peer), &m, deadline)?;
+                }
+            }
+            Outbound::To(idx, m) => send_round(transport, "pgw sign", Dest::One(idx), &m, deadline)?,
+        }
     }
+    Ok(())
 }
 
 /// Live-mesh assembly for `Pgw` signing: build the authenticated OMQ mesh (via the
@@ -520,5 +538,108 @@ mod tests {
     fn small_committees_signing_over_the_bus() {
         run_sign(3, 2);
         run_sign(5, 3);
+    }
+
+    /// A threaded in-memory mesh where a recipient can refuse frames: `refuse[to]` is how
+    /// many more frames it turns away (`u32::MAX` = it is unreachable), the way a peer
+    /// whose queue is full does.
+    #[derive(Clone)]
+    struct LossyMesh {
+        inboxes: std::sync::Arc<Vec<std::sync::Mutex<VecDeque<WireMsg>>>>,
+        refuse: std::sync::Arc<std::sync::Mutex<BTreeMap<u16, u32>>>,
+    }
+    struct LossyEndpoint {
+        mesh: LossyMesh,
+        me: u16,
+    }
+    impl LossyMesh {
+        fn new(n: u16, refuse: BTreeMap<u16, u32>) -> LossyMesh {
+            LossyMesh {
+                inboxes: std::sync::Arc::new((0..n).map(|_| std::sync::Mutex::new(VecDeque::new())).collect()),
+                refuse: std::sync::Arc::new(std::sync::Mutex::new(refuse)),
+            }
+        }
+        fn put(&self, to: u16, msg: &WireMsg) -> Result<(), (u16, String)> {
+            let mut r = self.refuse.lock().unwrap();
+            if let Some(n) = r.get_mut(&to) {
+                if *n > 0 {
+                    if *n != u32::MAX {
+                        *n -= 1;
+                    }
+                    return Err((to, "queue full".into()));
+                }
+            }
+            self.inboxes[to as usize].lock().unwrap().push_back(msg.clone());
+            Ok(())
+        }
+    }
+    impl SessionTransport for LossyEndpoint {
+        fn broadcast(&mut self, msg: &WireMsg) -> Result<(), crate::wire::MeshError> {
+            let failed: Vec<_> = (0..self.mesh.inboxes.len() as u16)
+                .filter(|&i| i != self.me)
+                .filter_map(|i| self.mesh.put(i, msg).err())
+                .collect();
+            if failed.is_empty() { Ok(()) } else { Err(crate::wire::MeshError::Undelivered(failed)) }
+        }
+        fn send_to(&mut self, peer: u16, msg: &WireMsg) -> Result<(), crate::wire::MeshError> {
+            self.mesh.put(peer, msg).map_err(|f| crate::wire::MeshError::Undelivered(vec![f]))
+        }
+        fn poll(&mut self) -> Result<Option<WireMsg>, crate::wire::MeshError> {
+            Ok(self.mesh.inboxes[self.me as usize].lock().unwrap().pop_front())
+        }
+    }
+
+    fn sign_threaded(
+        n: u16,
+        t: u16,
+        signers: &[u16],
+        refuse: BTreeMap<u16, u32>,
+        timeout: Duration,
+    ) -> (Vec<Result<[u8; 64], DriverError>>, [u8; 32], [u8; 32]) {
+        ensure_init().unwrap();
+        let c = committee(n, t);
+        let (key_packages, pubkey_package, vk0) = dkg_key_material(&c, n);
+        let message = [0x5au8; 32];
+        let mesh = LossyMesh::new(n, refuse);
+        let handles: Vec<_> = signers
+            .iter()
+            .map(|&idx| {
+                let (c, signers, pk) = (c.clone(), signers.to_vec(), pubkey_package.clone());
+                let kp = key_packages[&((idx + 1).try_into().unwrap())].clone();
+                let mut ep = LossyEndpoint { mesh: mesh.clone(), me: idx };
+                std::thread::spawn(move || {
+                    let mut rng = rand::rngs::OsRng;
+                    run_sign_over_transport(&c, idx, &signers, kp, pk, message, 0, &mut ep, &mut rng, timeout)
+                })
+            })
+            .collect();
+        (handles.into_iter().map(|h| h.join().unwrap()).collect(), message, vk0)
+    }
+
+    /// Frames a signer's queue turned away are delivered on retry, and a member outside
+    /// the round being unreachable does not matter. Before, the refused commitment was
+    /// dropped (`let _ =`) and both signers waited out the whole timeout.
+    #[test]
+    fn a_round_survives_refused_frames_and_an_offline_non_signer() {
+        let refuse = BTreeMap::from([(1u16, 3u32), (2u16, u32::MAX)]); // 1 flaps; 2 is down
+        let (results, message, vk0) = sign_threaded(3, 2, &[0, 1], refuse, Duration::from_secs(20));
+        let sigs: Vec<[u8; 64]> = results.into_iter().map(|r| r.expect("signer completed")).collect();
+        assert_eq!(sigs[0], sigs[1]);
+        assert!(ed25519_verify_consensus(&sigs[0], &message, &vk0));
+    }
+
+    /// A signer that cannot be reached at all ends the round with its name, within the
+    /// run's own deadline, instead of an anonymous timeout. (Signer 1 itself hears nothing
+    /// and times out; what matters is that signer 0 says who it could not reach.)
+    #[test]
+    fn an_unreachable_signer_stops_the_round_by_name() {
+        let refuse = BTreeMap::from([(1u16, u32::MAX)]);
+        let started = std::time::Instant::now();
+        let (results, _, _) = sign_threaded(3, 2, &[0, 1], refuse, Duration::from_secs(2));
+        match &results[0] {
+            Err(DriverError::Undelivered(why)) => assert!(why.contains("peer 1"), "{why}"),
+            other => panic!("expected Undelivered naming peer 1, got {other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }

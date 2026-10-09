@@ -70,6 +70,29 @@ pub enum DriverError {
     Transport(String),
     /// An MPC protocol / serialization failure (the cggmp21 live driver).
     Protocol(String),
+    /// A protocol frame could not be delivered to some peers within
+    /// [`crate::wire::SEND_RETRY_WINDOW`]: the run cannot complete without them, so it
+    /// stops here and names them rather than waiting out its timeout.
+    Undelivered(String),
+}
+
+/// Send one protocol frame that will not be sent again, or stop the run.
+///
+/// Every MPC driver sends each round's frames exactly once, so a frame a peer never
+/// receives leaves the run waiting for an answer that cannot come. This re-sends to the
+/// peers that missed it for up to [`crate::wire::SEND_RETRY_WINDOW`] (never past the run's
+/// own `deadline`), and turns a peer that stays unreachable into
+/// [`DriverError::Undelivered`] naming it.
+pub(crate) fn send_round<T: SessionTransport + ?Sized>(
+    transport: &mut T,
+    what: &str,
+    dest: crate::wire::Dest,
+    msg: &crate::wire::WireMsg,
+    deadline: Instant,
+) -> Result<(), DriverError> {
+    let within = crate::wire::SEND_RETRY_WINDOW.min(deadline.saturating_duration_since(Instant::now()));
+    crate::wire::deliver(transport, dest, msg, within)
+        .map_err(|e| DriverError::Undelivered(format!("{what}: {e}")))
 }
 
 /// One node's FROST DKG, driven a frame at a time.
@@ -372,8 +395,9 @@ impl FrostDkgDriver {
 ///
 /// The transport is expected to already authenticate inbound frames (S4) — with
 /// [`crate::omq_mesh::OmqPeerTransport::with_auth`], a forged `from` never reaches
-/// here. `send` failures for a momentarily-unroutable peer are benign (the peer
-/// re-derives the same packages; delivery is retried as the loop spins).
+/// here. Each round package is sent once and not repeated, so a peer that cannot be
+/// reached is retried for a bounded window and then fails the run by name
+/// ([`DriverError::Undelivered`]).
 pub fn run_over_transport<T, S, R>(
     committee: &CommitteeView,
     self_index: u16,
@@ -433,9 +457,9 @@ where
     R: RngCore + CryptoRng,
 {
     let (mut driver, first) = FrostDkgDriver::begin(committee, self_index, key_generation, rng)?;
-    send_all(transport, first);
-
     let deadline = Instant::now() + timeout;
+    send_all(transport, first, deadline)?;
+
     while !driver.is_complete() {
         if Instant::now() >= deadline {
             return Err(DriverError::Timeout);
@@ -443,7 +467,7 @@ where
         match transport.poll() {
             Ok(Some(msg)) => {
                 let outs = driver.on_wire(&msg, rng)?;
-                send_all(transport, outs);
+                send_all(transport, outs, deadline)?;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             // A single dropped/garbled/forged frame must not abort the ceremony.
@@ -453,13 +477,20 @@ where
     Ok(driver)
 }
 
-fn send_all<T: SessionTransport>(transport: &mut T, outs: Vec<Outbound>) {
+/// Send a step's frames. Each round package goes out once, so every one must arrive:
+/// see [`send_round`].
+pub(crate) fn send_all<T: SessionTransport>(
+    transport: &mut T,
+    outs: Vec<Outbound>,
+    deadline: Instant,
+) -> Result<(), DriverError> {
     for o in outs {
-        let _ = match o {
-            Outbound::Broadcast(m) => transport.broadcast(&m),
-            Outbound::To(idx, m) => transport.send_to(idx, &m),
-        };
+        match o {
+            Outbound::Broadcast(m) => send_round(transport, "dkg", crate::wire::Dest::All, &m, deadline)?,
+            Outbound::To(idx, m) => send_round(transport, "dkg", crate::wire::Dest::One(idx), &m, deadline)?,
+        }
     }
+    Ok(())
 }
 
 /// Live-mesh assembly: build the curve-authenticated, message-authenticated OMQ

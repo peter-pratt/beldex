@@ -28,9 +28,9 @@
 //! five matched below (add arms if the compiler flags a non-exhaustive match).
 
 use crate::committee::CommitteeView;
-use crate::dkg_driver::DriverError;
+use crate::dkg_driver::{send_round, DriverError};
 use crate::transport::Leg;
-use crate::wire::{SessionMsg, SessionTransport, WireMsg};
+use crate::wire::{Dest, SessionMsg, SessionTransport, WireMsg};
 use cggmp21::security_level::SecurityLevel128;
 use cggmp21::supported_curves::Secp256k1;
 use cggmp21::ExecutionId;
@@ -118,11 +118,12 @@ pub fn run_cggmp21_keygen_over_transport<T: SessionTransport>(
     // all mesh links are established — buffering any keygen frames that arrive
     // early (from a peer that passed the barrier first) so none are lost.
     let hello = wire(epoch, tag, self_index, CGGMP_HELLO, &[]);
+    let mut hello_failures = crate::wire::BarrierSendFailures::default();
     let mut seen: BTreeSet<u16> = BTreeSet::new();
     let mut early: Vec<(u16, u8, Vec<u8>)> = Vec::new();
     let barrier_deadline = Instant::now() + timeout.min(Duration::from_secs(60));
     loop {
-        crate::wire::note_send_failure("dkg", transport.broadcast(&hello));
+        crate::wire::note_barrier_send(&mut hello_failures, transport.broadcast(&hello));
         while let Ok(Some(w)) = transport.poll() {
             if w.leg != Leg::Pevm || w.epoch != epoch || w.payload_hash != tag {
                 continue;
@@ -139,14 +140,18 @@ pub fn run_cggmp21_keygen_over_transport<T: SessionTransport>(
             break;
         }
         if Instant::now() >= barrier_deadline {
-            return Err(DriverError::Protocol("connection barrier timed out: peers unreachable".into()));
+            let missing: Vec<u16> = (0..n).filter(|i| *i != self_index && !seen.contains(i)).collect();
+            return Err(DriverError::Protocol(format!(
+                "connection barrier timed out: no HELLO from peers {missing:?}{}",
+                hello_failures.describe()
+            )));
         }
         std::thread::sleep(Duration::from_millis(150));
     }
     // Grace: keep answering HELLOs briefly so peers still finishing the barrier
     // see ours (and buffer any keygen frames that arrive meanwhile).
     for _ in 0..6 {
-        crate::wire::note_send_failure("dkg", transport.broadcast(&hello));
+        crate::wire::note_barrier_send(&mut hello_failures, transport.broadcast(&hello));
         while let Ok(Some(w)) = transport.poll() {
             if w.leg == Leg::Pevm && w.epoch == epoch && w.payload_hash == tag {
                 if let SessionMsg::Round(payload) = &w.body {
@@ -232,13 +237,15 @@ pub fn run_cggmp21_keygen_over_transport<T: SessionTransport>(
         while let Ok(out) = out_rx.try_recv() {
             let bytes = serde_json::to_vec(&out.msg)
                 .map_err(|e| DriverError::Protocol(format!("serialize outgoing: {e}")))?;
-            match out.recipient {
-                MessageDestination::AllParties => {
-                    crate::wire::note_send_failure("dkg", transport.broadcast(&wire(epoch, tag, self_index, CGGMP_BCAST, &bytes)));
-                }
-                MessageDestination::OneParty(idx) => {
-                    crate::wire::note_send_failure("dkg", transport.send_to(idx, &wire(epoch, tag, self_index, CGGMP_P2P, &bytes)));
-                }
+            let (dest, kind) = match out.recipient {
+                MessageDestination::AllParties => (Dest::All, CGGMP_BCAST),
+                MessageDestination::OneParty(idx) => (Dest::One(idx), CGGMP_P2P),
+            };
+            // Sent once and never repeated: a peer that cannot be reached stops the run.
+            if let Err(e) = send_round(transport, "dkg", dest, &wire(epoch, tag, self_index, kind, &bytes), deadline) {
+                drop(in_tx);
+                let _ = proto.join();
+                return Err(e);
             }
         }
 
@@ -285,14 +292,11 @@ pub fn run_cggmp21_keygen_over_transport<T: SessionTransport>(
     while let Ok(out) = out_rx.try_recv() {
         let bytes = serde_json::to_vec(&out.msg)
             .map_err(|e| DriverError::Protocol(format!("serialize outgoing: {e}")))?;
-        match out.recipient {
-            MessageDestination::AllParties => {
-                crate::wire::note_send_failure("dkg", transport.broadcast(&wire(epoch, tag, self_index, CGGMP_BCAST, &bytes)));
-            }
-            MessageDestination::OneParty(idx) => {
-                crate::wire::note_send_failure("dkg", transport.send_to(idx, &wire(epoch, tag, self_index, CGGMP_P2P, &bytes)));
-            }
-        }
+        let (dest, kind) = match out.recipient {
+            MessageDestination::AllParties => (Dest::All, CGGMP_BCAST),
+            MessageDestination::OneParty(idx) => (Dest::One(idx), CGGMP_P2P),
+        };
+        send_round(transport, "dkg", dest, &wire(epoch, tag, self_index, kind, &bytes), deadline)?;
     }
 
     match proto.join() {

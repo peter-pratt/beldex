@@ -28,9 +28,9 @@
 //! `ProceedResult` arms).
 
 use crate::committee::CommitteeView;
-use crate::dkg_driver::DriverError;
+use crate::dkg_driver::{send_round, DriverError};
 use crate::transport::Leg;
-use crate::wire::{SessionMsg, SessionTransport, WireMsg};
+use crate::wire::{Dest, SessionMsg, SessionTransport, WireMsg};
 use cggmp21::security_level::SecurityLevel128;
 use cggmp21::supported_curves::Secp256k1;
 use cggmp21::{DataToSign, ExecutionId, KeyShare};
@@ -225,26 +225,29 @@ pub fn run_cggmp21_sign_over_transport<T: SessionTransport>(
     let mut own_contribution = [0u8; RUN_CONTRIBUTION_LEN];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut own_contribution);
     let hello = wire(epoch, tag, attempt, self_index, CGGMP_HELLO, &own_contribution);
+    let mut hello_failures = crate::wire::BarrierSendFailures::default();
     let mut contributions = std::collections::BTreeMap::from([(self_index, own_contribution)]);
     let mut early: Vec<EarlyFrame> = Vec::new();
     let barrier_deadline = Instant::now() + timeout.min(Duration::from_secs(60));
     loop {
-        crate::wire::note_send_failure("sign", transport.broadcast(&hello));
+        crate::wire::note_barrier_send(&mut hello_failures, transport.broadcast(&hello));
         poll_barrier(transport, epoch, tag, attempt, &signer_set, &mut contributions, &mut early)?;
         if contributions.len() >= parties.len() {
             break;
         }
         if Instant::now() >= barrier_deadline {
-            return Err(DriverError::Protocol(
-                "connection barrier timed out: signer peers unreachable".into(),
-            ));
+            let missing: Vec<u16> = parties.iter().copied().filter(|p| !contributions.contains_key(p)).collect();
+            return Err(DriverError::Protocol(format!(
+                "connection barrier timed out: no HELLO from signers {missing:?}{}",
+                hello_failures.describe()
+            )));
         }
         std::thread::sleep(Duration::from_millis(150));
     }
     // Keep announcing for peers still in their barrier, and keep checking that nobody
     // announces a second contribution.
     for _ in 0..6 {
-        crate::wire::note_send_failure("sign", transport.broadcast(&hello));
+        crate::wire::note_barrier_send(&mut hello_failures, transport.broadcast(&hello));
         poll_barrier(transport, epoch, tag, attempt, &signer_set, &mut contributions, &mut early)?;
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -320,19 +323,25 @@ pub fn run_cggmp21_sign_over_transport<T: SessionTransport>(
     let deadline = Instant::now() + timeout;
     let mut next_id: u64 = 0;
 
-    // Map a cggmp21 recipient position → committee index for mesh routing.
+    // Map a cggmp21 recipient position → committee index for mesh routing. Each frame is
+    // sent once and never repeated, so every one must reach its recipients
+    // (`send_round`). A broadcast goes to the other signers only: nobody else takes part,
+    // and a committee member outside this round being offline must not stop it.
     let send_out = |transport: &mut T, out: Outgoing<SigningMsg>| -> Result<(), DriverError> {
         let bytes = serde_json::to_vec(&out.msg)
             .map_err(|e| DriverError::Protocol(format!("serialize outgoing: {e}")))?;
         match out.recipient {
             MessageDestination::AllParties => {
-                crate::wire::note_send_failure("sign", transport.broadcast(&wire(epoch, rtag, attempt, self_index, CGGMP_BCAST, &bytes)));
+                let frame = wire(epoch, rtag, attempt, self_index, CGGMP_BCAST, &bytes);
+                for &peer in parties.iter().filter(|&&p| p != self_index) {
+                    send_round(transport, "sign", Dest::One(peer), &frame, deadline)?;
+                }
             }
             MessageDestination::OneParty(pos) => {
-                if let Some(&peer_idx) = parties.get(pos as usize) {
-                    let _ = transport
-                        .send_to(peer_idx, &wire(epoch, rtag, attempt, self_index, CGGMP_P2P, &bytes));
-                }
+                let &peer = parties.get(pos as usize).ok_or_else(|| {
+                    DriverError::Protocol(format!("the protocol addressed signing position {pos}, outside the signer set"))
+                })?;
+                send_round(transport, "sign", Dest::One(peer), &wire(epoch, rtag, attempt, self_index, CGGMP_P2P, &bytes), deadline)?;
             }
         }
         Ok(())
@@ -356,7 +365,11 @@ pub fn run_cggmp21_sign_over_transport<T: SessionTransport>(
 
     loop {
         while let Ok(out) = out_rx.try_recv() {
-            send_out(transport, out)?;
+            if let Err(e) = send_out(transport, out) {
+                drop(in_tx);
+                let _ = proto.join();
+                return Err(e);
+            }
         }
         loop {
             let w = match transport.poll() {

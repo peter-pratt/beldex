@@ -257,6 +257,41 @@ where
     /// drop them as belonging to an unopened session. Held as `(fact hash, body)`.
     pub rotation_ack_inbox: Vec<([u8; 32], Vec<u8>)>,
     live: BTreeMap<[u8; 32], LiveSession>,
+    /// Session frames that some peers missed, re-sent to just those peers every step.
+    resend: Vec<Resend>,
+}
+
+/// A session frame sent once (an ACK/NACK, the aggregate, a DistributeAck) that did not
+/// reach every peer. A peer that misses one cannot count it, so the session would sit
+/// until its stage timed out and churned to a new attempt; instead the frame is re-sent
+/// to the peers that missed it each step, for as long as its attempt is current.
+struct Resend {
+    session: [u8; 32],
+    what: &'static str,
+    msg: WireMsg,
+    peers: Vec<u16>,
+}
+
+/// Broadcast a session frame that is sent once, queueing a re-send for any peers that
+/// did not get it (see [`Resend`]).
+fn send_once<T: SessionTransport>(
+    resend: &mut Vec<Resend>,
+    net: &mut T,
+    session: [u8; 32],
+    what: &'static str,
+    msg: &WireMsg,
+) {
+    if let Err(e) = net.broadcast(msg) {
+        match e.undelivered_peers() {
+            Some(peers) => {
+                eprintln!("  mesh: session {what} {e}; re-sending to them every step");
+                resend.push(Resend { session, what, msg: msg.clone(), peers });
+            }
+            // Not something a re-send fixes (the frame could not be signed, say). The
+            // session's stage timeout is what recovers from it; say why it will be needed.
+            None => eprintln!("  mesh: session {what} could not be sent: {e}"),
+        }
+    }
 }
 
 impl<P, Sign, Complete> Coordinator<P, Sign, Complete>
@@ -287,6 +322,7 @@ where
             sign_settle_steps: 1,
             rotation_ack_inbox: Vec::new(),
             live: BTreeMap::new(),
+            resend: Vec::new(),
         }
     }
 
@@ -311,8 +347,45 @@ where
         let mut report = StepReport::default();
         self.open_ready(orch, &mut report);
         self.pump_inbox(net, &mut report);
+        self.resend_undelivered(net);
         self.drive_all(orch, net, &mut report);
         report
+    }
+
+    /// Re-send queued frames to the peers that missed them. A frame is dropped once all of
+    /// them have it, or once its session is gone or has moved to another attempt (the
+    /// frame belongs to an attempt nobody is running any more).
+    fn resend_undelivered<T: SessionTransport>(&mut self, net: &mut T) {
+        let live = &self.live;
+        self.resend.retain_mut(|r| {
+            let current = live
+                .get(&r.session)
+                .is_some_and(|l| l.session.attempt() == r.msg.attempt && !l.session.stage().is_terminal());
+            if !current {
+                return false;
+            }
+            let mut still = Vec::new();
+            let mut last_err = None;
+            for &peer in &r.peers {
+                match net.send_to(peer, &r.msg) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        still.push(peer);
+                        last_err = Some(e);
+                    }
+                }
+            }
+            if still.is_empty() {
+                eprintln!("  mesh: session {} delivered to peers {:?} on re-send", r.what, r.peers);
+                return false;
+            }
+            if let Some(e) = last_err.filter(|e| e.undelivered_peers().is_none()) {
+                eprintln!("  mesh: session {} re-send gave up: {e}", r.what);
+                return false;
+            }
+            r.peers = still;
+            true
+        });
     }
 
     // ---- 1) inbox ----------------------------------------------------------
@@ -348,6 +421,7 @@ where
                     &msg,
                     proposal,
                     net,
+                    &mut self.resend,
                     report,
                 );
                 continue;
@@ -387,6 +461,7 @@ where
         msg: &WireMsg,
         proposal: &[u8],
         net: &mut T,
+        resend: &mut Vec<Resend>,
         report: &mut StepReport,
     ) {
         if live.session.stage() != Stage::Consensus
@@ -405,14 +480,14 @@ where
                 live.proposal = Some(proposal.to_vec());
                 live.acked = true;
                 let m = Self::msg_for(&live.session, self_index, SessionMsg::Ack);
-                crate::wire::note_send_failure("session", net.broadcast(&m));
+                send_once(resend, net, msg.payload_hash, "ACK", &m);
                 let _ = apply(&mut live.session, &m); // count own ACK locally
                 report.acked += 1;
             }
             ProposalVerdict::Reject(reason) => {
                 live.nacked = true;
                 let m = Self::msg_for(&live.session, self_index, SessionMsg::Nack(reason));
-                crate::wire::note_send_failure("session", net.broadcast(&m));
+                send_once(resend, net, msg.payload_hash, "NACK", &m);
                 let _ = apply(&mut live.session, &m);
                 report.nacked += 1;
             }
@@ -532,14 +607,16 @@ where
                                 self.self_index,
                                 SessionMsg::Propose(p),
                             );
-                            crate::wire::note_send_failure("session", net.broadcast(&m));
+                            // Re-broadcast every tick while in Consensus, so a lost copy
+                            // is replaced by the next one.
+                            crate::wire::note_send_failure("session propose", net.broadcast(&m));
                             report.proposed += 1;
                             if !live.acked {
                                 // The leader's own build passed its own policy by construction.
                                 live.acked = true;
                                 let a =
                                     Self::msg_for(&live.session, self.self_index, SessionMsg::Ack);
-                                crate::wire::note_send_failure("session", net.broadcast(&a));
+                                send_once(&mut self.resend, net, *sk, "ACK", &a);
                                 let _ = apply(&mut live.session, &a);
                                 report.acked += 1;
                             }
@@ -583,13 +660,16 @@ where
                                                 self.self_index,
                                                 SessionMsg::Signature(sig.clone()),
                                             );
-                                            crate::wire::note_send_failure("session", net.broadcast(&m));
+                                            send_once(&mut self.resend, net, *sk, "signature", &m);
                                         }
                                         let _ = live.session.signature_ready(sig);
                                     }
-                                    // Transient, or an aggregate that does not verify under the
-                                    // group key: the stage timeout drives the retry.
-                                    Ok(_) | Err(_) => {}
+                                    // The stage timeout drives the retry; the log says why it
+                                    // will be needed (a peer the round could not reach, say).
+                                    Ok(_) => eprintln!(
+                                        "  signing round for attempt {attempt}: the aggregate does not verify under the group key"
+                                    ),
+                                    Err(e) => eprintln!("  signing round for attempt {attempt} failed: {e}"),
                                 }
                             }
                         }
@@ -600,7 +680,7 @@ where
                         live.dist_acked = true;
                         let m =
                             Self::msg_for(&live.session, self.self_index, SessionMsg::DistributeAck);
-                        crate::wire::note_send_failure("session", net.broadcast(&m));
+                        send_once(&mut self.resend, net, *sk, "DistributeAck", &m);
                         let _ = apply(&mut live.session, &m);
                     }
                 }
@@ -831,6 +911,20 @@ pub(crate) mod test_support {
     #[derive(Clone)]
     pub(crate) struct Bus {
         queues: Rc<RefCell<Vec<VecDeque<Vec<u8>>>>>,
+        /// `(from, to, kind)` frames the recipient turns away once each (its queue was
+        /// full at that moment), reported to the sender as undelivered. See [`kind_of`].
+        pub(crate) refuse_once: Rc<RefCell<std::collections::BTreeSet<(usize, usize, u8)>>>,
+    }
+
+    /// A message kind, for [`Bus::refuse_first`].
+    pub(crate) fn kind_of(body: &SessionMsg) -> u8 {
+        match body {
+            SessionMsg::Ack => 1,
+            SessionMsg::Signature(_) => 2,
+            SessionMsg::DistributeAck => 3,
+            SessionMsg::Nack(_) => 4,
+            _ => 0,
+        }
     }
     pub(crate) struct NodeNet {
         bus: Bus,
@@ -838,7 +932,17 @@ pub(crate) mod test_support {
     }
     impl Bus {
         pub(crate) fn new(n: usize) -> Bus {
-            Bus { queues: Rc::new(RefCell::new(vec![VecDeque::new(); n])) }
+            Bus {
+                queues: Rc::new(RefCell::new(vec![VecDeque::new(); n])),
+                refuse_once: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
+            }
+        }
+        /// Make `to` turn away the first frame of `kind` from `from`.
+        pub(crate) fn refuse_first(&self, from: usize, to: usize, kind: u8) {
+            self.refuse_once.borrow_mut().insert((from, to, kind));
+        }
+        fn refused(&self, from: usize, to: usize, msg: &WireMsg) -> bool {
+            self.refuse_once.borrow_mut().remove(&(from, to, kind_of(&msg.body)))
         }
         pub(crate) fn node(&self, index: usize) -> NodeNet {
             NodeNet { bus: self.clone(), index }
@@ -847,15 +951,21 @@ pub(crate) mod test_support {
     impl SessionTransport for NodeNet {
         fn broadcast(&mut self, msg: &WireMsg) -> Result<(), crate::wire::MeshError> {
             let bytes = msg.encode();
-            let mut qs = self.bus.queues.borrow_mut();
-            for (i, q) in qs.iter_mut().enumerate() {
-                if i != self.index {
-                    q.push_back(bytes.clone());
+            let n = self.bus.queues.borrow().len();
+            let mut failed = Vec::new();
+            for i in (0..n).filter(|&i| i != self.index) {
+                if self.bus.refused(self.index, i, msg) {
+                    failed.push((i as u16, "queue full".to_string()));
+                } else {
+                    self.bus.queues.borrow_mut()[i].push_back(bytes.clone());
                 }
             }
-            Ok(())
+            if failed.is_empty() { Ok(()) } else { Err(crate::wire::MeshError::Undelivered(failed)) }
         }
         fn send_to(&mut self, peer: u16, msg: &WireMsg) -> Result<(), crate::wire::MeshError> {
+            if self.bus.refused(self.index, peer as usize, msg) {
+                return Err(crate::wire::MeshError::Undelivered(vec![(peer, "queue full".into())]));
+            }
             self.bus.queues.borrow_mut()[peer as usize].push_back(msg.encode());
             Ok(())
         }
@@ -1086,6 +1196,43 @@ mod tests {
         }
         assert!(sigs.iter().all(|s| s == &sigs[0]), "all nodes hold the same aggregate");
         assert!(nodes.iter().all(|nd| nd.coord.live_count() == 0), "sessions cleaned up");
+    }
+
+    /// Node 5 turns away the first ACK and the first aggregate every peer sends it. Each is
+    /// sent once per attempt, so before the re-send queue node 5 never counted the ACKs nor
+    /// saw the signature: its stage timed out, it moved to a new attempt the others (long
+    /// finished) never joined, and it never completed. Now the missed frames are re-sent
+    /// the next step, node 5 holds the verified aggregate on the first attempt, and it
+    /// completes with it. (Being behind, it still misses the others' DistributeAcks, which
+    /// reach it out of stage and are dropped; the stage timeout completes a session that
+    /// holds a verified aggregate, as for any straggler.)
+    #[test]
+    fn frames_a_peer_turned_away_are_resent_until_it_has_them() {
+        let (n, t) = (6, 4);
+        let bus = Bus::new(n);
+        for from in 0..5 {
+            bus.refuse_first(from, 5, super::test_support::kind_of(&SessionMsg::Ack));
+            bus.refuse_first(from, 5, super::test_support::kind_of(&SessionMsg::Signature(vec![])));
+        }
+        let mut nodes: Vec<Node> = (0..n).map(|i| make_node(n, t, i, &bus)).collect();
+        for node in &mut nodes {
+            node.orch.observe(Duty::Mint(mint_ev(1000)));
+        }
+        let all: Vec<usize> = (0..n).collect();
+        run_steps(&mut nodes, &all, 4);
+        let straggler = nodes[5].coord.live.values().next().expect("node 5 still working");
+        assert_eq!(straggler.session.attempt(), 0, "no retry was needed");
+        assert!(straggler.signature.is_some(), "node 5 holds the verified aggregate");
+        run_steps(&mut nodes, &all, 30);
+
+        for (i, node) in nodes.iter().enumerate() {
+            assert_eq!(node.completions.borrow().len(), 1, "node {i} completed");
+            assert_eq!(node.orch.counts(), (0, 0, 1), "node {i}: duty Done");
+            assert!(node.coord.resend.is_empty(), "node {i}: nothing left to re-send");
+        }
+        // Every ACK refusal fired; of the signature refusals only the distributor's could.
+        let left: Vec<u8> = bus.refuse_once.borrow().iter().map(|(_, _, k)| *k).collect();
+        assert_eq!(left, vec![2; 4], "all ACK refusals and the distributor's signature refusal fired");
     }
 
     #[test]

@@ -23,9 +23,9 @@
 //! spots apply (`MessageDestination` variants; extra `ProceedResult` arms).
 
 use crate::committee::CommitteeView;
-use crate::dkg_driver::DriverError;
+use crate::dkg_driver::{send_round, DriverError};
 use crate::transport::Leg;
-use crate::wire::{SessionMsg, SessionTransport, WireMsg};
+use crate::wire::{Dest, SessionMsg, SessionTransport, WireMsg};
 use cggmp21::key_refresh::{AuxOnlyMsg, PregeneratedPrimes};
 use cggmp21::security_level::SecurityLevel128;
 use cggmp21::supported_curves::Secp256k1;
@@ -121,11 +121,12 @@ pub fn run_cggmp21_aux_over_transport<T: SessionTransport>(
     // any aux frames that arrive early, so no first-round message is dropped during
     // a staggered start (the mesh drops sends to an unconnected peer).
     let hello = wire(epoch, tag, self_index, AUX_HELLO, &[]);
+    let mut hello_failures = crate::wire::BarrierSendFailures::default();
     let mut seen: BTreeSet<u16> = BTreeSet::new();
     let mut early: Vec<(u16, u8, Vec<u8>)> = Vec::new();
     let barrier_deadline = Instant::now() + timeout.min(Duration::from_secs(60));
     loop {
-        crate::wire::note_send_failure("aux", transport.broadcast(&hello));
+        crate::wire::note_barrier_send(&mut hello_failures, transport.broadcast(&hello));
         while let Ok(Some(w)) = transport.poll() {
             if w.leg != Leg::Pevm || w.epoch != epoch || w.payload_hash != tag {
                 continue;
@@ -142,14 +143,16 @@ pub fn run_cggmp21_aux_over_transport<T: SessionTransport>(
             break;
         }
         if Instant::now() >= barrier_deadline {
-            return Err(DriverError::Protocol(
-                "aux connection barrier timed out: peers unreachable".into(),
-            ));
+            let missing: Vec<u16> = (0..n).filter(|i| *i != self_index && !seen.contains(i)).collect();
+            return Err(DriverError::Protocol(format!(
+                "aux connection barrier timed out: no HELLO from peers {missing:?}{}",
+                hello_failures.describe()
+            )));
         }
         std::thread::sleep(Duration::from_millis(150));
     }
     for _ in 0..6 {
-        crate::wire::note_send_failure("aux", transport.broadcast(&hello));
+        crate::wire::note_barrier_send(&mut hello_failures, transport.broadcast(&hello));
         while let Ok(Some(w)) = transport.poll() {
             if w.leg == Leg::Pevm && w.epoch == epoch && w.payload_hash == tag {
                 if let SessionMsg::Round(payload) = &w.body {
@@ -228,13 +231,15 @@ pub fn run_cggmp21_aux_over_transport<T: SessionTransport>(
         while let Ok(out) = out_rx.try_recv() {
             let bytes = serde_json::to_vec(&out.msg)
                 .map_err(|e| DriverError::Protocol(format!("serialize outgoing: {e}")))?;
-            match out.recipient {
-                MessageDestination::AllParties => {
-                    crate::wire::note_send_failure("aux", transport.broadcast(&wire(epoch, tag, self_index, AUX_BCAST, &bytes)));
-                }
-                MessageDestination::OneParty(idx) => {
-                    crate::wire::note_send_failure("aux", transport.send_to(idx, &wire(epoch, tag, self_index, AUX_P2P, &bytes)));
-                }
+            let (dest, kind) = match out.recipient {
+                MessageDestination::AllParties => (Dest::All, AUX_BCAST),
+                MessageDestination::OneParty(idx) => (Dest::One(idx), AUX_P2P),
+            };
+            // Sent once and never repeated: a peer that cannot be reached stops the run.
+            if let Err(e) = send_round(transport, "aux", dest, &wire(epoch, tag, self_index, kind, &bytes), deadline) {
+                drop(in_tx);
+                let _ = proto.join();
+                return Err(e);
             }
         }
         loop {
@@ -275,14 +280,11 @@ pub fn run_cggmp21_aux_over_transport<T: SessionTransport>(
     while let Ok(out) = out_rx.try_recv() {
         let bytes = serde_json::to_vec(&out.msg)
             .map_err(|e| DriverError::Protocol(format!("serialize outgoing: {e}")))?;
-        match out.recipient {
-            MessageDestination::AllParties => {
-                crate::wire::note_send_failure("aux", transport.broadcast(&wire(epoch, tag, self_index, AUX_BCAST, &bytes)));
-            }
-            MessageDestination::OneParty(idx) => {
-                crate::wire::note_send_failure("aux", transport.send_to(idx, &wire(epoch, tag, self_index, AUX_P2P, &bytes)));
-            }
-        }
+        let (dest, kind) = match out.recipient {
+            MessageDestination::AllParties => (Dest::All, AUX_BCAST),
+            MessageDestination::OneParty(idx) => (Dest::One(idx), AUX_P2P),
+        };
+        send_round(transport, "aux", dest, &wire(epoch, tag, self_index, kind, &bytes), deadline)?;
     }
 
     match proto.join() {

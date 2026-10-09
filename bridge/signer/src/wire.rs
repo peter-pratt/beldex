@@ -255,6 +255,38 @@ pub enum MeshError {
     /// Backend I/O failure (socket error, etc.), stringified so this stays free
     /// of any transport-crate types in the std-only interface.
     Io(String),
+    /// The frame was not handed to these peers' connections, each with the reason (its
+    /// queue is full, it is not connected, a socket error). Every other recipient got it.
+    /// Retryable: re-sending to just these peers cannot duplicate a delivery.
+    Undelivered(Vec<(u16, String)>),
+}
+
+impl MeshError {
+    /// The peers a retry should go to, if this failure is one a retry can fix.
+    pub fn undelivered_peers(&self) -> Option<Vec<u16>> {
+        match self {
+            MeshError::Undelivered(f) => Some(f.iter().map(|(p, _)| *p).collect()),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for MeshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MeshError::UnknownPeer(p) => write!(f, "peer {p} is not in this mesh"),
+            MeshError::Decode(e) => write!(f, "undecodable frame: {e:?}"),
+            MeshError::Auth(e) => write!(f, "frame failed authentication: {e}"),
+            MeshError::Io(e) => write!(f, "{e}"),
+            MeshError::Undelivered(peers) => {
+                write!(f, "not delivered to ")?;
+                for (i, (p, why)) in peers.iter().enumerate() {
+                    write!(f, "{}peer {p} ({why})", if i == 0 { "" } else { ", " })?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Moves [`WireMsg`]s between the committee's signers. Implemented by the
@@ -270,16 +302,113 @@ pub trait SessionTransport {
     fn poll(&mut self) -> Result<Option<WireMsg>, MeshError>;
 }
 
-/// Report a failed mesh send rather than discarding it.
+/// Report a failed send of a message that is sent again on a schedule anyway.
 ///
-/// A dropped frame is partial dissemination, and the round then fails as an
-/// unexplained timeout with nothing in the log pointing at the cause. The send is not
-/// retried here — the protocol drivers re-broadcast on their own schedule — but the
-/// failure is made visible so a delivery problem can be told apart from a peer that
-/// is simply slow.
+/// Only for those: a barrier HELLO (re-broadcast until every peer answers), a leader's
+/// `Propose` (re-broadcast every tick), a rotation-ack signature (re-sent every sweep). A
+/// lost copy is replaced by the next one, so logging it is the whole of the handling. A
+/// message sent once must go through [`deliver`] (or the coordinator's re-send queue),
+/// which retries the peers that missed it and reports the ones it could not reach.
 pub fn note_send_failure(what: &str, r: Result<(), MeshError>) {
     if let Err(e) = r {
-        eprintln!("  mesh send failed ({what}): {e:?}");
+        eprintln!("  mesh send failed ({what}, sent again on schedule): {e}");
+    }
+}
+
+/// What a connection barrier could not send, kept for its timeout error.
+///
+/// A barrier re-broadcasts its HELLO every ~150ms until every peer answers, so a peer
+/// that is down would otherwise log hundreds of identical lines. Instead the latest
+/// reason per peer is kept, and if the barrier gives up its error names both the peers
+/// that never answered and the ones this node could not even send to.
+#[derive(Debug, Default)]
+pub struct BarrierSendFailures {
+    last: std::collections::BTreeMap<u16, String>,
+    /// The latest failure that named no peer (the frame could not be signed, say).
+    other: Option<String>,
+    count: u64,
+}
+
+impl BarrierSendFailures {
+    /// `; HELLO not delivered to peer 3 (…) [12 failed sends]`, or empty.
+    pub fn describe(&self) -> String {
+        let mut parts: Vec<String> = self.last.iter().map(|(p, why)| format!("peer {p} ({why})")).collect();
+        parts.extend(self.other.iter().map(|why| format!("anyone ({why})")));
+        if parts.is_empty() {
+            return String::new();
+        }
+        format!("; HELLO not delivered to {} [{} failed sends]", parts.join(", "), self.count)
+    }
+}
+
+/// Record a barrier HELLO send's outcome in `f` (see [`BarrierSendFailures`]).
+pub fn note_barrier_send(f: &mut BarrierSendFailures, r: Result<(), MeshError>) {
+    match r {
+        Ok(()) => {}
+        Err(MeshError::Undelivered(peers)) => {
+            f.count += 1;
+            f.last.extend(peers);
+        }
+        Err(e) => {
+            f.count += 1;
+            f.other = Some(e.to_string());
+        }
+    }
+}
+
+/// How long [`deliver`] keeps re-sending to peers that missed a frame. A peer that cannot
+/// take a frame for this long is treated as gone: the run stops and names it, instead of
+/// waiting out its whole protocol timeout for a message that never left.
+pub const SEND_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Where a frame goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dest {
+    /// Every peer.
+    All,
+    /// One peer, by committee index.
+    One(u16),
+}
+
+/// Send a frame that is sent only once, making sure every recipient gets it.
+///
+/// Protocol rounds (cggmp21, FROST) are sent exactly once and never repeated: a frame
+/// that does not leave means the run can only time out, with nothing saying why. So a
+/// send that misses some peers is retried to just those peers, with backoff, for up to
+/// `within`. A peer still unreachable after that is returned as
+/// [`MeshError::Undelivered`], and the caller abandons the run with that cause. A
+/// failure a retry cannot fix (an unknown peer, a frame that could not be signed) is
+/// returned at once.
+pub fn deliver<T: SessionTransport + ?Sized>(
+    transport: &mut T,
+    dest: Dest,
+    msg: &WireMsg,
+    within: std::time::Duration,
+) -> Result<(), MeshError> {
+    let deadline = std::time::Instant::now() + within;
+    let mut backoff = std::time::Duration::from_millis(10);
+    let mut result = match dest {
+        Dest::All => transport.broadcast(msg),
+        Dest::One(peer) => transport.send_to(peer, msg),
+    };
+    loop {
+        let Some(peers) = result.as_ref().err().and_then(MeshError::undelivered_peers) else {
+            return result; // delivered, or not retryable
+        };
+        if std::time::Instant::now() >= deadline {
+            return result;
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(std::time::Duration::from_millis(250));
+        let mut still: Vec<(u16, String)> = Vec::new();
+        for peer in peers {
+            match transport.send_to(peer, msg) {
+                Ok(()) => {}
+                Err(MeshError::Undelivered(f)) => still.extend(f),
+                Err(e) => return Err(e),
+            }
+        }
+        result = if still.is_empty() { Ok(()) } else { Err(MeshError::Undelivered(still)) };
     }
 }
 
@@ -507,5 +636,104 @@ mod tests {
         let new_leaders: Vec<_> = bus.sessions.iter().map(|s| s.leader()).collect();
         assert!(new_leaders.iter().all(|&l| l == new_leaders[0]));
         assert_ne!(new_leaders[0], leader0);
+    }
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
+
+    /// Peers 1..=3. Each peer refuses its next `refuse[peer]` frames; `u32::MAX` = never
+    /// takes one. Records every frame that was taken, per peer.
+    #[derive(Default)]
+    struct Flaky {
+        refuse: BTreeMap<u16, u32>,
+        got: BTreeMap<u16, u32>,
+        sends: u32,
+        fail_hard: bool,
+    }
+    impl Flaky {
+        fn take(&mut self, peer: u16) -> Result<(), (u16, String)> {
+            self.sends += 1;
+            match self.refuse.get_mut(&peer) {
+                Some(n) if *n > 0 => {
+                    *n = n.saturating_sub(if *n == u32::MAX { 0 } else { 1 });
+                    Err((peer, "queue full".into()))
+                }
+                _ => {
+                    *self.got.entry(peer).or_default() += 1;
+                    Ok(())
+                }
+            }
+        }
+    }
+    impl SessionTransport for Flaky {
+        fn broadcast(&mut self, _msg: &WireMsg) -> Result<(), MeshError> {
+            if self.fail_hard {
+                return Err(MeshError::Io("sign: no key".into()));
+            }
+            let failed: Vec<_> = (1..=3).filter_map(|p| self.take(p).err()).collect();
+            if failed.is_empty() { Ok(()) } else { Err(MeshError::Undelivered(failed)) }
+        }
+        fn send_to(&mut self, peer: u16, _msg: &WireMsg) -> Result<(), MeshError> {
+            self.take(peer).map_err(|f| MeshError::Undelivered(vec![f]))
+        }
+        fn poll(&mut self) -> Result<Option<WireMsg>, MeshError> {
+            Ok(None)
+        }
+    }
+
+    fn frame() -> WireMsg {
+        WireMsg { leg: crate::transport::Leg::Pevm, epoch: 2, payload_hash: [7; 32], attempt: 0, from: 0, body: SessionMsg::Round(vec![1]) }
+    }
+
+    #[test]
+    fn a_peer_that_missed_a_frame_gets_it_on_retry_and_nobody_gets_it_twice() {
+        let mut t = Flaky { refuse: BTreeMap::from([(2, 3)]), ..Default::default() };
+        deliver(&mut t, Dest::All, &frame(), Duration::from_secs(5)).unwrap();
+        assert_eq!(t.got, BTreeMap::from([(1, 1), (2, 1), (3, 1)]), "each peer exactly once");
+    }
+
+    #[test]
+    fn a_peer_that_stays_unreachable_is_named_once_the_window_closes() {
+        let mut t = Flaky { refuse: BTreeMap::from([(3, u32::MAX)]), ..Default::default() };
+        let started = Instant::now();
+        let e = deliver(&mut t, Dest::All, &frame(), Duration::from_millis(300)).unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(300) && started.elapsed() < Duration::from_secs(2));
+        assert_eq!(e.undelivered_peers(), Some(vec![3]));
+        assert_eq!(e.to_string(), "not delivered to peer 3 (queue full)");
+        assert_eq!(t.got, BTreeMap::from([(1, 1), (2, 1)]), "the reachable peers still got it, once");
+    }
+
+    #[test]
+    fn a_failure_a_retry_cannot_fix_is_returned_at_once() {
+        let mut t = Flaky { fail_hard: true, ..Default::default() };
+        let started = Instant::now();
+        assert_eq!(
+            deliver(&mut t, Dest::All, &frame(), Duration::from_secs(5)),
+            Err(MeshError::Io("sign: no key".into()))
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+        let mut t = Flaky::default();
+        deliver(&mut t, Dest::One(2), &frame(), Duration::from_secs(5)).unwrap();
+        assert_eq!(t.got, BTreeMap::from([(2, 1)]));
+    }
+
+    #[test]
+    fn a_barrier_keeps_the_reason_instead_of_logging_every_hello() {
+        let mut f = BarrierSendFailures::default();
+        assert_eq!(f.describe(), "");
+        for _ in 0..40 {
+            note_barrier_send(&mut f, Err(MeshError::Undelivered(vec![(4, "queue full".into())])));
+            note_barrier_send(&mut f, Ok(()));
+        }
+        assert_eq!(f.describe(), "; HELLO not delivered to peer 4 (queue full) [40 failed sends]");
+        note_barrier_send(&mut f, Err(MeshError::Io("sign: no key".into())));
+        assert_eq!(
+            f.describe(),
+            "; HELLO not delivered to peer 4 (queue full), anyone (sign: no key) [41 failed sends]"
+        );
     }
 }

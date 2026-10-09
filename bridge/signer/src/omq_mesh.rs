@@ -12,9 +12,11 @@
 //!     intended peer, and the channel is encrypted + integrity-protected).
 //!
 //! A [`WireMsg`] is sent as a single ZMQ frame (its `encode()`); `poll` decodes
-//! one frame if ready. Sends are non-blocking: a momentarily-unroutable peer
-//! drops the frame, and the session engine's stage timeout drives the retry — so
-//! transient peer flaps never wedge a session.
+//! one frame if ready. Sends are non-blocking, so a slow or absent peer never wedges
+//! the sender. A frame a peer's connection would not take (its queue is full, or a
+//! socket error) is reported as [`MeshError::Undelivered`] naming that peer, never
+//! passed off as sent: a broadcast still goes to every other peer, and the caller
+//! re-sends to the ones that missed it ([`crate::wire::deliver`]).
 //!
 //! **Security (S4 hardening — now enforced):** curve gives confidentiality +
 //! peer-key pinning on dial, but the `from` index inside a `WireMsg` is
@@ -213,30 +215,40 @@ impl OmqPeerTransport {
         }
     }
 
-    /// Send one frame non-blocking; a full-HWM / unroutable peer is a benign drop
-    /// (the session stage timeout drives the retry).
-    fn send_frame(sock: &zmq::Socket, bytes: &[u8]) -> Result<(), MeshError> {
+    /// Hand one frame to a peer's connection without blocking. `Err` carries the reason
+    /// the frame did not leave. EAGAIN — the peer's queue is full, because it has been
+    /// unreachable or slow for a while — is such a reason: the frame is gone, and calling
+    /// it sent is what left rounds to fail as unexplained timeouts.
+    fn send_frame(sock: &zmq::Socket, bytes: &[u8]) -> Result<(), String> {
         match sock.send(bytes, zmq::DONTWAIT) {
             Ok(()) => Ok(()),
-            Err(zmq::Error::EAGAIN) => Ok(()), // peer not ready; drop, engine retries
-            Err(e) => Err(MeshError::Io(format!("send: {e}"))),
+            Err(zmq::Error::EAGAIN) => Err("its send queue is full: unreachable or not reading".into()),
+            Err(e) => Err(format!("send: {e}")),
         }
     }
 }
 
 impl SessionTransport for OmqPeerTransport {
+    /// Every peer is tried, whatever happens to the others: one peer that cannot take the
+    /// frame must not keep it from the peers after it in the map.
     fn broadcast(&mut self, msg: &WireMsg) -> Result<(), MeshError> {
         let bytes = self.frame_out(msg)?;
-        for sock in self.peers.values() {
-            Self::send_frame(sock, &bytes)?;
+        let failed: Vec<(u16, String)> = self
+            .peers
+            .iter()
+            .filter_map(|(idx, sock)| Self::send_frame(sock, &bytes).err().map(|why| (*idx, why)))
+            .collect();
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(MeshError::Undelivered(failed))
         }
-        Ok(())
     }
 
     fn send_to(&mut self, peer_index: u16, msg: &WireMsg) -> Result<(), MeshError> {
         let bytes = self.frame_out(msg)?;
         let sock = self.peers.get(&peer_index).ok_or(MeshError::UnknownPeer(peer_index))?;
-        Self::send_frame(sock, &bytes)
+        Self::send_frame(sock, &bytes).map_err(|why| MeshError::Undelivered(vec![(peer_index, why)]))
     }
 
     fn poll(&mut self) -> Result<Option<WireMsg>, MeshError> {
@@ -324,6 +336,60 @@ mod tests {
     fn two_node_plain_roundtrip() {
         let (mut ta, mut tb) = pair(55810, 55811, false);
         exchange(&mut ta, &mut tb);
+    }
+
+    /// A peer that is down must not cost the others their frames, and must not be passed
+    /// off as delivered. Peer 1 has no listener, so once its queue is full (the ZMQ
+    /// high-water mark, 1000 frames) every frame to it is refused; peer 2 is up. Before,
+    /// a refused frame was reported as sent (EAGAIN -> Ok), and any other send error
+    /// returned from the broadcast before it reached the peers after it.
+    #[test]
+    #[ignore = "binds real ZMQ sockets on localhost"]
+    fn a_down_peer_is_reported_and_does_not_cost_the_others_their_frames() {
+        let ep = |p: u16| format!("tcp://127.0.0.1:{p}");
+        let peer = |index: u16, port: u16| PeerAddr { index, endpoint: ep(port), curve_pubkey: [0; 32], signer_ed25519: [0; 32] };
+        let mut a = OmqPeerTransport::bind(&OmqMeshConfig {
+            self_index: 0,
+            listen_endpoint: ep(55830),
+            use_curve: false,
+            self_curve_secret: [0; 32],
+            self_curve_public: [0; 32],
+            peers: vec![peer(1, 55831), peer(2, 55832)], // nothing listens on 55831
+        })
+        .expect("bind a");
+        let mut b = OmqPeerTransport::bind(&OmqMeshConfig {
+            self_index: 2,
+            listen_endpoint: ep(55832),
+            use_curve: false,
+            self_curve_secret: [0; 32],
+            self_curve_public: [0; 32],
+            peers: vec![peer(0, 55830)],
+        })
+        .expect("bind b");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let frames = 1200;
+        let mut refused = 0;
+        let mut got = 0;
+        for _ in 0..frames {
+            // Peer 2 reads as it goes, as a live signer does; peer 1 never will.
+            while let Ok(Some(_)) = b.poll() {
+                got += 1;
+            }
+            match a.broadcast(&wire(0, SessionMsg::Ack)) {
+                Ok(()) => {}
+                Err(MeshError::Undelivered(f)) => {
+                    assert_eq!(f.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![1], "only the down peer");
+                    refused += 1;
+                }
+                Err(e) => panic!("unexpected {e:?}"),
+            }
+        }
+        assert!(refused > 0, "frames the down peer's full queue refused are reported");
+        while poll_until(&mut b).is_some() {
+            got += 1;
+        }
+        assert_eq!(got, frames, "the live peer got every frame");
     }
 
     // Curve-authenticated — the production path. Skips (does not fail) if the
