@@ -1781,6 +1781,82 @@ where
         .unwrap_or(GATEWAY_RELEASE_PER_TX_MAX)
         .min(GATEWAY_RELEASE_PER_TX_MAX);
 
+    // --- H-06: the economic invariants, from this node's own RPCs ----------------------
+    // Each contract must be the one configured (chain id, code, MINT_TAG, caps), the caps
+    // this signer, the contracts and consensus describe must agree, the caps on all chains
+    // together must fit under the slashable bond, and the wBDX in circulation must be
+    // backed by the gateway's balance. The first three are fatal here; supply above the
+    // reserve holds signing instead, so this node keeps observing and acknowledging
+    // rotations (the way out of a compromised key) while it signs nothing.
+    for (w, c) in src.evm.iter().zip(configs) {
+        w.verify_contract(c.per_tx_max, c.per_epoch_cap)
+            .map_err(|e| format!("refusing to serve: {e}"))?;
+    }
+    let solvency_check = {
+        use beldex_bridge_signer::solvency::{check_configuration, check_solvency, read, ConfiguredCaps};
+        let mut gateways = vec![gateway_id.to_string()];
+        if release_gateway != gateway_id {
+            gateways.push(release_gateway.clone()); // both hold bridge BDX
+        }
+        let daemon = HttpJsonRpc::new(format!("{}/json_rpc", beldexd_rpc.trim_end_matches('/')));
+        let chains: Vec<(u64, HttpJsonRpc, [u8; 20])> =
+            configs.iter().map(|c| (c.chain_id, HttpJsonRpc::new(c.rpc_url.clone()), c.contract)).collect();
+        let configured: Vec<ConfiguredCaps> = configs
+            .iter()
+            .map(|c| ConfiguredCaps { chain_id: c.chain_id, per_tx_max: c.per_tx_max, per_epoch_cap: c.per_epoch_cap })
+            .collect();
+        move || -> Result<(Vec<beldex_bridge_signer::solvency::Problem>, String), String> {
+            // The balance before the supplies: see check_solvency.
+            let mut native: Option<beldex_bridge_signer::solvency::NativeFigures> = None;
+            for gw in &gateways {
+                let n = read::native_figures(&daemon, gw)?;
+                native = Some(match native {
+                    None => n,
+                    Some(mut acc) => {
+                        acc.gateway_balance = acc.gateway_balance.saturating_add(n.gateway_balance);
+                        acc
+                    }
+                });
+            }
+            let native = native.ok_or("no reserve gateway")?;
+            let figures = chains
+                .iter()
+                .map(|(id, client, contract)| read::chain_figures(client, *id, contract))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut problems = check_configuration(&configured, &figures, &native);
+            problems.extend(check_solvency(&figures, &native));
+            let supply: u128 = figures.iter().map(|f| f.total_supply).sum();
+            let exposure: u128 = figures.iter().map(|f| f.window_mint_cap.saturating_mul(2)).sum();
+            let summary = format!(
+                "wBDX supply {supply} / gateway reserve {}; two mint windows on every chain {exposure} / slashable backing {}",
+                native.gateway_balance, native.slashable_backing
+            );
+            Ok((problems, summary))
+        }
+    };
+    let mut solvency_guard = beldex_bridge_signer::solvency::SolvencyGuard::new();
+    {
+        use beldex_bridge_signer::solvency::Problem;
+        let (first, summary) = solvency_check().map_err(|e| format!("refusing to serve: solvency check: {e}"))?;
+        let fatal: Vec<String> =
+            first.iter().filter(|p| !matches!(p, Problem::Insolvent { .. })).map(ToString::to_string).collect();
+        if !fatal.is_empty() {
+            return Err(format!("refusing to serve: {}", fatal.join("; ")));
+        }
+        solvency_guard.observe(&first);
+        if !first.is_empty() {
+            // One reading can be a race (a mint between the two reads); look again.
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            if let Ok((again, _)) = solvency_check() {
+                solvency_guard.observe(&again);
+            }
+        }
+        println!("  solvency: {summary}");
+        if let Some(why) = solvency_guard.hold() {
+            eprintln!("!! SIGNING HELD from startup: {why}. Mints and releases wait until the supply is backed again.");
+        }
+    }
+
     // Leader-side release build: gateway_create_transfer + the HF23 replay-guard ref +
     // the disclosed tx key (verifiers open the stealth outputs with it).
     let build_rpc = rpc.clone();
@@ -2078,6 +2154,7 @@ where
     if let Some(t) = std::env::var("BRIDGE_SIGNER_STAGE_TIMEOUT_TICKS").ok().and_then(|s| s.parse().ok()) {
         coord.stage_timeout_ticks = t;
     }
+    coord.hold = solvency_guard.hold().map(str::to_string);
 
     println!("serve: LIVE COORDINATED mode — per-duty sessions over the authenticated mesh");
     println!("  committee epoch {} size {} threshold {}; self_index {self_index}", coord.committee.epoch, coord.committee.size(), coord.committee.threshold);
@@ -2172,6 +2249,12 @@ where
     let reconcile_recheck_ticks = std::cmp::max(1, 60 / poll_secs.max(1));
     // The rotation-ack sweep: about once a minute.
     let ack_sweep_ticks = std::cmp::max(1, 60 / poll_secs.max(1));
+    // The solvency check (H-06): about once a minute unless configured.
+    let solvency_secs: u64 = std::env::var("BRIDGE_SIGNER_SOLVENCY_CHECK_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    let solvency_ticks = std::cmp::max(1, solvency_secs / poll_secs.max(1));
 
     let mut ticks = 0u64;
     loop {
@@ -2555,6 +2638,26 @@ where
                 rec.attempts += 1;
                 let _ = outbox::save(&outbox_dir_for_sweep, &rec);
             }
+        }
+
+        if ticks > 0 && ticks % solvency_ticks == 0 {
+            use beldex_bridge_signer::solvency::Change;
+            match solvency_check() {
+                Ok((problems, summary)) => match solvency_guard.observe(&problems) {
+                    Some(Change::Tripped(why)) => eprintln!(
+                        "!! SIGNING HELD: {why}. Mints and releases wait until this clears ({summary})"
+                    ),
+                    Some(Change::Cleared) => println!("solvency restored, signing resumes: {summary}"),
+                    None if !problems.is_empty() && solvency_guard.hold().is_none() => eprintln!(
+                        "  solvency check failed once, rechecking before holding: {}",
+                        problems.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
+                    ),
+                    None => {}
+                },
+                // Not evidence either way: the hold stays as it was.
+                Err(e) => eprintln!("  solvency check could not be made ({e}); signing state unchanged"),
+            }
+            coord.hold = solvency_guard.hold().map(str::to_string);
         }
 
         let rep = coord.step(orch, &mut net);

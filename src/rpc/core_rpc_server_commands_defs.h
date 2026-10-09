@@ -2954,6 +2954,12 @@ namespace cryptonote::rpc {
   ///   floor means "no longer retained", NOT "nothing was released".
   /// - `release_cap` -- per-window release cap (atomic units).
   /// - `per_tx_max` -- per-withdrawal release maximum (atomic units).
+  /// - `committee_threshold` -- signatures a bridge signing needs (t+1).
+  /// - `bridge_bond` -- the bond each bridge seat posts (atomic units).
+  /// - `slashable_backing` -- `committee_threshold * bridge_bond`: what a colluding
+  ///   signing threshold would lose. The sum over all EVM chains of twice each wBDX
+  ///   contract's window mint cap, and of each contract's `bondBackingCapLimit`, must
+  ///   fit under it; bridge signers check this at startup and while they run.
   /// - `per_chain_wbdx` -- expected wBDX supply per EVM chain (empty until Phase E).
   /// - `status` -- Generic RPC error code. "OK" is the success value.
   struct BRIDGE_GET_RESERVES : PUBLIC

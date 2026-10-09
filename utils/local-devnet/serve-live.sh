@@ -120,9 +120,15 @@ SIGN_SIGNERS="${SIGN_SIGNERS:-0,1,2,3,4,5}"
 # it. Never set it for a real chain: a reorg deeper than the depth reverses a burn after
 # its BDX was released.
 EVM_START_BLOCK="${EVM_START_BLOCK:-0}"
+# The caps the signers pre-check sessions against. They must be the contract's own
+# perTxMax / windowMintCap: signers refuse to start otherwise, since a pre-check that
+# disagrees with the contract passes sessions it will refuse. Same variables and defaults
+# as bridge-contract/devnet/01-deploy.sh, so a deploy with other caps carries over.
+PER_TX_MAX="${PER_TX_MAX:-1000000000000}"          # 1,000 BDX
+WINDOW_MINT_CAP="${WINDOW_MINT_CAP:-10000000000000}" # 10,000 BDX / window
 EVM_CHAINS=$(cat <<EOF
 [{"chain_id":${CHAIN_ID},"rpc":"${EVM_RPC}","contract":"${WBDX}","confirmations":1,
-  "per_epoch_cap":"1000000000000000","per_tx_max":"1000000000000000",
+  "per_epoch_cap":"${WINDOW_MINT_CAP}","per_tx_max":"${PER_TX_MAX}",
   "start_block":${EVM_START_BLOCK},"depth_only_finality":true}]
 EOF
 )

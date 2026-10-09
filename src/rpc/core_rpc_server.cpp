@@ -4253,6 +4253,13 @@ namespace cryptonote::rpc {
     cmd.response["epoch_released"] = exists ? acct.released_in_window(window) : uint64_t{0};
     cmd.response["release_cap"]    = cryptonote::GATEWAY_RELEASE_CAP_PER_WINDOW;
     cmd.response["per_tx_max"]     = cryptonote::GATEWAY_RELEASE_PER_TX_MAX;
+    // What a colluding signing threshold stands to lose: t+1 seats' BRIDGE_BOND. This is
+    // the backing every wBDX contract's caps must fit under, read from consensus so no
+    // signer or dashboard has to take a governance-typed number on trust.
+    const uint64_t threshold = cryptonote::bridge_committee_threshold(nettype);
+    cmd.response["committee_threshold"] = threshold;
+    cmd.response["bridge_bond"]         = cryptonote::BRIDGE_BOND;
+    cmd.response["slashable_backing"]   = threshold * cryptonote::BRIDGE_BOND;
     // The retention floor, same contract as gateway_release_ref_status: release
     // accounting is kept only for the current + immediately-previous window and
     // lazily pruned below that. Without this a caller passing an older `height`

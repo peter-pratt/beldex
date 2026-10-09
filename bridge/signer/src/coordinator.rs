@@ -259,6 +259,11 @@ where
     live: BTreeMap<[u8; 32], LiveSession>,
     /// Session frames that some peers missed, re-sent to just those peers every step.
     resend: Vec<Resend>,
+    /// Why signing is held, if it is (see [`crate::solvency::SolvencyGuard`]). While held,
+    /// no session is opened and no signing round is run, on either leg: duties stay queued
+    /// and proceed once the hold is lifted. Messages still flow, so a session already open
+    /// keeps its place and simply times out and requeues if the hold outlasts it.
+    pub hold: Option<String>,
 }
 
 /// A session frame sent once (an ACK/NACK, the aggregate, a DistributeAck) that did not
@@ -323,6 +328,7 @@ where
             rotation_ack_inbox: Vec::new(),
             live: BTreeMap::new(),
             resend: Vec::new(),
+            hold: None,
         }
     }
 
@@ -499,6 +505,9 @@ where
     // ---- 2) open sessions for ready duties ---------------------------------
 
     fn open_ready(&mut self, orch: &mut Orchestrator, report: &mut StepReport) {
+        if self.hold.is_some() {
+            return; // held: ready duties wait in the orchestrator
+        }
         let ready: Vec<Duty> = orch.ready().into_iter().cloned().collect();
         for duty in ready {
             let key = duty.key();
@@ -634,6 +643,7 @@ where
                     // same duty first.
                     if live.signature.is_none()
                         && live.acked
+                        && self.hold.is_none()
                         && !signed_this_step
                         && live.ticks_in_stage >= self.sign_settle_steps
                     {
@@ -1233,6 +1243,67 @@ mod tests {
         // Every ACK refusal fired; of the signature refusals only the distributor's could.
         let left: Vec<u8> = bus.refuse_once.borrow().iter().map(|(_, _, k)| *k).collect();
         assert_eq!(left, vec![2; 4], "all ACK refusals and the distributor's signature refusal fired");
+    }
+
+    /// While signing is held nothing is signed or submitted on any node, the duty is not
+    /// lost, and once the hold is lifted it completes everywhere.
+    #[test]
+    fn a_hold_stops_signing_and_lifting_it_lets_the_duty_complete() {
+        let (n, t) = (6, 4);
+        let bus = Bus::new(n);
+        let mut nodes: Vec<Node> = (0..n).map(|i| make_node(n, t, i, &bus)).collect();
+        let all: Vec<usize> = (0..n).collect();
+        for node in &mut nodes {
+            node.coord.hold = Some("wBDX total supply exceeds the gateway's balance".into());
+            node.orch.observe(Duty::Mint(mint_ev(1000)));
+        }
+        run_steps(&mut nodes, &all, 40); // long enough for any session to have timed out
+        for node in &nodes {
+            assert!(node.completions.borrow().is_empty(), "nothing signed while held");
+            assert_eq!(node.coord.live_count(), 0, "no session opened while held");
+            assert_eq!(node.orch.counts().2, 0, "and the duty is not marked done");
+        }
+
+        for node in &mut nodes {
+            node.coord.hold = None;
+        }
+        run_steps(&mut nodes, &all, 12);
+        for node in &nodes {
+            assert_eq!(node.completions.borrow().len(), 1, "completed once the hold lifted");
+            assert_eq!(node.orch.counts(), (0, 0, 1));
+        }
+    }
+
+    /// A hold that arrives mid-session stops the signing round from running; the session
+    /// times out and requeues, and the duty completes after the hold lifts.
+    #[test]
+    fn a_hold_arriving_mid_session_requeues_the_duty() {
+        let (n, t) = (6, 4);
+        let bus = Bus::new(n);
+        let mut nodes: Vec<Node> = (0..n).map(|i| make_node(n, t, i, &bus)).collect();
+        let all: Vec<usize> = (0..n).collect();
+        for node in &mut nodes {
+            node.coord.sign_settle_steps = 2; // keep the session in Sign for a few steps
+            node.orch.observe(Duty::Mint(mint_ev(1000)));
+        }
+        run_steps(&mut nodes, &all, 1);
+        assert!(nodes.iter().all(|nd| nd.coord.live_count() == 1), "sessions open");
+        for node in &mut nodes {
+            node.coord.hold = Some("held".into());
+        }
+        run_steps(&mut nodes, &all, 40);
+        for node in &nodes {
+            assert!(node.completions.borrow().is_empty(), "no signature produced while held");
+            assert_eq!(node.orch.counts().2, 0);
+        }
+        for node in &mut nodes {
+            node.coord.hold = None;
+        }
+        run_steps(&mut nodes, &all, 20);
+        for node in &nodes {
+            assert_eq!(node.completions.borrow().len(), 1);
+            assert_eq!(node.orch.counts(), (0, 0, 1));
+        }
     }
 
     #[test]

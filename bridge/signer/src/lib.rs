@@ -117,6 +117,10 @@ pub mod release_outbox;
 /// **DKG execution ledger** — every execution id this node has started, so a retried DKG
 /// cannot reuse one. std-only.
 pub mod execution_ledger;
+/// **Solvency** — wBDX supply against the gateway's reserve, and the caps against the
+/// slashable bond, checked by every signer (H-06). std-only core; readers need
+/// `evm-watcher`.
+pub mod solvency;
 /// **Mint outbox** — each signed mint payload, kept on disk until `processedDeposits` shows
 /// it minted, so a missed hand-off is re-delivered instead of stranding the deposit.
 /// std-only.
