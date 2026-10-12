@@ -3064,6 +3064,9 @@ namespace cryptonote::rpc {
   ///   landed.
   /// - `chain_contracts` -- per-chain {chain_id, contract}: the wBDX contract that chain's
   ///   rotation acknowledgements are bound to, set by the first one accepted.
+  /// - `departed_bonds` -- bonds of master nodes deregistered while they could still hold a
+  ///   live key share: {master_node, unlock_height, serving_key_epoch}. Each stays locked
+  ///   until every chain in serving_key_epoch has moved past it and unlock_height is reached.
   /// - `status` -- Generic RPC error code. "OK" is the success value.
   struct BRIDGE_GET_SEATS : PUBLIC
   {

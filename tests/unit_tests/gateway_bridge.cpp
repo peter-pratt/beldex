@@ -1333,6 +1333,137 @@ TEST(GatewayBridgeRotation, gate_treats_an_unobserved_chain_as_not_rotated)
   EXPECT_FALSE(cur.master_nodes_infos.at(c.mn[5])->bridge_seat.registered);
 }
 
+namespace
+{
+  // A seat's bond, locked by one contribution whose key image is returned.
+  crypto::key_image give_bond(master_node_list::state_t& st, const crypto::public_key& pk)
+  {
+    auto info = std::make_shared<master_node_info>(*st.master_nodes_infos.at(pk));
+    master_node_info::contribution_t contribution{};
+    const crypto::public_key r = rand_pubkey();
+    std::memcpy(contribution.key_image.data, r.data, sizeof(r.data));
+    contribution.amount = cryptonote::BRIDGE_BOND;
+    info->bridge_seat.bond_contributions = {contribution};
+    st.master_nodes_infos[pk] = info;
+    return contribution.key_image;
+  }
+
+  const master_nodes::key_image_blacklist_entry* blacklisted(const master_node_list::state_t& st, const crypto::key_image& ki)
+  {
+    for (const auto& e : st.key_image_blacklist)
+      if (e.key_image == ki) return &e;
+    return nullptr;
+  }
+}
+
+// A seated member that is DEREGISTERED (say it went offline) still holds a share of the live
+// keys. Its bond must wait for the same two hand-overs on every side as a leave request, not
+// come back on the unbonding window alone.
+TEST(GatewayBridgeRotation, deregistered_key_holder_bond_waits_for_two_hand_overs)
+{
+  const size_t N = cryptonote::bridge_committee_size(NET_FC);
+  auto c = make_committee(N);
+  master_node_list::state_t cur(nullptr);
+  cur.height = 5000;
+  for (size_t i = 0; i < N; ++i) seat_member(cur, c.mn[i], c.ed_pub[i], 100 + i);
+
+  const crypto::public_key gw = rand_pubkey();
+  auto gateway_tx = [&](gateway_descriptor_op_type type, const crypto::public_key& owner) {
+    tx_extra_gateway_descriptor_operation op{};
+    op.op_type              = type;
+    op.address_id           = gw;
+    op.descriptor.version   = 1;
+    op.descriptor.owner_key = owner;
+    op.descriptor.flags     = GATEWAY_FLAG_BRIDGE_RESERVE;
+    transaction tx{};
+    add_gateway_descriptor_operation_to_tx_extra(tx.extra, op);
+    return tx;
+  };
+  using op = gateway_descriptor_op_type;
+  cur.process_bridge_gateway_owner_tx(NET_FC, gateway_tx(op::register_address, rand_pubkey()));
+  ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 1, {0, 1, 2, 3}, 3), 5000));
+
+  const crypto::public_key gone = c.mn[2];
+  const crypto::key_image ki = give_bond(cur, gone);
+  const uint64_t dereg_height = 5000;
+  cur.hold_bridge_bond_on_deregister(NET_FC, gone, *cur.master_nodes_infos.at(gone), dereg_height);
+  cur.master_nodes_infos.erase(gone);
+  const uint64_t unlock = dereg_height + cryptonote::bridge_bond_unlock_blocks(NET_FC);
+
+  ASSERT_NE(blacklisted(cur, ki), nullptr);
+  EXPECT_EQ(blacklisted(cur, ki)->unlock_height, std::numeric_limits<uint64_t>::max())
+      << "a key holder's bond must not expire on a height alone";
+  ASSERT_EQ(cur.bridge_departed_bonds.size(), 1u);
+  EXPECT_EQ(cur.bridge_departed_bonds[0].unlock_height, unlock);
+
+  // Long past the window, with no hand-over at all: still held.
+  cur.finalize_bridge_unbonds(unlock + 100000);
+  EXPECT_NE(blacklisted(cur, ki), nullptr) << "no hand-over yet: the share it holds is still live";
+
+  // One hand-over on each side is not enough.
+  ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 2, {0, 1, 3, 4}, 3), 5001));
+  EXPECT_TRUE(cur.process_bridge_gateway_owner_tx(NET_FC, gateway_tx(op::update_address, rand_pubkey())));
+  cur.finalize_bridge_unbonds(unlock);
+  EXPECT_NE(blacklisted(cur, ki), nullptr);
+
+  // The second on each side, but before the window ends: still held.
+  ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 3, {0, 1, 3, 4}, 3), 5002));
+  EXPECT_TRUE(cur.process_bridge_gateway_owner_tx(NET_FC, gateway_tx(op::update_address, rand_pubkey())));
+  cur.finalize_bridge_unbonds(unlock - 1);
+  EXPECT_NE(blacklisted(cur, ki), nullptr) << "the window is the slashing horizon";
+
+  // Both milestones: released.
+  cur.finalize_bridge_unbonds(unlock);
+  EXPECT_EQ(blacklisted(cur, ki), nullptr);
+  EXPECT_TRUE(cur.bridge_departed_bonds.empty());
+}
+
+// A queued seat never held a key: deregistered, its bond keeps the plain unbonding window.
+TEST(GatewayBridgeRotation, deregistered_queued_seat_keeps_the_window)
+{
+  master_node_list::state_t cur(nullptr);
+  const crypto::public_key pk = rand_pubkey();
+  seat_member(cur, pk, crypto::ed25519_public_key::null(), 100, /*seated=*/false);
+  const crypto::key_image ki = give_bond(cur, pk);
+
+  cur.hold_bridge_bond_on_deregister(NET_FC, pk, *cur.master_nodes_infos.at(pk), 5000);
+  ASSERT_NE(blacklisted(cur, ki), nullptr);
+  EXPECT_EQ(blacklisted(cur, ki)->unlock_height, 5000 + cryptonote::bridge_bond_unlock_blocks(NET_FC));
+  EXPECT_TRUE(cur.bridge_departed_bonds.empty());
+}
+
+// A held bond survives a daemon restart, and a state saved before the field still loads.
+TEST(GatewayBridgeRotation, departed_bond_survives_state_serialization)
+{
+  master_node_list::state_serialized s{};
+  s.version = master_node_list::state_serialized::get_version(hf::hf23_bridge);
+  s.height  = 7;
+  master_nodes::bridge_departed_bond d{};
+  d.master_node = rand_pubkey();
+  const crypto::public_key r = rand_pubkey();
+  crypto::key_image ki;
+  std::memcpy(ki.data, r.data, sizeof(r.data));
+  d.key_images.push_back(ki);
+  d.serving_key_epoch.push_back(chain_ep(1, 4));
+  d.unlock_height = 12345;
+  s.bridge_departed_bonds.push_back(d);
+
+  master_node_list::state_serialized got{};
+  ASSERT_NO_THROW(serialization::parse_binary(serialization::dump_binary(s), got));
+  ASSERT_EQ(got.bridge_departed_bonds.size(), 1u);
+  EXPECT_EQ(got.bridge_departed_bonds[0].master_node, d.master_node);
+  ASSERT_EQ(got.bridge_departed_bonds[0].key_images.size(), 1u);
+  EXPECT_EQ(got.bridge_departed_bonds[0].key_images[0], ki);
+  ASSERT_EQ(got.bridge_departed_bonds[0].serving_key_epoch.size(), 1u);
+  EXPECT_EQ(got.bridge_departed_bonds[0].serving_key_epoch[0].key_epoch, 4u);
+  EXPECT_EQ(got.bridge_departed_bonds[0].unlock_height, 12345u);
+
+  s.version = master_node_list::state_serialized::version_t::version_4_bridge_chain_contract;
+  master_node_list::state_serialized older{};
+  ASSERT_NO_THROW(serialization::parse_binary(serialization::dump_binary(s), older));
+  EXPECT_TRUE(older.bridge_departed_bonds.empty());
+}
+
 // --------------------------------------------------------------------------
 // Governance message domain separation (S6/S14 on the native leg).
 // --------------------------------------------------------------------------
@@ -1517,6 +1648,27 @@ TEST(GatewayBridgeCap, window_accounting_and_rewind)
     EXPECT_EQ(a.released_in_window(10), GATEWAY_RELEASE_CAP_PER_WINDOW / 2);
     EXPECT_EQ(a.balance_for(crypto::null_aid), big - GATEWAY_RELEASE_CAP_PER_WINDOW / 2);
   }
+}
+
+// Two releases that each fit the window can still overflow it together, and a block holding
+// both is invalid. The block template runs this same simulation on each candidate against
+// the ones already taken, so the second one waits for a later block instead of getting every
+// block built from the pool rejected.
+TEST(GatewayBridgeCap, releases_valid_alone_can_overflow_the_window_together)
+{
+  MemGatewayDB db;
+  const crypto::public_key gw = seed_gateway(db, GATEWAY_RELEASE_CAP_PER_WINDOW * 4);
+  const uint64_t h = 10 * GATEWAY_RELEASE_WINDOW_BLOCKS + 5;
+  const auto first  = make_withdrawal(gw, GATEWAY_RELEASE_CAP_PER_WINDOW / 2 + 1);
+  const auto second = make_withdrawal(gw, GATEWAY_RELEASE_CAP_PER_WINDOW / 2 + 1);
+  std::string reason;
+
+  EXPECT_TRUE(simulate_gateways_from_transactions(db, {first}, h, /*bridge_active=*/true, &reason)) << reason;
+  EXPECT_TRUE(simulate_gateways_from_transactions(db, {second}, h, /*bridge_active=*/true, &reason)) << reason;
+  EXPECT_FALSE(simulate_gateways_from_transactions(db, {first, second}, h, /*bridge_active=*/true, &reason));
+  EXPECT_NE(reason.find("cap"), std::string::npos) << reason;
+  // The next window has room again.
+  EXPECT_TRUE(simulate_gateways_from_transactions(db, {second}, h + GATEWAY_RELEASE_WINDOW_BLOCKS, true, &reason));
 }
 
 TEST(GatewayBridgeCap, rewind_is_byte_exact)

@@ -262,6 +262,27 @@ namespace master_nodes
     END_SERIALIZE()
   };
 
+  // The bridge bond of a seat DEREGISTERED while it could still hold a share of a live key.
+  // Deregistration erases the master node, and with it the seat whose hand-over gate holds
+  // the bond, so the bond would otherwise come back on the unbonding window alone while the
+  // share still signs. This keeps that gate: the bond's key images stay blacklisted until
+  // every chain in `serving_key_epoch` has rotated past it AND `unlock_height` is reached,
+  // as for a seat that asked to leave.
+  struct bridge_departed_bond
+  {
+    crypto::public_key              master_node{};
+    std::vector<crypto::key_image>  key_images;
+    std::vector<bridge_chain_epoch> serving_key_epoch;
+    uint64_t                        unlock_height = 0;
+
+    BEGIN_SERIALIZE_OBJECT()
+      FIELD(master_node)
+      FIELD(key_images)
+      FIELD(serving_key_epoch)
+      VARINT_FIELD(unlock_height)
+    END_SERIALIZE()
+  };
+
   struct master_node_info // registration information
   {
     enum class version_t : uint8_t
@@ -585,6 +606,12 @@ namespace master_nodes
       std::lock_guard lock{m_mn_mutex};
       return m_state.bridge_chain_contracts;
     }
+    /// HF23: bonds of deregistered seats still waiting on their keys' retirement.
+    std::vector<bridge_departed_bond> get_bridge_departed_bonds() const
+    {
+      std::lock_guard lock{m_mn_mutex};
+      return m_state.bridge_departed_bonds;
+    }
     /// Whether a rotation ack (whose signatures have already been verified) may advance the
     /// current state: see state_t::check_bridge_rotation_ack.
     bool check_bridge_rotation_ack(const cryptonote::tx_extra_bridge_rotation_ack& ack, std::string& reason) const;
@@ -776,8 +803,8 @@ namespace master_nodes
 
     struct state_serialized
     {
-      enum struct version_t : uint8_t { version_0, version_1_serialize_hash, version_2_bridge_rotation, version_3_bridge_gateway_owner, version_4_bridge_chain_contract, count, };
-      static version_t get_version(cryptonote::hf /*hf_version*/) { return version_t::version_4_bridge_chain_contract; }
+      enum struct version_t : uint8_t { version_0, version_1_serialize_hash, version_2_bridge_rotation, version_3_bridge_gateway_owner, version_4_bridge_chain_contract, version_5_bridge_departed_bond, count, };
+      static version_t get_version(cryptonote::hf /*hf_version*/) { return version_t::version_5_bridge_departed_bond; }
 
       version_t                              version;
       uint64_t                               height;
@@ -789,6 +816,7 @@ namespace master_nodes
       std::vector<bridge_chain_epoch>        observed_key_epoch; // HF23 H.6.3
       std::vector<bridge_gateway_owner>      bridge_gateway_owners; // HF23: gateway hand-over
       std::vector<bridge_chain_contract>     bridge_chain_contracts; // HF23: rotation-ack binding
+      std::vector<bridge_departed_bond>      bridge_departed_bonds; // HF23: deregistered key holders' bonds
 
       BEGIN_SERIALIZE()
         ENUM_FIELD(version, version < version_t::count)
@@ -806,6 +834,8 @@ namespace master_nodes
           FIELD(bridge_gateway_owners);
         if (version >= version_t::version_4_bridge_chain_contract)
           FIELD(bridge_chain_contracts);
+        if (version >= version_t::version_5_bridge_departed_bond)
+          FIELD(bridge_departed_bonds);
       END_SERIALIZE()
     };
 
@@ -848,6 +878,9 @@ namespace master_nodes
       std::vector<bridge_gateway_owner>      bridge_gateway_owners;
       // The contract each chain's rotation acks are bound to (first accepted ack pins it).
       std::vector<bridge_chain_contract>     bridge_chain_contracts;
+      // Bonds of seats deregistered while they could still hold a live key share, held
+      // until those keys are retired (see bridge_departed_bond).
+      std::vector<bridge_departed_bond>      bridge_departed_bonds;
       master_node_list*                     mn_list;
 
       state_t(master_node_list* mnl) : mn_list{mnl} {}
@@ -910,6 +943,14 @@ namespace master_nodes
       bool process_bridge_gateway_owner_tx(cryptonote::network_type nettype, const cryptonote::transaction& tx);
       // Release (clear) any bridge seat whose bond unlock height has been reached.
       void finalize_bridge_unbonds(uint64_t block_height);
+      // The per-chain baseline a departing SEATED member's bond waits on: two hand-overs past
+      // where every wBDX chain and the bridge gateway stand now.
+      std::vector<bridge_chain_epoch> bridge_exit_baseline() const;
+      // Blacklist the bridge bond of a seat being deregistered: until its keys are retired
+      // and the window has passed if it may still hold a share of a live key, and on the
+      // window alone otherwise.
+      void hold_bridge_bond_on_deregister(cryptonote::network_type nettype, const crypto::public_key& pubkey,
+                                          const master_node_info& info, uint64_t block_height);
       // Number of currently seated (not merely queued) bridge operators.
       size_t bridge_seated_count() const;
       // Deterministically (re)assign seats from the registered set: the first

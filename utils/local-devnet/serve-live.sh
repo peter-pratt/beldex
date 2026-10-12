@@ -233,6 +233,18 @@ if [ "${#dead[@]}" -gt 0 ]; then
   exit 1
 fi
 
+# The settings this fleet runs with, so a restart (rotate-ceremony.sh, after it promotes the
+# share trees) brings it back exactly as configured, relay hook and ack wallet included.
+{
+  for v in GATEWAY_ID VIEW_SECRET RELEASE_GATEWAY WBDX EVM_RPC CHAIN_ID NODES THRESHOLD \
+           RELEASE_FEE RELAY_CMD RELAY_NODES RELAY_STAGGER_MS START_HEIGHT POLL_SECS \
+           BELDEX_CONFIRMATIONS SIGN_SIGNERS EVM_START_BLOCK; do
+    printf '%s=%q\n' "$v" "${!v}"
+  done
+  printf 'ACK_WALLET_RPC=%q\nMESH_PORT_BASE=%q\nSHARE_SUBDIR=%q\nSTAGE_TIMEOUT_TICKS=%q\n' \
+    "${ACK_WALLET_RPC:-}" "${MESH_PORT_BASE:-6000}" "${SHARE_SUBDIR:-shares}" "${STAGE_TIMEOUT_TICKS:-4}"
+} > serve-live.last
+
 echo "$alive signer(s) serving (need >= $THRESHOLD observing the same event to sign)"
 echo "watch:  tail -f testdata/serve-*.log"
 echo "stop:   pkill -f 'beldex-bridge-signer serve'"

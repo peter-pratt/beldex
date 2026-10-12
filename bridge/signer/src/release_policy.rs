@@ -264,6 +264,48 @@ fn is_possible_beldex_address(recipient: &[u8]) -> bool {
         && recipient.iter().all(|c| BASE58.contains(c))
 }
 
+/// Does `recipient` carry a valid address checksum?
+///
+/// A Beldex address is CryptoNote base58 (8-byte blocks as 11 characters, the last block
+/// shorter) over `prefix ‖ keys ‖ checksum`, the checksum being the first 4 bytes of
+/// Keccak-256 over everything before it. A mistyped address that stays inside the alphabet
+/// fails here, on every node alike — otherwise only the leader learns it from the daemon at
+/// `build`, and every other member keeps reopening a session for it. The checksum alone is
+/// checked, not the network prefix or the length, so nothing the daemon accepts is refused.
+#[cfg(any(feature = "evm-watcher", feature = "tss-integration"))]
+fn has_valid_address_checksum(recipient: &[u8]) -> bool {
+    use sha3::{Digest, Keccak256};
+    const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    // Characters per encoded block, by decoded size 0..=8.
+    const ENCODED_SIZE: [usize; 9] = [0, 2, 3, 5, 6, 7, 9, 10, 11];
+    let mut data = Vec::with_capacity(recipient.len());
+    for block in recipient.chunks(11) {
+        let Some(size) = ENCODED_SIZE.iter().position(|&n| n == block.len()) else {
+            return false;
+        };
+        let mut num: u128 = 0;
+        for c in block {
+            let Some(digit) = BASE58.iter().position(|b| b == c) else {
+                return false;
+            };
+            num = num * 58 + digit as u128;
+        }
+        if num >> (8 * size) != 0 {
+            return false; // overflows its block
+        }
+        data.extend_from_slice(&(num as u64).to_be_bytes()[8 - size..]);
+    }
+    if data.len() <= 4 {
+        return false;
+    }
+    let (body, checksum) = data.split_at(data.len() - 4);
+    Keccak256::digest(body)[..4] == *checksum
+}
+#[cfg(not(any(feature = "evm-watcher", feature = "tss-integration")))]
+fn has_valid_address_checksum(_recipient: &[u8]) -> bool {
+    true // no Keccak in this build: left to the daemon at `build`
+}
+
 impl<Build, Inspect> ProposalPolicy for ReleasePolicy<Build, Inspect>
 where
     Build: FnMut(&ReleaseEvent) -> Result<BuiltRelease, BuildError>,
@@ -302,6 +344,12 @@ where
                 if !is_possible_beldex_address(&ev.beldex_recipient) {
                     return Err(BuildError::Unactionable(
                         "burn recipient is not a possible Beldex address".into(),
+                    ));
+                }
+                // ...unless its checksum is checked here too, which is just as cheap.
+                if !has_valid_address_checksum(&ev.beldex_recipient) {
+                    return Err(BuildError::Unactionable(
+                        "burn recipient fails the Beldex address checksum".into(),
                     ));
                 }
                 Ok(())
@@ -504,7 +552,8 @@ mod tests {
             evm_txid: [0x77; 32], log_index: 0,
             chain: ChainId(1),
             amount,
-            beldex_recipient: b"bxRecipient".to_vec(),
+            // A real address: `actionable` checks the checksum.
+            beldex_recipient: b"59sr6Ez6CQKJ7Uq3akAAS7K9jebF1VHnjZtTLXuzjCX5fsiWMsaap2h6uUu4tZUJo4jSxQ8vtGKUvKwpkZB2WKJSQfeRnhJ".to_vec(),
         }
     }
 
@@ -800,5 +849,32 @@ mod recipient_shape_tests {
             a.push(c);
             assert!(!is_possible_beldex_address(&a), "{} should be rejected", c as char);
         }
+    }
+
+    /// Real addresses pass on every network; one mistyped character fails, as do test
+    /// placeholders that are base58-clean but were never an address.
+    #[cfg(any(feature = "evm-watcher", feature = "tss-integration"))]
+    #[test]
+    fn a_mistyped_address_fails_its_checksum() {
+        use super::has_valid_address_checksum;
+        let real: [&[u8]; 3] = [
+            // mainnet, testnet (tests/unit_tests/parse_address.cpp), and a devnet wallet
+            b"bxda4NxJymoYHRNRh7FjmDCZ912cFsKH7QjJprjNRyXY5Wh2unz1aKq1PPnxKyQBMu5ForNfRkioDGNSi7mqwpnr1KYXQRHfK",
+            b"9uDxTecU9r1LuSk12HpU43huCrfR4e7LM6zbvesbHDzCWxzcK9tYKhY2RM9ovD5NrLikxkBa8iakYMcbfC5pZuTc2Vnf1K7",
+            b"59sr6Ez6CQKJ7Uq3akAAS7K9jebF1VHnjZtTLXuzjCX5fsiWMsaap2h6uUu4tZUJo4jSxQ8vtGKUvKwpkZB2WKJSQfeRnhJ",
+        ];
+        for a in real {
+            assert!(has_valid_address_checksum(a), "{}", String::from_utf8_lossy(a));
+            // One character swapped for another inside the alphabet, at a few positions.
+            for pos in [3, 40, a.len() - 2] {
+                let mut typo = a.to_vec();
+                typo[pos] = if typo[pos] == b'2' { b'3' } else { b'2' };
+                assert!(!has_valid_address_checksum(&typo), "typo at {pos} must fail");
+            }
+            // A dropped character leaves a block of an impossible length or a bad sum.
+            assert!(!has_valid_address_checksum(&a[..a.len() - 1]));
+        }
+        assert!(!has_valid_address_checksum(b"bxRecipient"));
+        assert!(!has_valid_address_checksum(b""));
     }
 }
