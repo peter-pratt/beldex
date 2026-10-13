@@ -73,11 +73,14 @@ fn sign_tag(digest32: &[u8; 32]) -> [u8; 32] {
 
 /// The execution id of one signing run.
 ///
-/// Unique per run: the committee, the exact signer set, the retry attempt and the payload
-/// identify the duty, and `contributions` (one per signer, in `parties` order) make this
-/// run of it new. Two runs of the same duty never share a transcript.
+/// Unique per run: the committee, the key signing (its compressed group public key), the
+/// exact signer set, the retry attempt and the payload identify the duty, and
+/// `contributions` (one per signer, in `parties` order) make this run of it new. Two runs
+/// of the same duty never share a transcript, and neither do runs under two keys one
+/// committee holds at once (the outgoing and incoming key of a same-membership rotation).
 fn signing_execution_id(
     committee_identity: &[u8],
+    group_key: &[u8; 33],
     parties: &[u16],
     attempt: u32,
     preimage: &[u8],
@@ -86,8 +89,8 @@ fn signing_execution_id(
     let parties_bytes: Vec<u8> = parties.iter().flat_map(|p| p.to_le_bytes()).collect();
     let contributions_bytes: Vec<u8> = contributions.concat();
     crate::committee::execution_id(
-        b"beldex-pevm-sign-v2",
-        &[committee_identity, &parties_bytes, &attempt.to_le_bytes(), preimage, &contributions_bytes],
+        b"beldex-pevm-sign-v3",
+        &[committee_identity, group_key, &parties_bytes, &attempt.to_le_bytes(), preimage, &contributions_bytes],
     )
 }
 
@@ -253,7 +256,9 @@ pub fn run_cggmp21_sign_over_transport<T: SessionTransport>(
     }
 
     let ordered: Vec<[u8; RUN_CONTRIBUTION_LEN]> = parties.iter().map(|p| contributions[p]).collect();
-    let eid_bytes = signing_execution_id(&committee.identity_bytes(), &parties, attempt, preimage, &ordered);
+    // A signer holding a share of another key derives another id, so its frames are never
+    // taken as this run's: the run fails at once instead of mid-protocol.
+    let eid_bytes = signing_execution_id(&committee.identity_bytes(), &x33, &parties, attempt, preimage, &ordered);
     let rtag = round_tag(&eid_bytes);
 
     // Channels bridge the protocol thread and this (mesh-pump) thread.
@@ -617,7 +622,8 @@ mod tests {
         let c = committee(3, 2).identity_bytes();
         let parties = [0u16, 1];
         let pre = b"mint";
-        let id = |cs: &[[u8; 32]]| signing_execution_id(&c, &parties, 0, pre, cs);
+        let key = [2u8; 33];
+        let id = |cs: &[[u8; 32]]| signing_execution_id(&c, &key, &parties, 0, pre, cs);
 
         // Same duty, same attempt, same signers: only the runs' contributions differ.
         let first = id(&[[1; 32], [2; 32]]);
@@ -626,9 +632,12 @@ mod tests {
         assert_ne!(first, id(&[[2; 32], [1; 32]]), "contributions are bound to the signer that made them");
 
         // The duty's own identity still separates ids as before.
-        assert_ne!(first, signing_execution_id(&c, &parties, 1, pre, &[[1; 32], [2; 32]]));
-        assert_ne!(first, signing_execution_id(&c, &[0, 2], 0, pre, &[[1; 32], [2; 32]]));
-        assert_ne!(first, signing_execution_id(&c, &parties, 0, b"other", &[[1; 32], [2; 32]]));
+        assert_ne!(first, signing_execution_id(&c, &key, &parties, 1, pre, &[[1; 32], [2; 32]]));
+        assert_ne!(first, signing_execution_id(&c, &key, &[0, 2], 0, pre, &[[1; 32], [2; 32]]));
+        assert_ne!(first, signing_execution_id(&c, &key, &parties, 0, b"other", &[[1; 32], [2; 32]]));
+        // Same committee, same everything, another key: the outgoing and incoming keys of a
+        // same-membership rotation never share an id.
+        assert_ne!(first, signing_execution_id(&c, &[3u8; 33], &parties, 0, pre, &[[1; 32], [2; 32]]));
 
         // Rounds travel under a tag of the run, distinct from the barrier's.
         assert_ne!(round_tag(&first), round_tag(&id(&[[1; 32], [3; 32]])));
