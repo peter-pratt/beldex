@@ -2,6 +2,14 @@
 # gateway-handover.sh — hand the gateway's spending rights to the INCOMING committee.
 #
 #     runlog ./gateway-handover.sh <new-Pgw-group-vk-hex>
+#     runlog ./gateway-handover.sh --sign-only <new-Pgw-group-vk-hex> <file>
+#     runlog ./gateway-handover.sh --submit <file>
+#
+# --sign-only builds and signs the hand-over now and keeps it in <file> without sending it;
+# --submit sends one kept that way. The rotation ceremony signs while the outgoing key is
+# certainly live (right after it authorises the rotation) and sends only once the
+# activation is verified, so its holders need not stay online through the challenge window.
+# Sending needs no key, only the same wallet that built it.
 #
 # WHY THIS EXISTS. Consensus checks every gateway withdrawal against the gateway's
 # CURRENT owner key (gateway_utils.cpp, "gateway input signature verification failed").
@@ -28,6 +36,33 @@ set -euo pipefail
 LOCAL="$(cd "$(dirname "$0")" && pwd)"
 cd "$LOCAL"
 
+wrpc() {
+  curl -s "http://127.0.0.1:$WPORT/json_rpc" -H 'Content-Type: application/json' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":\"0\",\"method\":\"$1\",\"params\":$2}"
+}
+jget() { python3 -c "import sys,json;d=json.load(sys.stdin);r=d.get('result');print(r['$1'] if r else 'ERR:'+json.dumps(d.get('error')))"; }
+
+# Send a hand-over signed earlier with --sign-only.
+submit_saved() {
+  local SUB
+  SUB=$(wrpc gateway_submit_descriptor_update \
+    "{\"tx_metadata\":\"$METADATA\",\"signature\":\"$SIG\",\"signature_type\":\"eddsa\"}")
+  echo "$SUB" | grep -q '"tx_hash"' || { echo "!! submit failed: $SUB" >&2; exit 1; }
+  echo "   tx_hash : $(echo "$SUB" | jget tx_hash)"
+}
+
+MODE=full
+case "${1:-}" in
+  --sign-only) MODE=sign; SAVE="${3:-}"; shift
+               [ -n "$SAVE" ] || { echo "usage: $0 --sign-only <new-Pgw-group-vk-hex> <file>" >&2; exit 1; } ;;
+  --submit)    SAVED="${2:-}"
+               [ -s "$SAVED" ] || { echo "usage: $0 --submit <file signed with --sign-only>" >&2; exit 1; }
+               . "$SAVED"
+               echo "== send the hand-over to $NEW_VK signed earlier (wallet on port $WPORT pays the fee)"
+               submit_saved
+               exit 0 ;;
+esac
+
 NEW_VK="${1:-}"
 [ -n "$NEW_VK" ] || { echo "usage: $0 <new-Pgw-group-vk-hex>" >&2; exit 1; }
 NEW_VK="${NEW_VK#0x}"
@@ -48,12 +83,6 @@ if [ -z "${WPORT:-}" ]; then
   done
 fi
 [ -n "${WPORT:-}" ] || { echo "!! no funded wallet-rpc found — mine more blocks first (./mine.sh 30)" >&2; exit 1; }
-
-wrpc() {
-  curl -s "http://127.0.0.1:$WPORT/json_rpc" -H 'Content-Type: application/json' \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":\"0\",\"method\":\"$1\",\"params\":$2}"
-}
-jget() { python3 -c "import sys,json;d=json.load(sys.stdin);r=d.get('result');print(r['$1'] if r else 'ERR:'+json.dumps(d.get('error')))"; }
 
 echo "== 1/3  build the descriptor update (wallet on port $WPORT pays the fee)"
 # bridge_reserve is STICKY: consensus REJECTS an update that would clear it, so it is
@@ -89,12 +118,20 @@ SIG=$(grep -h 'Pgw signature' testdata/pgw-sign-*.log 2>/dev/null \
 [ "${#SIG}" -eq 128 ] || { echo "!! Pgw signature is ${#SIG} hex chars, expected 128" >&2; exit 1; }
 echo "   signature : $SIG"
 
+if [ "$MODE" = sign ]; then
+  # Kept, not sent. The file authorises the gateway move to NEW_VK, so it is owner-only;
+  # it is only ever sent once the rotation to that key is verified on chain.
+  ( umask 077; printf 'NEW_VK=%s\nWPORT=%s\nMETADATA=%s\nSIG=%s\n' "$NEW_VK" "$WPORT" "$METADATA" "$SIG" > "$SAVE" )
+  echo
+  echo "hand-over signed and kept in $SAVE — send it with: $0 --submit $SAVE"
+  echo "(keep the wallet on port $WPORT otherwise idle until then: spending the outputs it"
+  echo " built this from would void it, and the outgoing key would have to sign again)"
+  exit 0
+fi
+
 echo
 echo "== 3/3  attach the signature and relay"
-SUB=$(wrpc gateway_submit_descriptor_update \
-  "{\"tx_metadata\":\"$METADATA\",\"signature\":\"$SIG\",\"signature_type\":\"eddsa\"}")
-echo "$SUB" | grep -q '"tx_hash"' || { echo "!! submit failed: $SUB" >&2; exit 1; }
-echo "   tx_hash : $(echo "$SUB" | jget tx_hash)"
+submit_saved
 
 echo
 echo "handover submitted — mine it in, then confirm the owner key moved:"

@@ -299,6 +299,7 @@ for a in $ARCH_NAMES; do ARCH_N=$(( ARCH_N + 1 )); done
 GEN_FROM_ARCHIVES=$(( ARCH_N + 1 ))
 GEN_FROM_CHAIN="$CUR_EPOCH"
 
+KEYGEN_FROM_ENV="${KEYGEN:-}"
 if [ -n "${KEYGEN:-}" ]; then
   note "DKG generation      : $KEYGEN  (from KEYGEN in the environment — derivation not used)"
 elif [ "$GEN_FROM_ARCHIVES" = "$GEN_FROM_CHAIN" ]; then
@@ -322,6 +323,23 @@ else
    previous DKGs actually used and re-run with KEYGEN=<n> set explicitly."
 fi
 [ "$KEYGEN" != "0" ] || fail "generation 0 is what the ORIGINAL DKG used — pick 1 or higher."
+
+# Generations step 1 has started, across every ceremony on this devnet (kept outside the
+# per-ceremony state, which a fresh run sets aside). A started DKG spends its generation —
+# its ExecutionId may not be reused — but spends neither an archive nor a keyEpoch, so the
+# derivation above keeps naming it. A resume uses the one its own step 1 ran; a fresh run
+# takes the first one no earlier attempt has spent.
+USED_GENS="$WORK/dkg-generations-used"
+if [ -z "$KEYGEN_FROM_ENV" ]; then
+  if [ "$FROM" -gt 1 ] && [ -n "$(state_get DKG_DONE)" ]; then
+    KEYGEN="$(state_get DKG_DONE)"
+    note "DKG generation      : $KEYGEN  (the one this ceremony's step 1 ran)"
+  elif [ "$FROM" = 1 ] && grep -qx "$KEYGEN" "$USED_GENS" 2>/dev/null; then
+    spent="$KEYGEN"
+    while grep -qx "$KEYGEN" "$USED_GENS"; do KEYGEN=$(( KEYGEN + 1 )); done
+    note "generation $spent was started by an earlier DKG attempt; using $KEYGEN"
+  fi
+fi
 
 state_put KEYGEN "$KEYGEN"
 state_put PROXY "$PROXY"
@@ -371,6 +389,7 @@ devnet/shares-next. cggmp21 0.6.3 has no threshold key refresh, so this is what
 The current committee stays live and in the contract throughout.
 EOF
 
+  echo "$KEYGEN" >> "$USED_GENS"
   if ! run_logged "01-dkg.log" "$LOCAL/dkg-next.sh" "$KEYGEN"; then
     # Whether the generation is spent depends on whether the protocol ever STARTED. A signer
     # that refused at the door -- wrong build, bad config, off the committee -- never derived
@@ -607,6 +626,40 @@ step4b() {
 }
 skip4b() { note "step 4b skipped"; }
 
+# The incoming committee's Pgw, from step 1's DKG.
+incoming_pgw() {
+  local vkfile
+  vkfile="$(ls "$TESTDATA"/beldex-127.0.0.1-*/devnet/shares-next/pgw-*.groupvk 2>/dev/null | head -1)"
+  [ -n "$vkfile" ] || fail "no shares-next/pgw-*.groupvk found — step 1's DKG did not write a Pgw key.
+   Without it the gateway cannot be handed over and releases will stop at step 7."
+  od -An -v -tx1 < "$vkfile" | tr -d ' \n'
+}
+HANDOVER_SAVED="$WORK/06b-gateway-handover.signed"
+
+# ===========================================================================================
+# step 4c — the outgoing committee signs the gateway hand-over now, sent at step 6b.
+#
+# The hand-over has to be signed by the OUTGOING Pgw. Signed at 6b it needs those holders
+# online through the whole challenge window, and if enough of them drop out meanwhile the
+# contract moves to the new key while the gateway can no longer follow. Signed here, right
+# beside the rotation signature, the outgoing key is certainly live; 6b only sends it, which
+# needs no key at all. Not gated: nothing is sent, and the file is only used once step 6 has
+# verified the rotation to exactly this key.
+# ===========================================================================================
+step4c() {
+  banner "4c — the outgoing committee signs the gateway hand-over (sent at step 6b)"
+  STEP_TITLE="step 4c, the gateway hand-over signature"; FAILED_AT=4
+  local newvk
+  newvk="$(incoming_pgw)"
+  rm -f "$HANDOVER_SAVED"
+  SHARE_SUBDIR=shares run_logged "04c-gateway-handover-sign.log" \
+    "$LOCAL/gateway-handover.sh" --sign-only "$newvk" "$HANDOVER_SAVED" \
+    || { note "the outgoing committee could not sign the hand-over now — see
+   $WORK/04c-gateway-handover-sign.log. Step 6b will try again with the full flow."; return 0; }
+  ok "hand-over to $newvk signed and kept for step 6b"
+}
+skip4c() { note "step 4c skipped"; }
+
 skip4() {
   ls "$TESTDATA"/rotate-sign-*.log >/dev/null 2>&1 \
     || fail "step 4 was skipped but there are no rotate-sign-*.log files in $TESTDATA.
@@ -709,12 +762,20 @@ step6b() {
   banner "6b — hand the gateway to the incoming committee"
   STEP_TITLE="step 6b, the gateway handover"; FAILED_AT=6
 
-  local vkfile newvk
-  vkfile="$(ls "$TESTDATA"/beldex-127.0.0.1-*/devnet/shares-next/pgw-*.groupvk 2>/dev/null | head -1)"
-  [ -n "$vkfile" ] || fail "no shares-next/pgw-*.groupvk found — step 1's DKG did not write a Pgw key.
-   Without it the gateway cannot be handed over and releases will stop at step 7."
-  newvk="$(od -An -v -tx1 < "$vkfile" | tr -d ' \n')"
+  local newvk
+  newvk="$(incoming_pgw)"
   printf '  incoming Pgw : %s\n' "$newvk"
+
+  # Signed at step 4c for exactly this key: send it, no key needed.
+  if [ -s "$HANDOVER_SAVED" ] && [ "$(envget "$HANDOVER_SAVED" NEW_VK)" = "$newvk" ]; then
+    if run_logged "06b-gateway-handover.log" "$LOCAL/gateway-handover.sh" --submit "$HANDOVER_SAVED"; then
+      rm -f "$HANDOVER_SAVED"
+      ok "the gateway now answers to the incoming committee's Pgw (address unchanged; signed at step 4c)"
+      return 0
+    fi
+    note "sending the hand-over signed at step 4c failed — see $WORK/06b-gateway-handover.log.
+   Signing it again with the outgoing key."
+  fi
 
   # The outgoing tree is still the default (`shares`); do not let a stray SHARE_SUBDIR
   # point this at shares-next, which would sign with a key the gateway does not accept.
@@ -791,6 +852,20 @@ EOF
     || fail "after the promotion the default tree signs as $now, but the contract holds $NEW_SIGNER.
    The wrong tree was promoted. Every sign-* run from here would be rejected on chain."
   ok "the default share tree now signs as $now — the key the contract holds"
+
+  # The signers still running hold the retired trees in memory: the old key's say KEY
+  # REPLACED and stop, and nothing serves the new key until they are started on the
+  # promoted trees. Restart them with the settings they were launched with.
+  if [ -s "$TESTDATA/serve-live.last" ]; then
+    ( set -a; . "$TESTDATA/serve-live.last"; set +a
+      run_logged "07-serve-restart.log" "$LOCAL/serve-live.sh" ) \
+      && ok "signers restarted on the promoted share trees" \
+      || note "the signers did not restart — see $WORK/07-serve-restart.log, then run ./serve-live.sh.
+   Until they do, nothing mints or releases under the new key."
+  else
+    note "no testdata/serve-live.last: the signers were not started by serve-live.sh here.
+   Start them on the promoted share trees now, or nothing serves the new key."
+  fi
 }
 skip7() {
   ARCHIVE="${ARCHIVE_DIR:-$(state_get ARCHIVE)}"
@@ -905,6 +980,7 @@ for n in 1 2 3 4 5 6 7 8; do
   # the single submission step 5 makes, and neither touches the chain.
   if [ "$n" = 4 ]; then
     if [ "$FROM" -le 4 ]; then step4b; else skip4b; fi
+    if [ "$FROM" -le 4 ]; then step4c; else skip4c; fi
   fi
   if [ "$n" = 6 ]; then
     if [ "$FROM" -le 6 ]; then step6b; else skip6b; fi

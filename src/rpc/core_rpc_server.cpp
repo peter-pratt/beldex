@@ -4415,6 +4415,18 @@ namespace cryptonote::rpc {
       contracts.push_back(json{{"chain_id", cc.chain_id},
                                {"contract", oxenc::to_hex(cc.contract.begin(), cc.contract.end())}});
     cmd.response["chain_contracts"] = std::move(contracts);
+    // Bonds of master nodes deregistered while they could still hold a live key share.
+    auto departed = json::array();
+    for (const auto &db : m_core.get_master_node_list().get_bridge_departed_bonds())
+    {
+      auto baseline = json::array();
+      for (const auto &ce : db.serving_key_epoch)
+        baseline.push_back(json{{"chain_id", ce.chain_id}, {"key_epoch", ce.key_epoch}});
+      departed.push_back(json{{"master_node", tools::type_to_hex(db.master_node)},
+                              {"unlock_height", db.unlock_height},
+                              {"serving_key_epoch", std::move(baseline)}});
+    }
+    cmd.response["departed_bonds"] = std::move(departed);
     cmd.response["status"]             = STATUS_OK;
   }
 

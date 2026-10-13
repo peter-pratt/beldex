@@ -1992,7 +1992,26 @@ end:
     // (otherwise the *block* will fail but validation won't, because validation here won't see the
     // earlier tx has having taken effect, but the block addition will).
     std::unordered_set<crypto::hash> bns_buys;
-  
+
+    // Gateway txs taken so far. Each one is valid on its own, but the block applies them
+    // together: the per-window release cap, a burn ref discharged twice, or withdrawals that
+    // together overdraw invalidate the WHOLE block. Every producer builds from the same pool,
+    // so one such tx would get every block rejected and stall the chain. Each candidate is
+    // simulated with the ones already taken, exactly as block validation will, and left in
+    // the pool for a later block if it fails.
+    std::vector<cryptonote::transaction> gw_txs;
+    auto touches_gateway = [](const cryptonote::transaction& tx) {
+      if (tx.type == txtype::register_gateway_address || tx.type == txtype::update_gateway_address
+          || tx.has_gateway_inputs())
+        return true;
+      for (const auto& o : tx.vout)
+        if (std::holds_alternative<tx_out_gateway>(o.target))
+          return true;
+      tx_extra_gateway_freeze freeze{};
+      tx_extra_gateway_repoint repoint{};
+      return get_field_from_tx_extra(tx.extra, freeze) || get_field_from_tx_extra(tx.extra, repoint);
+    };
+
     LOG_PRINT_L2("Filling block template, median weight " << median_weight << ", " << m_txs_by_fee_and_receive_time.size() << " txes in the pool");
 
     LockedTXN lock(m_blockchain);
@@ -2103,6 +2122,19 @@ end:
           !bns_buys.emplace(bns.name_hash).second) {
 
           LOG_PRINT_L2("  conflicting BNS buy in mempool");
+          continue;
+        }
+      }
+
+      if (version >= feature::GATEWAY_ADDRESSES && touches_gateway(tx))
+      {
+        gw_txs.push_back(tx);
+        std::string gw_reason;
+        if (!simulate_gateways_from_transactions(m_blockchain.get_db(), gw_txs, height,
+                                                 version >= feature::BRIDGE, &gw_reason))
+        {
+          gw_txs.pop_back();
+          LOG_PRINT_L1("  left for a later block, it would invalidate this one: " << gw_reason);
           continue;
         }
       }

@@ -73,6 +73,11 @@ using cryptonote::hf;
 namespace master_nodes
 {
   size_t constexpr STORE_LONG_TERM_STATE_INTERVAL = 10000;
+  // HF23: how many bridge epochs a committee stays resolvable after its state leaves the
+  // short-term history. Rotation acks, slash reports, the mint bus and a restarting signer
+  // all look up the committee of an epoch that may have started many hours earlier, and the
+  // short-term history (12h) is shorter than one mainnet epoch (24h).
+  uint64_t constexpr BRIDGE_COMMITTEE_HISTORY_EPOCHS = 7;
 
   constexpr auto X25519_MAP_PRUNING_INTERVAL = 5min;
   constexpr auto X25519_MAP_PRUNING_LAG = 24h;
@@ -755,16 +760,7 @@ namespace master_nodes
         // (Bridge-fault *forfeiture* of the bond is Phase F; this only prevents
         // early reclaim on a base-stake deregistration.)
         if (hf_version >= hf::hf23_bridge && info.bridge_seat.registered)
-        {
-          for (const auto &contribution : info.bridge_seat.bond_contributions)
-          {
-            key_image_blacklist.emplace_back();
-            key_image_blacklist_entry &entry = key_image_blacklist.back();
-            entry.key_image                  = contribution.key_image;
-            entry.unlock_height              = block_height + cryptonote::bridge_bond_unlock_blocks(nettype);
-            entry.amount                     = contribution.amount;
-          }
-        }
+          hold_bridge_bond_on_deregister(nettype, key, info, block_height);
 
         master_nodes_infos.erase(iter);
         return true;
@@ -2432,7 +2428,13 @@ namespace master_nodes
     // hand-over to wait for: an empty baseline, and only the unbonding window gates it.
     if (!info.bridge_seat.seated)
       return true;
-    info.bridge_seat.serving_key_epoch = observed_key_epoch;
+    info.bridge_seat.serving_key_epoch = bridge_exit_baseline();
+    return true;
+  }
+
+  std::vector<bridge_chain_epoch> master_node_list::state_t::bridge_exit_baseline() const
+  {
+    std::vector<bridge_chain_epoch> baseline = observed_key_epoch;
     // The seat also holds a share of the NATIVE gateway owner key, and that share keeps
     // signing until the gateway is re-pointed. Releasing the bond once only the wBDX
     // chains have rotated would hand the stake back while the gateway share is still
@@ -2441,22 +2443,56 @@ namespace master_nodes
     // which walks only the baseline, would never require it. (With no bridge
     // gateway registered at all there is no gateway key to hold a share of.)
     if (!bridge_gateway_owners.empty() &&
-        !chain_epoch_present(info.bridge_seat.serving_key_epoch,
-                             cryptonote::BRIDGE_GATEWAY_CHAIN_ID))
+        !chain_epoch_present(baseline, cryptonote::BRIDGE_GATEWAY_CHAIN_ID))
     {
       bridge_chain_epoch gw{};
       gw.chain_id  = cryptonote::BRIDGE_GATEWAY_CHAIN_ID;
       gw.key_epoch = chain_epoch_get(observed_key_epoch, cryptonote::BRIDGE_GATEWAY_CHAIN_ID);
-      info.bridge_seat.serving_key_epoch.push_back(gw);
+      baseline.push_back(gw);
     }
     // TWO hand-overs past where each chain stands now, not one. The seat may hold a share
     // of the key the committee it was last selected into generated — which, if it asked to
     // leave after that DKG but before the hand-over TO that key, is the NEXT key, not the
     // live one. The first hand-over can therefore move the bridge onto a key it still holds;
     // the second moves it onto one generated without it, since it is never selected again.
-    for (auto &e : info.bridge_seat.serving_key_epoch)
+    for (auto &e : baseline)
       ++e.key_epoch;
-    return true;
+    return baseline;
+  }
+
+  void master_node_list::state_t::hold_bridge_bond_on_deregister(cryptonote::network_type nettype,
+                                                                 const crypto::public_key &pubkey,
+                                                                 const master_node_info &info,
+                                                                 uint64_t block_height)
+  {
+    const auto &bs = info.bridge_seat;
+    const uint64_t unlock_height = block_height + cryptonote::bridge_bond_unlock_blocks(nettype);
+    // A seat that may still hold a share of a live key: a seated one that never asked to
+    // leave (baseline taken now, as at an unbond request), or one that asked and is still
+    // serving (its request-time baseline). A queued seat, or one already unseated because
+    // its key was retired, holds nothing live and stays on the window alone.
+    std::vector<bridge_chain_epoch> baseline;
+    if (bs.seated)
+      baseline = bs.requested_unbond_height != 0 ? bs.serving_key_epoch : bridge_exit_baseline();
+
+    bridge_departed_bond departed{};
+    for (const auto &contribution : bs.bond_contributions)
+    {
+      key_image_blacklist.emplace_back();
+      key_image_blacklist_entry &entry = key_image_blacklist.back();
+      entry.key_image                  = contribution.key_image;
+      entry.unlock_height              = baseline.empty() ? unlock_height : std::numeric_limits<uint64_t>::max();
+      entry.amount                     = contribution.amount;
+      departed.key_images.push_back(contribution.key_image);
+    }
+    if (baseline.empty())
+      return;
+    departed.master_node       = pubkey;
+    departed.serving_key_epoch = std::move(baseline);
+    departed.unlock_height     = unlock_height;
+    bridge_departed_bonds.push_back(std::move(departed));
+    MGINFO("Bridge bond of deregistered master node " << pubkey
+           << " held until its keys are retired and height " << unlock_height);
   }
 
 
@@ -2774,6 +2810,29 @@ namespace master_nodes
       auto iter = master_nodes_infos.find(pk);
       duplicate_info(iter->second).bridge_seat = master_node_info::bridge_seat_info{}; // reset to unregistered default
     }
+
+    // Bonds of seats deregistered while they could still hold a live key share: released
+    // on the same two milestones. Every chain in the baseline must have rotated past it.
+    // Unlike a seat's, this baseline may name only the gateway (a deregistration cannot be
+    // refused, as an unbond is, before the first wBDX ack), and then that gates it alone.
+    for (auto it = bridge_departed_bonds.begin(); it != bridge_departed_bonds.end();)
+    {
+      bool retired = block_height >= it->unlock_height;
+      for (const auto &b : it->serving_key_epoch)
+        if (!chain_epoch_present(observed_key_epoch, b.chain_id)
+            || chain_epoch_get(observed_key_epoch, b.chain_id) <= b.key_epoch)
+          retired = false;
+      if (!retired)
+      {
+        ++it;
+        continue;
+      }
+      for (const auto &ki : it->key_images)
+        key_image_blacklist.erase(std::remove(key_image_blacklist.begin(), key_image_blacklist.end(), ki),
+                                  key_image_blacklist.end());
+      MGINFO("Bridge bond of deregistered master node " << it->master_node << " released at height " << block_height);
+      it = bridge_departed_bonds.erase(it);
+    }
   }
 
   void master_node_list::state_t::refresh_bridge_seats()
@@ -3062,9 +3121,46 @@ namespace master_nodes
           }
           m_transient.state_archive.emplace_hint(m_transient.state_archive.end(), std::move(*it));
         }
+        else if (it->quorums.bridge && !it->quorums.bridge->validators.empty())
+        {
+          // A bridge epoch's first state: keep its committee (only), so the epoch stays
+          // resolvable after this state leaves the short-term history, and across restarts.
+          m_transient.state_added_to_archive = true;
+          state_t &state            = const_cast<state_t &>(*it); // safe: set order only depends on state_t.height
+          state.master_nodes_infos = {};
+          state.key_image_blacklist = {};
+          state.only_loaded_quorums = true;
+          quorum_manager bridge_only{};
+          bridge_only.bridge = state.quorums.bridge;
+          state.quorums = bridge_only;
+          m_transient.state_archive.emplace_hint(m_transient.state_archive.end(), std::move(*it));
+        }
 
       }
       m_transient.state_history.erase(m_transient.state_history.begin(), end_it);
+
+      // Drop bridge committees kept above once they are older than the retention. They are
+      // the only quorum-only archive entries that are neither a long-term interval state nor
+      // needed by the states that follow one.
+      if (hf_version >= hf::hf23_bridge)
+      {
+        const uint64_t keep = BRIDGE_COMMITTEE_HISTORY_EPOCHS * cryptonote::bridge_epoch_blocks(m_blockchain.nettype());
+        const uint64_t oldest = cull_height > keep ? cull_height - keep : 0;
+        for (auto it = m_transient.state_archive.begin(); it != m_transient.state_archive.end() && it->height < oldest;)
+        {
+          const uint64_t next_long_term = ((it->height / STORE_LONG_TERM_STATE_INTERVAL) + 1) * STORE_LONG_TERM_STATE_INTERVAL;
+          const bool kept_for_bridge = it->only_loaded_quorums
+                                    && (it->height % STORE_LONG_TERM_STATE_INTERVAL) != 0
+                                    && next_long_term - it->height > VOTE_LIFETIME + VOTE_OR_TX_VERIFY_HEIGHT_BUFFER;
+          if (kept_for_bridge)
+          {
+            it = m_transient.state_archive.erase(it);
+            m_transient.state_added_to_archive = true;
+          }
+          else
+            ++it;
+        }
+      }
 
       if (m_transient.old_quorum_states.size() > m_store_quorum_history)
         m_transient.old_quorum_states.erase(m_transient.old_quorum_states.begin(), m_transient.old_quorum_states.begin() + (m_transient.old_quorum_states.size() -  m_store_quorum_history));
@@ -3562,6 +3658,7 @@ namespace master_nodes
     result.observed_key_epoch  = state.observed_key_epoch; // HF23 H.6.3
     result.bridge_gateway_owners = state.bridge_gateway_owners;
     result.bridge_chain_contracts = state.bridge_chain_contracts;
+    result.bridge_departed_bonds = state.bridge_departed_bonds;
     return result;
   }
 
@@ -4207,6 +4304,7 @@ namespace master_nodes
   , observed_key_epoch{std::move(state.observed_key_epoch)} // HF23 H.6.3
   , bridge_gateway_owners{std::move(state.bridge_gateway_owners)}
   , bridge_chain_contracts{std::move(state.bridge_chain_contracts)}
+  , bridge_departed_bonds{std::move(state.bridge_departed_bonds)}
   , mn_list{mnl}
   {
     if (!mn_list)
