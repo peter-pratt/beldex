@@ -2106,7 +2106,7 @@ where
                     log_index: p.log_index,
                     first_seen: beldex_bridge_signer::release_outbox::now_secs(),
                     attempts: 1,
-                    gave_up: false,
+                    warned: false,
                 };
                 match beldex_bridge_signer::release_outbox::save(&release_outbox_dir, &record) {
                     Ok(path) => println!("  release saved for re-send: {}", path.display()),
@@ -2596,26 +2596,24 @@ where
             use beldex_bridge_signer::release_outbox as outbox;
             let now = outbox::now_secs();
             for (_, mut rec) in outbox::load_all(&outbox_dir_for_sweep) {
-                if rec.gave_up {
-                    continue; // already handed to a person; do not keep churning
-                }
-                if rec.should_give_up(now) {
-                    rec.gave_up = true;
+                // Re-sent until discharged, however long that takes: consensus refuses a
+                // second payout for the same burn for ever, so no re-send can pay twice.
+                // Past STALE_AFTER_SECS it is reported once, and still re-sent.
+                if rec.is_stale(now) && !rec.warned {
+                    rec.warned = true;
                     let _ = outbox::save(&outbox_dir_for_sweep, &rec);
                     eprintln!(
-                        "!! RELEASE UNDELIVERED after {}h — chain {} burn {} log {} (txid {})\n   \
-                         signed transaction kept in {}; NOT retrying further.\n   \
-                         Before re-sending by hand, CHECK THE TXID IS NOT ALREADY ON CHAIN: \
-                         consensus only refuses a second payout for 24h, and past that a \
-                         stale re-send would pay twice.",
-                        outbox::GIVE_UP_AFTER_SECS / 3600,
+                        "!! release still unmined after {}h — chain {} burn {} log {} (txid {})\n   \
+                         Still re-sending the same signed transaction (it can never pay twice). \
+                         Check the daemon's answer to it, and whether the gateway inputs it spends \
+                         are still unspent. Kept in {}.",
+                        outbox::STALE_AFTER_SECS / 3600,
                         rec.chain_id,
                         rec.evm_txid,
                         rec.log_index,
                         rec.txid,
                         outbox_dir_for_sweep
                     );
-                    continue;
                 }
                 // ASK consensus whether this burn is already discharged, rather than
                 // inferring it from a submit error. Re-submitting a release that has been
@@ -2747,8 +2745,8 @@ fn main() -> ExitCode {
                 println!("{} outstanding release(s) in {dir}:\n", all.len());
                 for (path, r) in &all {
                     let hours = r.age_secs(now) / 3600;
-                    let state = if r.gave_up {
-                        "NEEDS A PERSON — retries stopped"
+                    let state = if r.is_stale(now) {
+                        "still retrying, but unmined past the stale mark: check why"
                     } else {
                         "still retrying"
                     };
@@ -2758,10 +2756,10 @@ fn main() -> ExitCode {
                     );
                 }
                 println!(
-                    "Before re-sending any of these by hand, CHECK THE TXID IS NOT ALREADY ON\n\
-                     CHAIN. Consensus refuses a second payout for the same burn for only 24h;\n\
-                     past that a stale re-send would pay the user twice. Since a release is\n\
-                     never re-signed, that one txid is the only transaction that can pay it."
+                    "Each is the one signed transaction that can pay its burn: a release is never\n\
+                     re-signed, and consensus refuses a second payout for the same burn for ever.\n\
+                     The signers keep re-sending these until they land; one still here long\n\
+                     after its burn usually means the gateway inputs it spends are gone."
                 );
             }
         return ExitCode::SUCCESS;

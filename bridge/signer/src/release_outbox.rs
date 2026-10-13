@@ -11,10 +11,12 @@
 //! * **Re-broadcast, never re-sign.** The same signed bytes carry the same transaction id,
 //!   so the chain simply ignores a duplicate. Paying twice is impossible by construction.
 //!   Signing a *fresh* transaction for the same burn is what would create that risk.
-//! * **Stop well inside the chain's memory.** Consensus refuses a second discharge of a
-//!   burn for `GATEWAY_RELEASE_WINDOW_BLOCKS` (24h at 30s blocks, current + previous
-//!   window). Past that it forgets, and a stale re-send would have nothing stopping it.
-//!   Automatic retries therefore stop at half that.
+//! * **The chain never forgets a discharged burn.** Consensus keeps every release ref it
+//!   has accepted in a table that is never pruned (`gateway_release_refs`) and refuses a
+//!   second discharge of the same burn however late it comes. So re-sending is safe for as
+//!   long as it takes, and stops only when the burn is discharged. (Retries used to stop at
+//!   12h because the record then lasted only two 24h release windows; a re-send after that
+//!   could have paid twice.)
 //!
 //! The record keeps the transaction id precisely so a person recovering by hand can ask
 //! one question — "is this id on chain?" — and get a complete answer. Because we never
@@ -27,13 +29,13 @@ use std::path::{Path, PathBuf};
 /// long enough for inclusion, rather than re-sending before a block can even exist.
 pub const RETRY_INTERVAL_SECS: u64 = 15 * 60;
 
-/// How long to keep re-sending before giving up and asking for a person.
+/// How long a release may go unmined before someone is asked to look.
 ///
-/// Half the 24h window consensus is guaranteed to remember the burn for. Beyond that a
-/// re-send could land after the chain has forgotten, and pay twice. It is also well past
-/// the point where the cause is a fee: a release that cannot be mined in twelve hours has
-/// something structurally wrong that more attempts will not fix.
-pub const GIVE_UP_AFTER_SECS: u64 = 12 * 60 * 60;
+/// Re-sending does not stop: the user's wBDX is already burned, and a re-send cannot pay
+/// twice. But a release that has not been mined in twelve hours is past anything a fee
+/// spike explains (the gateway's inputs may have been spent, or the daemon refuses it), so
+/// the signer says so once, loudly, and keeps trying.
+pub const STALE_AFTER_SECS: u64 = 12 * 60 * 60;
 
 /// One signed release, kept until it is known to have landed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,8 +51,10 @@ pub struct ReleaseRecord {
     /// Unix seconds when it was first signed — the clock the retry window runs on.
     pub first_seen: u64,
     pub attempts: u32,
-    /// Set once retries stop, so a sweep can tell "still trying" from "needs a person".
-    pub gave_up: bool,
+    /// Set once the release has been reported as stale, so the warning is given once.
+    /// (Records written by builds that gave up carry `gave_up`; they read as warned and
+    /// are re-sent again.)
+    pub warned: bool,
 }
 
 impl ReleaseRecord {
@@ -59,14 +63,15 @@ impl ReleaseRecord {
         now.saturating_sub(self.first_seen)
     }
 
-    /// Whether automatic re-sending should stop and ask for a person instead.
-    pub fn should_give_up(&self, now: u64) -> bool {
-        self.age_secs(now) >= GIVE_UP_AFTER_SECS
+    /// Whether it has gone unmined long enough that a person should look.
+    pub fn is_stale(&self, now: u64) -> bool {
+        self.age_secs(now) >= STALE_AFTER_SECS
     }
 
-    /// Whether enough time has passed since the last attempt to try again.
+    /// Whether enough time has passed since the last attempt to try again. Always true
+    /// eventually: a release is re-sent until its burn is discharged.
     pub fn due(&self, now: u64, last_attempt: u64) -> bool {
-        !self.should_give_up(now) && now.saturating_sub(last_attempt) >= RETRY_INTERVAL_SECS
+        now.saturating_sub(last_attempt) >= RETRY_INTERVAL_SECS
     }
 
     pub fn to_json(&self) -> String {
@@ -74,7 +79,7 @@ impl ReleaseRecord {
             concat!(
                 r#"{{"txid":"{}","tx_blob":"{}","signature":"{}","chain_id":{},"#,
                 r#""evm_txid":"{}","log_index":{},"first_seen":{},"attempts":{},"#,
-                r#""gave_up":{}}}"#
+                r#""warned":{}}}"#
             ),
             self.txid,
             self.tx_blob,
@@ -84,7 +89,7 @@ impl ReleaseRecord {
             self.log_index,
             self.first_seen,
             self.attempts,
-            self.gave_up,
+            self.warned,
         )
     }
 
@@ -111,7 +116,7 @@ impl ReleaseRecord {
             log_index: num_field("log_index")? as u32,
             first_seen: num_field("first_seen")?,
             attempts: num_field("attempts")? as u32,
-            gave_up: s.contains("\"gave_up\":true"),
+            warned: s.contains("\"warned\":true") || s.contains("\"gave_up\":true"),
         })
     }
 }
@@ -190,7 +195,7 @@ mod tests {
             log_index: 2,
             first_seen,
             attempts: 0,
-            gave_up: false,
+            warned: false,
         }
     }
 
@@ -226,30 +231,26 @@ mod tests {
         assert!(r.due(now, now - RETRY_INTERVAL_SECS), "a full interval has passed");
     }
 
-    /// Retrying must stop well inside the window consensus remembers the burn for. Past
-    /// that, a stale re-send could land after the chain has forgotten and pay twice.
+    /// A release is re-sent until its burn is discharged, however long that takes:
+    /// consensus refuses a second discharge for ever, so a late re-send cannot pay twice.
+    /// Past twelve hours it is reported once as stale, and still re-sent.
     #[test]
-    fn retrying_stops_at_half_the_window_the_chain_remembers() {
+    fn retrying_never_stops_and_a_stale_release_is_reported() {
         let r = rec(1000);
-        assert!(!r.should_give_up(1000 + GIVE_UP_AFTER_SECS - 1), "still inside the window");
-        assert!(r.should_give_up(1000 + GIVE_UP_AFTER_SECS), "stop and ask for a person");
-
-        // And once it gives up, nothing is due any more — no quiet background retrying.
-        let now = 1000 + GIVE_UP_AFTER_SECS;
-        assert!(!r.due(now, 0), "a given-up release must not keep re-sending");
-
-        // The bound that makes this safe: consensus remembers for 24h, we stop at 12h.
-        assert!(
-            GIVE_UP_AFTER_SECS * 2 <= 24 * 60 * 60,
-            "give-up must stay well inside the chain's 24h replay window"
-        );
+        assert!(!r.is_stale(1000 + STALE_AFTER_SECS - 1));
+        assert!(r.is_stale(1000 + STALE_AFTER_SECS), "a person is asked to look");
+        let a_month = 30 * 24 * 60 * 60;
+        assert!(r.due(1000 + a_month, 1000 + a_month - RETRY_INTERVAL_SECS), "and it is still re-sent");
     }
 
-    /// 15-minute pacing over 12 hours is 48 attempts — few enough to reason about, and
-    /// each is a re-send of the same bytes rather than a fresh signing round.
+    /// A record an older build gave up on reads as already reported, and is re-sent again.
     #[test]
-    fn the_retry_budget_is_forty_eight_attempts() {
-        assert_eq!(GIVE_UP_AFTER_SECS / RETRY_INTERVAL_SECS, 48);
+    fn a_release_an_older_build_gave_up_on_is_retried() {
+        let r = rec(1000);
+        let old = r.to_json().replace("\"warned\":false", "\"gave_up\":true");
+        let back = ReleaseRecord::from_json(&old).unwrap();
+        assert!(back.warned, "the stale warning is not repeated");
+        assert!(back.due(1000 + 2 * STALE_AFTER_SECS, 0), "but re-sending resumes");
     }
 
     /// One record per burn: re-saving must update in place, never accumulate copies that
@@ -260,13 +261,13 @@ mod tests {
         let mut r = rec(1000);
         save(&dir, &r).unwrap();
         r.attempts = 7;
-        r.gave_up = true;
+        r.warned = true;
         save(&dir, &r).unwrap();
 
         let loaded = load_all(&dir);
         assert_eq!(loaded.len(), 1, "one burn, one record");
         assert_eq!(loaded[0].1.attempts, 7);
-        assert!(loaded[0].1.gave_up, "the given-up flag survives, so a sweep can see it");
+        assert!(loaded[0].1.warned, "the warned flag survives, so the warning is given once");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
