@@ -832,12 +832,33 @@ fn value_to_u128(v: Option<&Value>) -> Option<u128> {
 ///   "per_tx_max":"…","per_epoch_cap":"…","start_block":18000000}, …]`
 /// (`per_tx_max`/`per_epoch_cap` may be strings or numbers; `start_block` optional;
 /// `"depth_only_finality": true` optional, dev chains only).
+/// Every key a chain row may carry. Anything else is refused: a misspelt optional setting
+/// (`"start_blok"`, `"depth_only_finalty"`) would otherwise be ignored and its default used
+/// in silence, which for these settings means scanning from block 0 or demanding finality
+/// a dev chain cannot give.
+pub const EVM_CHAIN_KEYS: &[&str] = &[
+    "chain_id",
+    "contract",
+    "confirmations",
+    "rpc",
+    "per_tx_max",
+    "per_epoch_cap",
+    "start_block",
+    "depth_only_finality",
+    "implementation",
+    "implementation_codehash",
+];
+
 pub fn parse_evm_chains(json: &str) -> Result<Vec<EvmChainConfig>, String> {
     let v: Value = serde_json::from_str(json).map_err(|e| format!("EVM chains JSON: {e}"))?;
     let arr = v.as_array().ok_or("EVM chains config must be a JSON array")?;
     let mut out = Vec::with_capacity(arr.len());
     for (i, row) in arr.iter().enumerate() {
         let miss = |f: &str| format!("chain[{i}]: missing/invalid `{f}`");
+        let obj = row.as_object().ok_or_else(|| format!("chain[{i}]: must be a JSON object"))?;
+        if let Some(k) = obj.keys().find(|k| !EVM_CHAIN_KEYS.contains(&k.as_str())) {
+            return Err(format!("chain[{i}]: unknown key `{k}` (known: {})", EVM_CHAIN_KEYS.join(", ")));
+        }
 
         let chain_id = row.get("chain_id").and_then(Value::as_u64).ok_or_else(|| miss("chain_id"))?;
         let contract_hex = row.get("contract").and_then(Value::as_str).ok_or_else(|| miss("contract"))?;
@@ -851,7 +872,12 @@ pub fn parse_evm_chains(json: &str) -> Result<Vec<EvmChainConfig>, String> {
         let rpc_url = row.get("rpc").and_then(Value::as_str).ok_or_else(|| miss("rpc"))?.to_string();
         let per_tx_max = value_to_u128(row.get("per_tx_max")).ok_or_else(|| miss("per_tx_max"))?;
         let per_epoch_cap = value_to_u128(row.get("per_epoch_cap")).ok_or_else(|| miss("per_epoch_cap"))?;
-        let start_block = row.get("start_block").and_then(Value::as_u64).unwrap_or(0);
+        // Optional, but when present it must be a block number: a string or a negative
+        // number used to read as absent, and the watcher scanned from block 0.
+        let start_block = match row.get("start_block") {
+            None => 0,
+            Some(v) => v.as_u64().ok_or_else(|| miss("start_block (a block number)"))?,
+        };
         let depth_only_finality = match row.get("depth_only_finality") {
             None => false,
             Some(Value::Bool(b)) => *b,
@@ -1561,6 +1587,24 @@ mod tests {
         ]"#;
         let cfgs = parse_evm_chains(dup).unwrap();
         assert!(build_registry(&cfgs).is_err());
+    }
+
+    #[test]
+    fn unknown_keys_and_malformed_optional_settings_are_refused() {
+        let row = |extra: &str| {
+            format!(
+                r#"[{{"chain_id":1,"contract":"0x2222222222222222222222222222222222222222","confirmations":1,"rpc":"x","per_tx_max":"1","per_epoch_cap":"1"{extra}}}]"#
+            )
+        };
+        assert!(parse_evm_chains(&row("")).is_ok());
+        let e = parse_evm_chains(&row(r#","start_blok":100"#)).unwrap_err();
+        assert!(e.contains("unknown key `start_blok`"), "{e}");
+        let e = parse_evm_chains(&row(r#","depth_only_finalty":true"#)).unwrap_err();
+        assert!(e.contains("depth_only_finalty"), "{e}");
+        let e = parse_evm_chains(&row(r#","start_block":"18000000""#)).unwrap_err();
+        assert!(e.contains("start_block"), "a string block number is refused, not read as 0: {e}");
+        assert_eq!(parse_evm_chains(&row(r#","start_block":18000000"#)).unwrap()[0].start_block, 18_000_000);
+        assert!(parse_evm_chains("[7]").unwrap_err().contains("must be a JSON object"));
     }
 
     #[test]

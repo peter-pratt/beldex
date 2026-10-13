@@ -157,7 +157,7 @@ fn run_prepare(_src: &str) -> Result<String, String> {
 /// that directory.
 #[cfg(feature = "submit-http")]
 fn run_relay(src: &str) -> Result<String, String> {
-    use beldex_bridge_relayer::{ChainEndpoint, HttpSubmitter, RelayOutcome, RelayPayload};
+    use beldex_bridge_relayer::{HttpSubmitter, RelayOutcome, RelayPayload};
 
     let json = read_source(src)?;
     let payload =
@@ -172,22 +172,7 @@ fn run_relay(src: &str) -> Result<String, String> {
     let v: serde_json::Value =
         serde_json::from_str(&chains_json).map_err(|e| format!("RELAYER_CHAINS: {e}"))?;
     let arr = v.as_array().ok_or("RELAYER_CHAINS must be a JSON array")?;
-    let mut chains = Vec::new();
-    for c in arr {
-        let chain_id = c.get("chain_id").and_then(|x| x.as_u64()).ok_or("chain entry needs chain_id")?;
-        let rpc_url = c.get("rpc_url").and_then(|x| x.as_str()).ok_or("chain entry needs rpc_url")?;
-        let mut ep = ChainEndpoint::new(chain_id, rpc_url);
-        if let Some(x) = c.get("max_fee_cap_wei").and_then(|x| x.as_u64()) {
-            ep.max_fee_cap_wei = x as u128;
-        }
-        if let Some(x) = c.get("priority_fee_wei").and_then(|x| x.as_u64()) {
-            ep.priority_fee_wei = x as u128;
-        }
-        if let Some(x) = c.get("gas_limit_pct").and_then(|x| x.as_u64()) {
-            ep.gas_limit_pct = x;
-        }
-        chains.push(ep);
-    }
+    let chains = parse_relayer_chains(arr)?;
 
     let state_dir = std::env::var("RELAYER_STATE_DIR")
         .ok()
@@ -229,5 +214,69 @@ fn read_source(src: &str) -> Result<String, String> {
         Ok(s)
     } else {
         std::fs::read_to_string(src).map_err(|e| format!("{src}: {e}"))
+    }
+}
+
+/// Every key a `RELAYER_CHAINS` entry may carry.
+#[cfg(feature = "submit-http")]
+const RELAYER_CHAIN_KEYS: &[&str] = &["chain_id", "rpc_url", "max_fee_cap_wei", "priority_fee_wei", "gas_limit_pct"];
+
+/// Parse the `RELAYER_CHAINS` entries. Unknown keys are refused, and so is an optional fee
+/// setting that is present but not a non-negative integer: either used to be ignored, so a
+/// typo (`"max_fee_cap"`) or a quoted number left the default fee cap in force in silence.
+#[cfg(feature = "submit-http")]
+fn parse_relayer_chains(arr: &[serde_json::Value]) -> Result<Vec<beldex_bridge_relayer::ChainEndpoint>, String> {
+    use beldex_bridge_relayer::ChainEndpoint;
+    let mut chains = Vec::new();
+    for (i, c) in arr.iter().enumerate() {
+        let obj = c.as_object().ok_or_else(|| format!("RELAYER_CHAINS[{i}]: must be a JSON object"))?;
+        if let Some(k) = obj.keys().find(|k| !RELAYER_CHAIN_KEYS.contains(&k.as_str())) {
+            return Err(format!(
+                "RELAYER_CHAINS[{i}]: unknown key `{k}` (known: {})",
+                RELAYER_CHAIN_KEYS.join(", ")
+            ));
+        }
+        let chain_id = c.get("chain_id").and_then(|x| x.as_u64()).ok_or("chain entry needs chain_id")?;
+        let rpc_url = c.get("rpc_url").and_then(|x| x.as_str()).ok_or("chain entry needs rpc_url")?;
+        let opt = |k: &str| -> Result<Option<u64>, String> {
+            match c.get(k) {
+                None => Ok(None),
+                Some(v) => v
+                    .as_u64()
+                    .map(Some)
+                    .ok_or_else(|| format!("RELAYER_CHAINS[{i}]: `{k}` must be a non-negative integer")),
+            }
+        };
+        let mut ep = ChainEndpoint::new(chain_id, rpc_url);
+        if let Some(x) = opt("max_fee_cap_wei")? {
+            ep.max_fee_cap_wei = u128::from(x);
+        }
+        if let Some(x) = opt("priority_fee_wei")? {
+            ep.priority_fee_wei = u128::from(x);
+        }
+        if let Some(x) = opt("gas_limit_pct")? {
+            ep.gas_limit_pct = x;
+        }
+        chains.push(ep);
+    }
+    Ok(chains)
+}
+
+#[cfg(all(test, feature = "submit-http"))]
+mod relayer_chain_config_tests {
+    use super::parse_relayer_chains;
+
+    fn parse(json: &str) -> Result<usize, String> {
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        parse_relayer_chains(v.as_array().unwrap()).map(|c| c.len())
+    }
+
+    #[test]
+    fn unknown_keys_and_malformed_fee_settings_are_refused() {
+        assert_eq!(parse(r#"[{"chain_id":1,"rpc_url":"x","max_fee_cap_wei":100}]"#), Ok(1));
+        assert!(parse(r#"[{"chain_id":1,"rpc_url":"x","max_fee_cap":100}]"#).unwrap_err().contains("unknown key `max_fee_cap`"));
+        assert!(parse(r#"[{"chain_id":1,"rpc_url":"x","max_fee_cap_wei":"100"}]"#).unwrap_err().contains("max_fee_cap_wei"));
+        assert!(parse(r#"[{"chain_id":1,"rpc_url":"x","gas_limit_pct":-5}]"#).unwrap_err().contains("gas_limit_pct"));
+        assert!(parse(r#"[{"chain_id":1}]"#).unwrap_err().contains("rpc_url"));
     }
 }
