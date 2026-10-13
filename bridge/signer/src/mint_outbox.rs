@@ -12,10 +12,10 @@
 //! contract's `processedDeposits` says it landed.
 //!
 //! Re-delivering a mint can never pay twice: the contract refuses a deposit it has already
-//! minted, permanently (unlike the native side, whose release replay guard forgets after a
-//! window). So retries need no safety cut-off. They do stop eventually, because a payload
-//! signed by a key that has since been rotated out can never mint, and retrying it forever
-//! would only hide that a person has to re-sign it.
+//! minted, permanently. So retries need no safety cut-off. They do stop eventually, because
+//! a payload signed by a key that has since been rotated out can never mint, and retrying
+//! it forever would only hide that a person has to re-sign it. A given-up mint is moved to
+//! [`GAVE_UP_SUBDIR`], kept for that person, and out of the set the sweep re-reads.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -164,6 +164,26 @@ pub fn remove(dir: &str, rec: &MintRecord) {
     let _ = std::fs::remove_file(path_for(dir, rec.chain_id, &rec.beldex_txid, rec.output_index));
 }
 
+/// Where given-up mints are kept, under the outbox directory. They wait for a person (a
+/// payload signed by a rotated-out key has to be re-signed), so they are never deleted,
+/// but they are out of the working set: the sweep reads the outbox every minute and
+/// would otherwise re-read every mint ever given up, for good.
+pub const GAVE_UP_SUBDIR: &str = "gave-up";
+
+/// Move a given-up mint out of the working set into [`GAVE_UP_SUBDIR`]. Written there
+/// before it is removed here, so a crash between the two leaves a copy, never none.
+pub fn archive(dir: &str, rec: &MintRecord) -> Result<PathBuf, String> {
+    let archived_dir = Path::new(dir).join(GAVE_UP_SUBDIR);
+    let archived = save(archived_dir.to_str().ok_or("outbox path is not utf-8")?, rec)?;
+    remove(dir, rec);
+    Ok(archived)
+}
+
+/// Every given-up mint, oldest first.
+pub fn load_archived(dir: &str) -> Vec<(PathBuf, MintRecord)> {
+    Path::new(dir).join(GAVE_UP_SUBDIR).to_str().map(load_all).unwrap_or_default()
+}
+
 /// Every mint still outstanding, oldest first.
 pub fn load_all(dir: &str) -> Vec<(PathBuf, MintRecord)> {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -301,6 +321,23 @@ mod tests {
         });
         assert!(errs.is_empty(), "concurrent saves failed: {errs:?}");
         assert_eq!(load_all(&dir).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A given-up mint leaves the working set the sweep reads, and is kept, not deleted.
+    #[test]
+    fn a_given_up_mint_is_kept_out_of_the_working_set() {
+        let dir = std::env::temp_dir().join(format!("bx-mint-archive-{}", std::process::id()));
+        let dir = dir.to_str().unwrap().to_string();
+        let mut r = rec(1000);
+        save(&dir, &r).unwrap();
+        r.gave_up = true;
+        let archived = archive(&dir, &r).unwrap();
+        assert!(load_all(&dir).is_empty(), "the sweep no longer reads it");
+        let kept = load_archived(&dir);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].1, r, "every field kept for the person who re-signs it");
+        assert!(archived.starts_with(std::path::Path::new(&dir).join(GAVE_UP_SUBDIR)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

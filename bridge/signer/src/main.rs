@@ -2604,7 +2604,12 @@ where
             use beldex_bridge_signer::mint_outbox as outbox;
             let now = beldex_bridge_signer::release_outbox::now_secs();
             for (_, mut rec) in outbox::load_all(&mint_outbox_for_sweep) {
-                if rec.gave_up || !rec.due(now) {
+                // Given up by an earlier run: move it out of the working set.
+                if rec.gave_up {
+                    let _ = outbox::archive(&mint_outbox_for_sweep, &rec);
+                    continue;
+                }
+                if !rec.due(now) {
                     continue;
                 }
                 let Some(beldex_txid) = config::parse_hex32(&rec.beldex_txid) else {
@@ -2633,7 +2638,9 @@ where
                 }
                 if rec.should_give_up(now) {
                     rec.gave_up = true;
-                    let _ = outbox::save(&mint_outbox_for_sweep, &rec);
+                    let kept = outbox::archive(&mint_outbox_for_sweep, &rec)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|e| format!("{mint_outbox_for_sweep} (could not move it: {e})"));
                     eprintln!(
                         "!! MINT UNDELIVERED after {} days — chain {} deposit {} output {}\n   \
                          payload kept in {}; NOT re-delivering further. If the wBDX signer \
@@ -2643,7 +2650,7 @@ where
                         rec.chain_id,
                         rec.beldex_txid,
                         rec.output_index,
-                        mint_outbox_for_sweep
+                        kept
                     );
                     continue;
                 }
@@ -2828,6 +2835,22 @@ where
                 src.beldex.finalized_up_to(),
                 evm.join("; ")
             );
+            // What waits on disk, so growth is visible before it is a problem: mints being
+            // re-delivered, mints given up (each waits for a person), releases being re-sent.
+            {
+                use beldex_bridge_signer::{mint_outbox, release_outbox};
+                let now = release_outbox::now_secs();
+                let releases = release_outbox::load_all(&outbox_dir_for_sweep);
+                let stale = releases.iter().filter(|(_, r)| r.is_stale(now)).count();
+                let given_up = mint_outbox::load_archived(&mint_outbox_for_sweep).len();
+                println!(
+                    "outboxes: mints {} re-delivering, {given_up} given up (in {}/{}) | releases {} re-sending ({stale} stale)",
+                    mint_outbox::load_all(&mint_outbox_for_sweep).len(),
+                    mint_outbox_for_sweep,
+                    mint_outbox::GAVE_UP_SUBDIR,
+                    releases.len(),
+                );
+            }
         }
         ticks += 1;
         if opts.max_ticks.is_some_and(|max| ticks >= max) {
@@ -2887,6 +2910,34 @@ fn main() -> ExitCode {
                      re-signed, and consensus refuses a second payout for the same burn for ever.\n\
                      The signers keep re-sending these until they land; one still here long\n\
                      after its burn usually means the gateway inputs it spends are gone."
+                );
+            }
+            // Mints the signer stopped re-delivering: each needs a person.
+            use beldex_bridge_signer::mint_outbox;
+            let mdir = std::env::var("BRIDGE_SIGNER_MINT_OUTBOX")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "mints".to_string());
+            let given_up = mint_outbox::load_archived(&mdir);
+            if given_up.is_empty() {
+                println!("no given-up mints in {mdir}/{}", mint_outbox::GAVE_UP_SUBDIR);
+            } else {
+                println!("\n{} given-up mint(s) in {mdir}/{}:\n", given_up.len(), mint_outbox::GAVE_UP_SUBDIR);
+                for (path, r) in &given_up {
+                    println!(
+                        "  deposit {} output {} -> chain {}\n    waiting   {}d ({} attempts)\n    file      {}\n",
+                        r.beldex_txid,
+                        r.output_index,
+                        r.chain_id,
+                        r.age_secs(now) / 86_400,
+                        r.attempts,
+                        path.display()
+                    );
+                }
+                println!(
+                    "These were not minted within {} days of re-delivery. If the wBDX signer has rotated\n\
+                     since, the payload can never mint: the deposit needs a fresh signature.",
+                    mint_outbox::GIVE_UP_AFTER_SECS / 86_400
                 );
             }
         return ExitCode::SUCCESS;
