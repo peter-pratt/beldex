@@ -259,10 +259,13 @@ fi
 
 # The settings this fleet runs with, so a restart (rotate-ceremony.sh, after it promotes the
 # share trees) brings it back exactly as configured, relay hook and ack wallet included.
+# The caps and the implementation pin are kept too: without the pin, a restart would read
+# whatever the proxy runs now and pin that, accepting an upgrade nobody reviewed.
 {
   for v in GATEWAY_ID VIEW_SECRET RELEASE_GATEWAY WBDX EVM_RPC CHAIN_ID NODES THRESHOLD \
            RELEASE_FEE RELAY_CMD RELAY_NODES RELAY_STAGGER_MS START_HEIGHT POLL_SECS \
-           BELDEX_CONFIRMATIONS SIGN_SIGNERS EVM_START_BLOCK; do
+           BELDEX_CONFIRMATIONS SIGN_SIGNERS EVM_START_BLOCK \
+           PER_TX_MAX WINDOW_MINT_CAP WBDX_IMPLEMENTATION WBDX_IMPLEMENTATION_CODEHASH; do
     printf '%s=%q\n' "$v" "${!v}"
   done
   printf 'ACK_WALLET_RPC=%q\nMESH_PORT_BASE=%q\nSHARE_SUBDIR=%q\nSTAGE_TIMEOUT_TICKS=%q\n' \
