@@ -121,6 +121,9 @@ pub mod execution_ledger;
 /// slashable bond, checked by every signer (H-06). std-only core; readers need
 /// `evm-watcher`.
 pub mod solvency;
+/// **Watcher cursors** — how far each chain has been fully handled, saved so a restart
+/// resumes there instead of rescanning from the start. std-only.
+pub mod watch_cursor;
 /// **Mint outbox** — each signed mint payload, kept on disk until `processedDeposits` shows
 /// it minted, so a missed hand-off is re-delivered instead of stranding the deposit.
 /// std-only.

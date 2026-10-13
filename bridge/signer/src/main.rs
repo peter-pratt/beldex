@@ -2262,6 +2262,77 @@ where
         .unwrap_or(60);
     let solvency_ticks = std::cmp::max(1, solvency_secs / poll_secs.max(1));
 
+    // --- H-04: resume each chain where it was fully handled --------------------------
+    // A cursor is trusted only if the chain still has the block it names (see watch_cursor).
+    // Without one, or with one that does not match, the watchers start from their
+    // configured heights, as before.
+    let cursor_dir: Option<std::path::PathBuf> = match std::env::var("BRIDGE_SIGNER_WATCH_CURSOR_DIR") {
+        Ok(v) if v.trim() == "off" => None,
+        Ok(v) if !v.trim().is_empty() => Some(v.trim().into()),
+        _ => Some("watch-cursors".into()),
+    };
+    let beldex_identity = format!("beldex gateway {gateway_id}");
+    let evm_identity = |c: &beldex_bridge_signer::evm_watcher::EvmChainConfig| {
+        format!("evm chain {} contract {}", c.chain_id, hex(&c.contract))
+    };
+    let mut beldex_saved: u64 = 0;
+    let mut evm_saved: BTreeMap<u64, u64> = BTreeMap::new();
+    match &cursor_dir {
+        None => println!("  watch cursors: OFF (every restart rescans from the configured start)"),
+        Some(dir) => {
+            use beldex_bridge_signer::watch_cursor;
+            println!("  watch cursors kept in: {}", dir.display());
+            match watch_cursor::load(dir, "beldex", &beldex_identity) {
+                Ok(Some(c)) => match src.beldex.block_hash(c.height) {
+                    Ok(h) if h == c.hash => {
+                        src.beldex.resume_after(c.height);
+                        beldex_saved = c.height;
+                        println!("  beldex watcher: resuming after height {} (saved cursor)", c.height);
+                    }
+                    Ok(_) => println!(
+                        "  beldex watcher: the saved cursor names a block this chain does not have at {}; \
+                         scanning from the configured start",
+                        c.height
+                    ),
+                    Err(e) => println!(
+                        "  beldex watcher: could not check the saved cursor ({e:?}); scanning from the configured start"
+                    ),
+                },
+                Ok(None) => {}
+                Err(e) => eprintln!("  beldex watcher: ignoring the saved cursor: {e}"),
+            }
+            for (w, c) in src.evm.iter_mut().zip(configs) {
+                match watch_cursor::load(dir, &format!("evm-{}", c.chain_id), &evm_identity(c)) {
+                    Ok(Some(cur)) => match w.block_hash(cur.height) {
+                        Ok(Some(h)) if h == cur.hash => {
+                            w.resume_from(cur.height + 1);
+                            evm_saved.insert(c.chain_id, cur.height);
+                            println!("  evm chain {}: resuming after block {} (saved cursor)", c.chain_id, cur.height);
+                        }
+                        Ok(_) => println!(
+                            "  evm chain {}: the saved cursor names a block this chain does not have at {}; \
+                             scanning from the configured start",
+                            c.chain_id, cur.height
+                        ),
+                        Err(e) => println!(
+                            "  evm chain {}: could not check the saved cursor ({e:?}); scanning from the configured start",
+                            c.chain_id
+                        ),
+                    },
+                    Ok(None) => {}
+                    Err(e) => eprintln!("  evm chain {}: ignoring the saved cursor: {e}", c.chain_id),
+                }
+            }
+        }
+    }
+    // Duties whose first reconcile could not be answered; asked again every tick (the
+    // watchers hand each event out only once).
+    let mut deferred: Vec<Duty> = Vec::new();
+    // The highest key epoch each chain's watcher has handed out as a rotation. A chain's
+    // cursor waits until L1 has acknowledged it: the acknowledgement is built from that
+    // event, which a restart past it would never see again.
+    let mut rotation_seen: BTreeMap<u64, u64> = BTreeMap::new();
+
     let mut ticks = 0u64;
     loop {
         // Re-read the committee about once a minute. A transport error is not a change —
@@ -2360,10 +2431,21 @@ where
         // Ingest the watchers (re-emission is safe — the orchestrator dedups, and a duty is
         // reconciled against chain state at most once per SIGHTING; the re-check above
         // covers duties that settle after they were queued).
+        if reconcile_on && !deferred.is_empty() {
+            let resolved = beldex_bridge_signer::reconcile::retry_undetermined(orch, &mut reconciler, &mut deferred);
+            if resolved > 0 {
+                println!("reconciled {resolved} duty(ies) the chain could not answer for earlier");
+            }
+        }
         let mut ingest = |orch: &mut beldex_bridge_signer::orchestrator::Orchestrator, d: Duty| {
             if reconcile_on {
-                if observe_reconciled(orch, &mut reconciler, d) == ObserveOutcome::AlreadySettled {
-                    println!("reconciled: duty already settled on-chain — not re-worked");
+                match observe_reconciled(orch, &mut reconciler, d.clone()) {
+                    ObserveOutcome::AlreadySettled => {
+                        println!("reconciled: duty already settled on-chain — not re-worked")
+                    }
+                    // The watcher will not hand it out again: keep it and ask again.
+                    ObserveOutcome::Undetermined => deferred.push(d),
+                    _ => {}
                 }
             } else {
                 orch.observe(d);
@@ -2384,6 +2466,8 @@ where
         // Observe: a settled key change on any watched chain. Sign it and tell the mesh.
         if bus_genesis != [0u8; 32] {
             for r in src.poll_rotations() {
+                let seen = rotation_seen.entry(r.chain.0).or_insert(0);
+                *seen = (*seen).max(r.key_epoch);
                 // Already applied on L1 (seen again after a restart re-scanned the chain):
                 // nothing left to acknowledge.
                 if l1_observed.get(&r.chain.0).is_some_and(|have| *have >= r.key_epoch) {
@@ -2641,6 +2725,49 @@ where
                 let _ = rpc.borrow_mut().submit_transfer(&rec.tx_blob, &sig);
                 rec.attempts += 1;
                 let _ = outbox::save(&outbox_dir_for_sweep, &rec);
+            }
+        }
+
+        // Record how far each chain has been fully handled, about once a minute, when it
+        // has nothing unfinished (see watch_cursor for what that covers).
+        if let (Some(dir), true) = (&cursor_dir, ticks % reconcile_recheck_ticks == 0) {
+            use beldex_bridge_signer::watch_cursor::{self, Cursor};
+            let unfinished: Vec<&Duty> = orch.outstanding().into_iter().chain(deferred.iter()).collect();
+            let h = src.beldex.finalized_up_to();
+            if h > beldex_saved && mint_key_replaced.is_empty() && watch_cursor::mints_settled(unfinished.iter().copied()) {
+                match src.beldex.block_hash(h) {
+                    Ok(hash) => match watch_cursor::save(dir, "beldex", &beldex_identity, &Cursor { height: h, hash }) {
+                        Ok(()) => beldex_saved = h,
+                        Err(e) => eprintln!("  beldex cursor not saved: {e}"),
+                    },
+                    Err(e) => eprintln!("  beldex cursor not saved: block {h}: {e:?}"),
+                }
+            }
+            for (w, c) in src.evm.iter().zip(configs) {
+                let Some(h) = w.resume_point().checked_sub(1) else { continue };
+                let acked = rotation_seen
+                    .get(&c.chain_id)
+                    .is_none_or(|e| l1_observed.get(&c.chain_id).is_some_and(|o| o >= e));
+                if h <= evm_saved.get(&c.chain_id).copied().unwrap_or(0)
+                    || release_key_replaced
+                    || !acked
+                    || !watch_cursor::releases_settled(c.chain_id, unfinished.iter().copied())
+                {
+                    continue;
+                }
+                match w.block_hash(h) {
+                    Ok(Some(hash)) => {
+                        let name = format!("evm-{}", c.chain_id);
+                        match watch_cursor::save(dir, &name, &evm_identity(c), &Cursor { height: h, hash }) {
+                            Ok(()) => {
+                                evm_saved.insert(c.chain_id, h);
+                            }
+                            Err(e) => eprintln!("  evm chain {} cursor not saved: {e}", c.chain_id),
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => eprintln!("  evm chain {} cursor not saved: block {h}: {e:?}", c.chain_id),
+                }
             }
         }
 

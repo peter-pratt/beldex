@@ -68,6 +68,18 @@ pub fn observe_reconciled<R: DutyReconciler>(
     }
 }
 
+/// Retry duties whose first reconcile could not be answered.
+///
+/// A watcher hands each finalized event out once. When the reconciler cannot say whether
+/// it is settled (an RPC outage), [`observe_reconciled`] leaves it unregistered, and
+/// without this it was gone until a restart rescanned the chain. Each is asked again;
+/// those still undetermined stay in `deferred`. Returns how many were resolved.
+pub fn retry_undetermined<R: DutyReconciler>(orch: &mut Orchestrator, rec: &mut R, deferred: &mut Vec<Duty>) -> usize {
+    let before = deferred.len();
+    deferred.retain(|d| observe_reconciled(orch, rec, d.clone()) == ObserveOutcome::Undetermined);
+    before - deferred.len()
+}
+
 /// A reconciler that never claims knowledge — every duty is worked. The pre-reconciliation
 /// behavior, and the right choice when no chain query is configured.
 pub struct NoReconcile;
@@ -347,6 +359,24 @@ mod tests {
         assert_eq!(observe_reconciled(&mut orch, &mut rec, mint(2)), ObserveOutcome::Queued);
         assert_eq!(orch.status(&mint(2).key()), Some(DutyStatus::Pending));
         assert_eq!(orch.ready().len(), 1);
+    }
+
+    /// The watcher does not hand the event out again, so an undetermined duty is kept and
+    /// asked about until the chain answers; until then nothing is lost.
+    #[test]
+    fn an_undetermined_duty_is_kept_until_the_chain_answers() {
+        let mut orch = Orchestrator::new();
+        let mut rec = Scripted { answer: None, calls: 0 };
+        let mut deferred = Vec::new();
+        if observe_reconciled(&mut orch, &mut rec, mint(7)) == ObserveOutcome::Undetermined {
+            deferred.push(mint(7));
+        }
+        assert_eq!(retry_undetermined(&mut orch, &mut rec, &mut deferred), 0);
+        assert_eq!(deferred.len(), 1, "the outage continues: still kept");
+        rec.answer = Some(false);
+        assert_eq!(retry_undetermined(&mut orch, &mut rec, &mut deferred), 1);
+        assert!(deferred.is_empty());
+        assert_eq!(orch.status(&mint(7).key()), Some(DutyStatus::Pending), "and now it is worked");
     }
 
     #[test]

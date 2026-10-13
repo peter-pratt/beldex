@@ -708,6 +708,33 @@ impl<C: JsonRpcClient> EvmWatcher<C> {
         self.chain
     }
 
+    /// The first block not yet fully handled: every event in a block below it has been
+    /// handed out finalized (or dropped by a reorg). The scan position alone is not that.
+    /// It runs ahead of burns and rotations still waiting on finality, which sit in the
+    /// trackers at their own inclusion heights, so the lowest of those caps it. A restart
+    /// may resume here and miss nothing.
+    pub fn resume_point(&self) -> u64 {
+        self.tracker
+            .pending()
+            .iter()
+            .map(|o| o.inclusion_height)
+            .chain(self.rotations.pending().iter().map(|o| o.inclusion_height))
+            .fold(self.next_scan, u64::min)
+    }
+
+    /// Resume scanning at `block`, skipping everything below it: the blocks a saved cursor
+    /// says were fully handled before a restart. Never moves the scan backwards.
+    pub fn resume_from(&mut self, block: u64) {
+        self.next_scan = self.next_scan.max(block);
+    }
+
+    /// The hash of the block at `height` on this endpoint's chain, if it has one. What a
+    /// saved cursor is checked against, so a cursor from another chain (a reset devnet
+    /// reuses contract addresses) or from before a reorg is never trusted.
+    pub fn block_hash(&self, height: u64) -> Result<Option<[u8; 32]>, RpcError> {
+        self.block_hash_at(height)
+    }
+
     pub fn pending_len(&self) -> usize {
         self.tracker.pending_len()
     }
@@ -1565,5 +1592,61 @@ mod tests {
         assert!(u.finalized.is_empty(), "reorged burn is never finalized");
         assert_eq!(u.dropped.len(), 1);
         assert_eq!(w.pending_len(), 0);
+    }
+
+    /// The resume point never passes an event still waiting on finality, even though the
+    /// scan has moved beyond it, and resuming there finds that event again.
+    #[test]
+    fn the_resume_point_waits_for_unsettled_events() {
+        let node = MockNode {
+            tip: Cell::new(105),
+            logs: RefCell::new(vec![burn_log(100, [0xAA; 32], [0x01; 32], 500, b"bx")]),
+            hashes: RefCell::new([(100u64, [0xAA; 32])].into_iter().collect()),
+            finalized: Cell::new(Some(90)),
+        };
+        let mut w = EvmWatcher::new(node, ChainId(1), [0x22; 20], 1, 50);
+        assert!(w.advance().unwrap().finalized.is_empty(), "block 100 is past the finalized 90");
+        assert_eq!(w.resume_point(), 91, "nothing at or below the finalized block is left");
+        w.client.finalized.set(Some(99));
+        w.client.tip.set(130);
+        assert!(w.advance().unwrap().finalized.is_empty());
+        assert_eq!(w.resume_point(), 100, "the burn at 100 is not settled yet");
+        // Even a scan position past it (it never moves back) does not carry the resume
+        // point past an event the tracker still holds.
+        w.next_scan = 125;
+        assert_eq!(w.resume_point(), 100);
+
+        // A watcher resumed at that point still finds and settles the burn.
+        let node = MockNode {
+            tip: Cell::new(130),
+            logs: RefCell::new(vec![burn_log(100, [0xAA; 32], [0x01; 32], 500, b"bx")]),
+            hashes: RefCell::new([(100u64, [0xAA; 32])].into_iter().collect()),
+            finalized: Cell::new(Some(120)),
+        };
+        let mut resumed = EvmWatcher::new(node, ChainId(1), [0x22; 20], 1, 50);
+        resumed.resume_from(100);
+        assert_eq!(resumed.advance().unwrap().finalized.len(), 1);
+        assert_eq!(resumed.resume_point(), 121, "everything up to the finalized block is handled");
+    }
+
+    /// Resuming skips the blocks a cursor says were handled, and never moves backwards.
+    #[test]
+    fn resuming_skips_handled_blocks_only() {
+        let node = MockNode {
+            tip: Cell::new(130),
+            logs: RefCell::new(vec![
+                burn_log(60, [0x60; 32], [0x01; 32], 500, b"bx"),
+                burn_log(110, [0x6E; 32], [0x02; 32], 700, b"bx"),
+            ]),
+            hashes: RefCell::new([(60u64, [0x60; 32]), (110u64, [0x6E; 32])].into_iter().collect()),
+            finalized: Cell::new(Some(120)),
+        };
+        let mut w = EvmWatcher::new(node, ChainId(1), [0x22; 20], 1, 50);
+        w.resume_from(100);
+        w.resume_from(70); // an older cursor cannot rewind it
+        let got = w.advance().unwrap().finalized;
+        assert_eq!(got.len(), 1, "the burn at 60 was handled before the restart");
+        assert_eq!(got[0].amount, 700);
+        assert_eq!(w.block_hash(110).unwrap(), Some([0x6E; 32]));
     }
 }

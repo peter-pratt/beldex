@@ -416,6 +416,25 @@ impl<C: BeldexRpc> BeldexWatcher<C> {
     pub fn finalized_up_to(&self) -> u64 {
         self.finalized_up_to
     }
+
+    /// Resume after `height`: every deposit at or below it was handled before a restart,
+    /// as a saved cursor records. Never moves the watcher backwards.
+    pub fn resume_after(&mut self, height: u64) {
+        self.finalized_up_to = self.finalized_up_to.max(height);
+    }
+
+    /// The hash of the block at `height`, which a saved cursor is checked against before
+    /// it is trusted: a cursor from another chain, or a fresh devnet, names a block that is
+    /// not there.
+    pub fn block_hash(&self, height: u64) -> Result<[u8; 32], RpcError> {
+        let v = self.client.call("get_block_header_by_height", json!({ "height": height }))?;
+        v.get("block_header")
+            .and_then(|h| h.get("hash"))
+            .and_then(Value::as_str)
+            .and_then(hex_to_bytes)
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            .ok_or_else(|| RpcError::BadResponse("get_block_header_by_height.block_header.hash".into()))
+    }
 }
 
 /// The real blocking HTTP JSON-RPC backend against the member's own `beldexd`
@@ -583,6 +602,10 @@ mod tests {
         fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
             match method {
                 "get_info" => Ok(json!({ "immutable_height": self.immutable.get() })),
+                "get_block_header_by_height" => {
+                    let h = params["height"].as_u64().unwrap();
+                    Ok(json!({ "block_header": { "hash": format!("{:064x}", h) } }))
+                }
                 "gateway_get_history" => {
                     let from = params.get("from_height").and_then(Value::as_u64).unwrap_or(0);
                     let hits: Vec<Value> = self
@@ -891,5 +914,26 @@ mod tests {
             }
             other => panic!("expected Mint, got {other:?}"),
         }
+    }
+
+    /// A watcher resumed after a height emits only the deposits above it, and the block
+    /// hash a cursor is checked against comes from the daemon.
+    #[test]
+    fn resuming_after_a_height_skips_the_deposits_at_or_below_it() {
+        let daemon = MockDaemon {
+            immutable: Cell::new(300),
+            events: vec![
+                deposit_event(150, [0x01; 32], 5, None),
+                deposit_event(250, [0x02; 32], 7, None),
+            ],
+            top: 300,
+        };
+        let mut w = BeldexWatcher::new(daemon, "gw", 0);
+        w.resume_after(200);
+        w.resume_after(100); // an older cursor cannot rewind it
+        let got = w.advance().unwrap();
+        assert_eq!(got.len(), 1, "the deposit at 150 was handled before the restart");
+        assert_eq!(got[0].height, 250);
+        assert_eq!(w.block_hash(200).unwrap()[31], 200u8);
     }
 }
