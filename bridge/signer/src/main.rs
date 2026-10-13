@@ -472,7 +472,7 @@ fn run_dkg(_cfg: &Config) -> Result<(), String> {
 
 /// Read a secret share file: it must be sealed under the share key (see
 /// [`beldex_bridge_signer::share_file`]); plaintext only on a test network that allows it.
-#[cfg(feature = "live-dkg")]
+#[cfg(any(feature = "live-dkg", feature = "live-pevm-dkg"))]
 fn read_secret_file(path: &str) -> Result<Vec<u8>, String> {
     beldex_bridge_signer::share_file::read_secret(std::path::Path::new(path))
 }
@@ -484,7 +484,7 @@ fn read_public_file(path: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Create a directory for secret material, owner-only.
-#[cfg(feature = "live-dkg")]
+#[cfg(any(feature = "live-dkg", feature = "live-pevm-dkg"))]
 fn create_secret_dir(dir: &str) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("create share dir {dir}: {e}"))?;
     #[cfg(unix)]
@@ -498,14 +498,14 @@ fn create_secret_dir(dir: &str) -> Result<(), String> {
 
 /// Write a secret share file, sealed under the share key and bound to its name. Refused
 /// when no key is configured, unless a test network allows plaintext.
-#[cfg(feature = "live-dkg")]
+#[cfg(any(feature = "live-dkg", feature = "live-pevm-dkg"))]
 fn write_secret_file(path: &str, bytes: &[u8]) -> Result<(), String> {
     beldex_bridge_signer::share_file::write_secret(std::path::Path::new(path), bytes)
 }
 
 /// Write public group-key material: readable (scripts compare it), owner-only, atomic.
 /// Members never trust it on its own; they check it against their sealed share.
-#[cfg(feature = "live-dkg")]
+#[cfg(any(feature = "live-dkg", feature = "live-pevm-dkg"))]
 fn write_public_file(path: &str, bytes: &[u8]) -> Result<(), String> {
     beldex_bridge_signer::share_file::write_public(std::path::Path::new(path), bytes)
 }
@@ -1669,6 +1669,10 @@ impl MintHandoff {
     }
 }
 
+// The live backend: coordinated signing over the mesh. Only built with `serve-live`, the
+// feature that brings the mesh, the live signers and the release builder it uses; without
+// it `serve` runs the dry-run backend and this is never called.
+#[cfg(feature = "serve-live")]
 fn run_serve_live<B, C>(
     cfg: &Config,
     src: &mut beldex_bridge_signer::service::WatcherEventSource<B, C>,
@@ -3081,6 +3085,7 @@ mod secret_file_tests {
     /// A burn naming an address the daemon cannot parse can never be paid, so retrying it
     /// forever only re-opens a session every few seconds for the life of the process. A
     /// daemon that is merely unreachable must still be retried.
+    #[cfg(feature = "serve-live")]
     #[test]
     fn only_a_rejected_request_gives_up_on_a_release() {
         use beldex_bridge_signer::coordinator::BuildError;

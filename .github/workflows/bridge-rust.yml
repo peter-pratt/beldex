@@ -1,0 +1,61 @@
+name: Bridge (Rust)
+
+# The bridge signer and relayer had no CI: nothing ran their tests on a change, and the
+# #[ignore]d ones (full cggmp21 MPC runs, real ZMQ sockets) ran only when someone remembered.
+#
+#   tests    every push / pull request that touches bridge/: the signer at its default
+#            features and with the live stack, and the relayer with all features.
+#   ignored  nightly and on demand: the ignored tests, via bridge/signer/run-ignored-tests.sh
+#            so CI and a developer run exactly the same set.
+
+on:
+  push:
+    paths: ["bridge/**", ".github/workflows/bridge-rust.yml"]
+  pull_request:
+    paths: ["bridge/**", ".github/workflows/bridge-rust.yml"]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tests:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native dependencies (libzmq with CURVE)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libzmq3-dev libsodium-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            bridge/signer
+            bridge/relayer
+      - name: Signer (default features)
+        working-directory: bridge/signer
+        run: cargo test
+      - name: Signer (live stack)
+        working-directory: bridge/signer
+        run: cargo test --features live-pevm-dkg,serve-live
+      - name: Relayer (all features)
+        working-directory: bridge/relayer
+        run: cargo test --all-features
+
+  ignored:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native dependencies (libzmq with CURVE)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libzmq3-dev libsodium-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bridge/signer
+      - name: Ignored signer tests (MPC, real sockets)
+        run: bridge/signer/run-ignored-tests.sh
