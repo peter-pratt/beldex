@@ -126,6 +126,16 @@ fn hex32(s: &str) -> Result<[u8; 32], String> {
     crate::config::parse_hex32(s).ok_or_else(|| "expected 32-byte hex".to_string())
 }
 
+/// A release amount as the native `u64` it is paid in. Refused, never wrapped: `as u64`
+/// would turn an amount above `u64::MAX` into a much smaller one and build a withdrawal for
+/// it. The release policy's per-transaction cap keeps real amounts far below this; the
+/// check here is what makes that cap not the only thing standing between a `u128` burn
+/// amount and a truncated payment.
+#[cfg(feature = "autonomy")]
+fn native_amount(amount: u128) -> Result<u64, String> {
+    u64::try_from(amount).map_err(|_| format!("release amount {amount} does not fit a native amount (u64)"))
+}
+
 #[cfg(feature = "autonomy")]
 impl HttpGatewayRpc {
     /// Build a bridge **release** withdrawal: `gateway_create_transfer` with the HF23
@@ -144,7 +154,7 @@ impl HttpGatewayRpc {
         let params = serde_json::json!({
             "source": source_gateway,
             "destinations": [dest_addr],
-            "amounts": [amount as u64],
+            "amounts": [native_amount(amount)?],
             "fee": fee,
             "ref_chain_id": ref_chain_id,
             "ref_evm_txid": hexs(ref_evm_txid),
@@ -264,6 +274,18 @@ fn decoded_payout_spendable(r: &serde_json::Value) -> Result<bool, String> {
 }
 
 #[cfg(all(test, feature = "autonomy"))]
+mod native_amount_tests {
+    #[test]
+    fn a_release_amount_past_u64_is_refused_not_wrapped() {
+        assert_eq!(super::native_amount(50_000_000_000_000), Ok(50_000_000_000_000));
+        assert_eq!(super::native_amount(u64::MAX as u128), Ok(u64::MAX));
+        // u64::MAX + 2 would wrap to 1 with `as u64`.
+        let e = super::native_amount(u64::MAX as u128 + 2).unwrap_err();
+        assert!(e.contains("does not fit"), "{e}");
+    }
+}
+
+#[cfg(all(test, feature = "autonomy"))]
 mod release_ref_tests {
     use super::{decoded_payout_spendable, decoded_release_ref};
     use crate::release_policy::ReleaseRef;
@@ -344,7 +366,7 @@ impl GatewayRpc for HttpGatewayRpc {
         let params = serde_json::json!({
             "source": source_gateway,
             "destinations": [dest_addr],
-            "amounts": [amount as u64],
+            "amounts": [native_amount(amount)?],
             "fee": fee,
         });
         let r = self.call("gateway_create_transfer", params)?;
