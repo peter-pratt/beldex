@@ -126,9 +126,27 @@ EVM_START_BLOCK="${EVM_START_BLOCK:-0}"
 # as bridge-contract/devnet/01-deploy.sh, so a deploy with other caps carries over.
 PER_TX_MAX="${PER_TX_MAX:-1000000000000}"          # 1,000 BDX
 WINDOW_MINT_CAP="${WINDOW_MINT_CAP:-10000000000000}" # 10,000 BDX / window
+# The contract code the signers sign for (M-05). wBDX is a UUPS proxy, and an upgrade
+# changes what a signature authorises, so each signer pins the implementation its operator
+# reviewed: the address in the proxy's EIP-1967 slot and the keccak256 of its code. A
+# signer with no pin refuses to start, and one whose proxy is upgraded stops signing.
+# In production each operator sets these from the audited deployment. On this devnet,
+# where the contract was deployed a minute ago by bootstrap-bridge.sh, they default to
+# what the proxy points at now; set WBDX_IMPLEMENTATION / WBDX_IMPLEMENTATION_CODEHASH to
+# pin something else (or to see a signer refuse a pin that does not match).
+if [ -z "${WBDX_IMPLEMENTATION:-}" ] || [ -z "${WBDX_IMPLEMENTATION_CODEHASH:-}" ]; then
+  [ -d "$HOME/.foundry/bin" ] && PATH="$HOME/.foundry/bin:$PATH"
+  command -v cast >/dev/null || { echo "!! cast (foundry) is needed to read the wBDX implementation pin; or set WBDX_IMPLEMENTATION and WBDX_IMPLEMENTATION_CODEHASH"; exit 1; }
+  slot="$(cast storage "$WBDX" 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc --rpc-url "$EVM_RPC")" \
+    || { echo "!! could not read the wBDX implementation slot from $EVM_RPC"; exit 1; }
+  WBDX_IMPLEMENTATION="${WBDX_IMPLEMENTATION:-0x${slot: -40}}"
+  WBDX_IMPLEMENTATION_CODEHASH="${WBDX_IMPLEMENTATION_CODEHASH:-$(cast keccak "$(cast code "$WBDX_IMPLEMENTATION" --rpc-url "$EVM_RPC")")}"
+fi
+echo "  wBDX implementation pin: $WBDX_IMPLEMENTATION (code $WBDX_IMPLEMENTATION_CODEHASH)"
 EVM_CHAINS=$(cat <<EOF
 [{"chain_id":${CHAIN_ID},"rpc":"${EVM_RPC}","contract":"${WBDX}","confirmations":1,
   "per_epoch_cap":"${WINDOW_MINT_CAP}","per_tx_max":"${PER_TX_MAX}",
+  "implementation":"${WBDX_IMPLEMENTATION}","implementation_codehash":"${WBDX_IMPLEMENTATION_CODEHASH}",
   "start_block":${EVM_START_BLOCK},"depth_only_finality":true}]
 EOF
 )

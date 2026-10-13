@@ -1781,8 +1781,9 @@ where
         .unwrap_or(GATEWAY_RELEASE_PER_TX_MAX)
         .min(GATEWAY_RELEASE_PER_TX_MAX);
 
-    // --- H-06: the economic invariants, from this node's own RPCs ----------------------
-    // Each contract must be the one configured (chain id, code, MINT_TAG, caps), the caps
+    // --- H-06 / M-05: the economic invariants, from this node's own RPCs ---------------
+    // Each contract must be the one configured (chain id, code, MINT_TAG, caps), its proxy
+    // must point at the implementation this node pinned, the caps
     // this signer, the contracts and consensus describe must agree, the caps on all chains
     // together must fit under the slashable bond, and the wBDX in circulation must be
     // backed by the gateway's balance. The first three are fatal here; supply above the
@@ -1803,7 +1804,12 @@ where
             configs.iter().map(|c| (c.chain_id, HttpJsonRpc::new(c.rpc_url.clone()), c.contract)).collect();
         let configured: Vec<ConfiguredCaps> = configs
             .iter()
-            .map(|c| ConfiguredCaps { chain_id: c.chain_id, per_tx_max: c.per_tx_max, per_epoch_cap: c.per_epoch_cap })
+            .map(|c| ConfiguredCaps {
+                chain_id: c.chain_id,
+                per_tx_max: c.per_tx_max,
+                per_epoch_cap: c.per_epoch_cap,
+                implementation: c.implementation,
+            })
             .collect();
         move || -> Result<(Vec<beldex_bridge_signer::solvency::Problem>, String), String> {
             // The balance before the supplies: see check_solvency.

@@ -766,7 +766,12 @@ pub struct EvmChainConfig {
     /// finalized block. Dev chains only (anvil); defaults to false, which requires the
     /// chain's own finality.
     pub depth_only_finality: bool,
+    /// The implementation the wBDX proxy must point at (M-05). `None` only parses: a
+    /// signer refuses to serve without one (see [`crate::solvency`]).
+    pub implementation: Option<ImplementationPin>,
 }
+
+pub use crate::solvency::ImplementationPin;
 
 impl EvmChainConfig {
     /// The registry row (E.3) for this chain.
@@ -821,6 +826,28 @@ pub fn parse_evm_chains(json: &str) -> Result<Vec<EvmChainConfig>, String> {
             Some(Value::Bool(b)) => *b,
             Some(_) => return Err(miss("depth_only_finality (true/false)")),
         };
+        // Both or neither: half a pin would read as pinned while checking half the code.
+        let implementation = match (row.get("implementation"), row.get("implementation_codehash")) {
+            (None, None) => None,
+            (Some(a), Some(h)) => {
+                let address = a
+                    .as_str()
+                    .and_then(hex_to_bytes)
+                    .and_then(|b| <[u8; 20]>::try_from(b).ok())
+                    .ok_or_else(|| miss("implementation (20-byte hex)"))?;
+                let code_hash = h
+                    .as_str()
+                    .and_then(hex_to_bytes)
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                    .ok_or_else(|| miss("implementation_codehash (32-byte hex)"))?;
+                Some(ImplementationPin { address, code_hash })
+            }
+            _ => {
+                return Err(format!(
+                    "chain[{i}]: `implementation` and `implementation_codehash` go together"
+                ))
+            }
+        };
 
         out.push(EvmChainConfig {
             chain_id,
@@ -831,6 +858,7 @@ pub fn parse_evm_chains(json: &str) -> Result<Vec<EvmChainConfig>, String> {
             per_epoch_cap,
             start_block,
             depth_only_finality,
+            implementation,
         });
     }
     Ok(out)
@@ -1493,6 +1521,30 @@ mod tests {
         ]"#;
         let cfgs = parse_evm_chains(dup).unwrap();
         assert!(build_registry(&cfgs).is_err());
+    }
+
+    #[test]
+    fn an_implementation_pin_is_both_fields_or_neither() {
+        let row = |extra: &str| {
+            format!(
+                r#"[{{"chain_id":1,"contract":"0x2222222222222222222222222222222222222222","confirmations":1,"rpc":"x","per_tx_max":"1","per_epoch_cap":"1"{extra}}}]"#
+            )
+        };
+        assert_eq!(parse_evm_chains(&row("")).unwrap()[0].implementation, None);
+        let pinned = parse_evm_chains(&row(&format!(
+            r#","implementation":"0x{}","implementation_codehash":"0x{}""#,
+            "ab".repeat(20),
+            "cd".repeat(32)
+        )))
+        .unwrap();
+        assert_eq!(
+            pinned[0].implementation,
+            Some(ImplementationPin { address: [0xAB; 20], code_hash: [0xCD; 32] })
+        );
+        let half = row(&format!(r#","implementation":"0x{}""#, "ab".repeat(20)));
+        assert!(parse_evm_chains(&half).unwrap_err().contains("go together"));
+        let short = row(&format!(r#","implementation":"0x{}","implementation_codehash":"0x12""#, "ab".repeat(20)));
+        assert!(parse_evm_chains(&short).unwrap_err().contains("implementation_codehash"));
     }
 
     #[test]

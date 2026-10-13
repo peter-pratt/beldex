@@ -33,6 +33,13 @@
 //! and consensus's disagree: its own pre-checks would then pass sessions the contract
 //! refuses, or the contract would accept burns consensus can never release.
 //!
+//! And it signs only for contract code it has pinned (M-05). wBDX sits behind a UUPS
+//! proxy: an upgrade changes what a mint signature authorises without changing the address
+//! the signer talks to. The proxy's EIP-1967 implementation slot, and the hash of the code
+//! there, must match the operator's pin; a signer without a pin does not start, and one
+//! whose contract is upgraded under it stops signing until its operator has reviewed the
+//! new code and pinned it.
+//!
 //! What a signer does with a problem is up to the caller: at startup a configuration
 //! problem is fatal. While serving, [`SolvencyGuard`] holds signing once a problem has
 //! been seen on [`SolvencyGuard::REQUIRED_STREAK`] checks in a row (a mint can land between
@@ -45,10 +52,26 @@ use std::fmt;
 /// depends on it.
 pub const WBDX_DECIMALS: u8 = 9;
 
+/// The contract code a signer has verified and agreed to sign for: the address the proxy's
+/// EIP-1967 implementation slot holds, and the keccak256 of that address's runtime code.
+///
+/// A signature authorises whatever the code behind the proxy does with it. An upgrade
+/// changes that without changing the proxy's address, so the signer pins the code itself
+/// and stops signing when it changes, until its operator has looked at the new code and
+/// pinned it. The address alone would do while code at an address cannot change; the hash
+/// is kept as well so a pin states exactly which code was reviewed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImplementationPin {
+    pub address: [u8; 20],
+    pub code_hash: [u8; 32],
+}
+
 /// One wBDX contract's figures, read from its chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainFigures {
     pub chain_id: u64,
+    /// What the proxy points at now.
+    pub implementation: ImplementationPin,
     pub total_supply: u128,
     pub window_mint_cap: u128,
     pub per_tx_max: u128,
@@ -74,6 +97,8 @@ pub struct ConfiguredCaps {
     pub chain_id: u64,
     pub per_tx_max: u128,
     pub per_epoch_cap: u128,
+    /// The implementation this signer agreed to sign for.
+    pub implementation: Option<ImplementationPin>,
 }
 
 /// A broken invariant or a disagreement.
@@ -93,6 +118,30 @@ pub enum Problem {
     CapMismatch { chain_id: u64, configured: (u128, u128), contract: (u128, u128) },
     /// A contract accepts burns up to a different maximum than consensus releases.
     NativeMaxMismatch { chain_id: u64, contract: u128, native: u128 },
+    /// No implementation pinned for a chain: the signer would sign for whatever code is
+    /// behind the proxy.
+    ImplementationUnpinned { chain_id: u64, found: ImplementationPin },
+    /// The proxy points at code other than the pinned implementation: it was upgraded.
+    ImplementationChanged { chain_id: u64, pinned: ImplementationPin, found: ImplementationPin },
+}
+
+impl Problem {
+    /// Whether one reading can show this problem without it being real. Only a shortfall
+    /// can: a mint may land between reading the balance and reading the supply. Everything
+    /// else is read from settled state, and a hold on it should not wait for a second look.
+    pub fn may_be_a_race(&self) -> bool {
+        matches!(self, Problem::Insolvent { .. })
+    }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+impl fmt::Display for ImplementationPin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "implementation 0x{} code hash 0x{}", hex(&self.address), hex(&self.code_hash))
+    }
 }
 
 impl fmt::Display for Problem {
@@ -125,6 +174,18 @@ impl fmt::Display for Problem {
                 f,
                 "chain {chain_id}: the contract accepts burns up to {contract} but consensus releases at most {native}"
             ),
+            Problem::ImplementationUnpinned { chain_id, found } => write!(
+                f,
+                "chain {chain_id}: no implementation pinned. The proxy points at {found}; review that code, \
+                 then set \"implementation\": \"0x{}\", \"implementation_codehash\": \"0x{}\" for this chain",
+                hex(&found.address),
+                hex(&found.code_hash)
+            ),
+            Problem::ImplementationChanged { chain_id, pinned, found } => write!(
+                f,
+                "chain {chain_id}: the wBDX proxy does not run the pinned code (it was upgraded, or the pin is \
+                 wrong): pinned {pinned}, found {found}. No signing until that code is reviewed and pinned"
+            ),
         }
     }
 }
@@ -151,6 +212,15 @@ pub fn check_configuration(
                 configured: (c.per_tx_max, c.per_epoch_cap),
                 contract: (f.per_tx_max, f.window_mint_cap),
             });
+        }
+        match c.implementation {
+            None => problems.push(Problem::ImplementationUnpinned { chain_id: f.chain_id, found: f.implementation }),
+            Some(pinned) if pinned != f.implementation => problems.push(Problem::ImplementationChanged {
+                chain_id: f.chain_id,
+                pinned,
+                found: f.implementation,
+            }),
+            Some(_) => {}
         }
         if f.native_release_max != native.native_per_tx_max {
             problems.push(Problem::NativeMaxMismatch {
@@ -194,7 +264,9 @@ pub enum Change {
 /// Holds signing while the invariants are broken.
 ///
 /// A mint or a release can land between reading the balance and reading the supplies,
-/// so one failed check is not proof; [`Self::REQUIRED_STREAK`] in a row are. A check that
+/// so one failed solvency check is not proof; [`Self::REQUIRED_STREAK`] in a row are. Any
+/// other problem (an upgraded implementation, caps that disagree) is read from settled
+/// state and holds at once. A check that
 /// passes clears the hold at once: the invariants hold again (governance burned the
 /// unbacked wBDX, lowered a cap, or the race resolved). A check that could not be made
 /// changes nothing either way.
@@ -224,7 +296,7 @@ impl SolvencyGuard {
         }
         self.streak = self.streak.saturating_add(1);
         let why = problems.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
-        if self.streak < Self::REQUIRED_STREAK {
+        if self.streak < Self::REQUIRED_STREAK && problems.iter().all(Problem::may_be_a_race) {
             return None;
         }
         let tripped = self.hold.is_none();
@@ -237,7 +309,7 @@ impl SolvencyGuard {
 /// signer's own daemon. Every signer reads its own; nothing here is taken from a peer.
 #[cfg(feature = "evm-watcher")]
 pub mod read {
-    use super::{ChainFigures, NativeFigures};
+    use super::{ChainFigures, ImplementationPin, NativeFigures};
     use crate::evm_watcher::JsonRpcClient;
     use serde_json::{json, Value};
 
@@ -247,6 +319,46 @@ pub mod read {
     const BOND_BACKING_CAP_LIMIT: &str = "0x8e801d1b";
     const NATIVE_RELEASE_MAX: &str = "0xbd0b3279";
     const DECIMALS: &str = "0x313ce567";
+    /// EIP-1967: `bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1)`.
+    pub const IMPLEMENTATION_SLOT: &str = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
+
+    fn hex_bytes(v: &Value, what: &str) -> Result<Vec<u8>, String> {
+        let s = v.as_str().and_then(|s| s.strip_prefix("0x")).ok_or_else(|| format!("{what}: not hex: {v}"))?;
+        if s.len() % 2 != 0 {
+            return Err(format!("{what}: odd-length hex"));
+        }
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| format!("{what}: {e}")))
+            .collect()
+    }
+
+    /// What the proxy at `contract` runs: the address in its EIP-1967 implementation slot,
+    /// and the keccak256 of the runtime code there.
+    pub fn implementation<C: JsonRpcClient>(client: &C, contract: &[u8; 20]) -> Result<ImplementationPin, String> {
+        use sha3::{Digest, Keccak256};
+        let to: String = contract.iter().map(|b| format!("{b:02x}")).collect();
+        let slot = client
+            .call("eth_getStorageAt", json!([format!("0x{to}"), IMPLEMENTATION_SLOT, "latest"]))
+            .map_err(|e| format!("implementation slot: {e:?}"))?;
+        let word = hex_bytes(&slot, "implementation slot")?;
+        if word.len() != 32 || word[..12].iter().any(|b| *b != 0) {
+            return Err(format!("implementation slot: not an address: {slot}"));
+        }
+        let address: [u8; 20] = word[12..].try_into().expect("length checked");
+        if address == [0; 20] {
+            return Err("implementation slot is empty: not an EIP-1967 proxy".into());
+        }
+        let impl_hex: String = address.iter().map(|b| format!("{b:02x}")).collect();
+        let code = client
+            .call("eth_getCode", json!([format!("0x{impl_hex}"), "latest"]))
+            .map_err(|e| format!("implementation code: {e:?}"))?;
+        let code = hex_bytes(&code, "implementation code")?;
+        if code.is_empty() {
+            return Err(format!("no code at the implementation 0x{impl_hex}"));
+        }
+        Ok(ImplementationPin { address, code_hash: Keccak256::digest(&code).into() })
+    }
 
     fn word<C: JsonRpcClient>(client: &C, contract: &[u8; 20], selector: &str, what: &str) -> Result<u128, String> {
         let to: String = contract.iter().map(|b| format!("{b:02x}")).collect();
@@ -271,6 +383,7 @@ pub mod read {
         let decimals = r(DECIMALS, "decimals")?;
         Ok(ChainFigures {
             chain_id,
+            implementation: implementation(client, contract).map_err(|e| format!("chain {chain_id}: {e}"))?,
             total_supply: r(TOTAL_SUPPLY, "totalSupply")?,
             window_mint_cap: r(WINDOW_MINT_CAP, "windowMintCap")?,
             per_tx_max: r(PER_TX_MAX, "perTxMax")?,
@@ -312,10 +425,12 @@ mod tests {
     use super::*;
 
     const BDX: u128 = 1_000_000_000;
+    const PIN: ImplementationPin = ImplementationPin { address: [0xA1; 20], code_hash: [0xC0; 32] };
 
     fn chain(id: u64, supply: u128) -> ChainFigures {
         ChainFigures {
             chain_id: id,
+            implementation: PIN,
             total_supply: supply,
             window_mint_cap: 10_000 * BDX,
             per_tx_max: 1_000 * BDX,
@@ -325,7 +440,7 @@ mod tests {
         }
     }
     fn configured(id: u64) -> ConfiguredCaps {
-        ConfiguredCaps { chain_id: id, per_tx_max: 1_000 * BDX, per_epoch_cap: 10_000 * BDX }
+        ConfiguredCaps { chain_id: id, per_tx_max: 1_000 * BDX, per_epoch_cap: 10_000 * BDX, implementation: Some(PIN) }
     }
     /// The devnet: threshold 4 of 100,000 BDX bonds.
     fn native(balance: u128) -> NativeFigures {
@@ -375,7 +490,7 @@ mod tests {
         let mut c = chain(1, 0);
         c.decimals = 18;
         c.native_release_max = 60_000 * BDX;
-        let cfg = ConfiguredCaps { chain_id: 1, per_tx_max: 2_000 * BDX, per_epoch_cap: 10_000 * BDX };
+        let cfg = ConfiguredCaps { chain_id: 1, per_tx_max: 2_000 * BDX, per_epoch_cap: 10_000 * BDX, implementation: Some(PIN) };
         let p = check_configuration(&[cfg, configured(7)], &[c], &native(0));
         assert_eq!(
             p,
@@ -390,6 +505,47 @@ mod tests {
                 Problem::MissingChain(7),
             ]
         );
+    }
+
+    #[test]
+    fn a_signer_signs_only_for_the_implementation_it_pinned() {
+        let n = native(0);
+        let mut unpinned = configured(1);
+        unpinned.implementation = None;
+        let p = check_configuration(&[unpinned], &[chain(1, 0)], &n);
+        assert_eq!(p, vec![Problem::ImplementationUnpinned { chain_id: 1, found: PIN }]);
+        let shown = p[0].to_string();
+        assert!(
+            shown.contains(&format!("\"implementation\": \"0x{}\"", "a1".repeat(20)))
+                && shown.contains(&format!("\"implementation_codehash\": \"0x{}\"", "c0".repeat(32))),
+            "the refusal says what to pin once the code is reviewed: {shown}"
+        );
+
+        // Upgraded under the signer: new address, or same address with other code.
+        for found in [
+            ImplementationPin { address: [0xB2; 20], ..PIN },
+            ImplementationPin { code_hash: [0xC1; 32], ..PIN },
+        ] {
+            let mut upgraded = chain(1, 0);
+            upgraded.implementation = found;
+            let p = check_configuration(&[configured(1)], &[upgraded], &n);
+            assert_eq!(p, vec![Problem::ImplementationChanged { chain_id: 1, pinned: PIN, found }]);
+        }
+    }
+
+    #[test]
+    fn an_upgrade_holds_signing_on_the_first_check() {
+        let upgraded = Problem::ImplementationChanged {
+            chain_id: 1,
+            pinned: PIN,
+            found: ImplementationPin { address: [0xB2; 20], ..PIN },
+        };
+        assert!(!upgraded.may_be_a_race());
+        let mut g = SolvencyGuard::new();
+        assert!(matches!(g.observe(std::slice::from_ref(&upgraded)), Some(Change::Tripped(why)) if why.contains("does not run the pinned code")));
+        // A shortfall alongside it does not soften that.
+        let mut g = SolvencyGuard::new();
+        assert!(g.observe(&[Problem::Insolvent { supply: 2, reserve: 1 }, upgraded]).is_some());
     }
 
     #[test]
@@ -428,9 +584,22 @@ mod tests {
     fn contract_figures_are_read_by_selector() {
         use crate::evm_watcher::{JsonRpcClient, RpcError};
         use serde_json::{json, Value};
+        use sha3::{Digest, Keccak256};
+        const CODE: &str = "0x6080604052";
         struct Fake;
         impl JsonRpcClient for Fake {
-            fn call(&self, _m: &str, p: Value) -> Result<Value, RpcError> {
+            fn call(&self, m: &str, p: Value) -> Result<Value, RpcError> {
+                match m {
+                    "eth_getStorageAt" => {
+                        assert_eq!(p[1], read::IMPLEMENTATION_SLOT);
+                        return Ok(json!(format!("0x{}{}", "00".repeat(12), "a1".repeat(20))));
+                    }
+                    "eth_getCode" => {
+                        assert_eq!(p[0], format!("0x{}", "a1".repeat(20)), "the code is read at the implementation");
+                        return Ok(json!(CODE));
+                    }
+                    _ => {}
+                }
                 let v: u128 = match p[0]["data"].as_str().unwrap() {
                     "0x18160ddd" => 7,
                     "0x466351f2" => 10,
@@ -448,6 +617,10 @@ mod tests {
             f,
             ChainFigures {
                 chain_id: 31337,
+                implementation: ImplementationPin {
+                    address: [0xA1; 20],
+                    code_hash: Keccak256::digest([0x60, 0x80, 0x60, 0x40, 0x52]).into(),
+                },
                 total_supply: 7,
                 window_mint_cap: 10,
                 per_tx_max: 1,
@@ -456,5 +629,19 @@ mod tests {
                 decimals: 9
             }
         );
+    }
+
+    #[cfg(feature = "evm-watcher")]
+    #[test]
+    fn a_contract_that_is_not_a_proxy_is_refused() {
+        use crate::evm_watcher::{JsonRpcClient, RpcError};
+        use serde_json::{json, Value};
+        struct NoProxy;
+        impl JsonRpcClient for NoProxy {
+            fn call(&self, _m: &str, _p: Value) -> Result<Value, RpcError> {
+                Ok(json!(format!("0x{}", "00".repeat(32))))
+            }
+        }
+        assert!(read::implementation(&NoProxy, &[1; 20]).unwrap_err().contains("not an EIP-1967 proxy"));
     }
 }
