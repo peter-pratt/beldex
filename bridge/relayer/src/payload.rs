@@ -82,6 +82,8 @@ pub enum PayloadError {
     BadHex(&'static str),
     BadLength(&'static str),
     BadAmount,
+    /// A numeric field outside the range it is carried in.
+    OutOfRange(&'static str),
     UnknownKind(String),
     Json(String),
 }
@@ -142,11 +144,15 @@ mod json {
                     let amount = get_str(&v, "amount")?
                         .parse::<u128>()
                         .map_err(|_| PayloadError::BadAmount)?;
-                    // Optional on the wire so an older producer still parses.
+                    // Required, and never truncated: it is part of the signed mint tuple and
+                    // the contract's replay key, so a missing or wrapped value would name a
+                    // different deposit output (and the signature would not verify for it).
                     let output_index = v
                         .get("output_index")
                         .and_then(Value::as_u64)
-                        .unwrap_or(0) as u32;
+                        .ok_or(PayloadError::MissingField("output_index"))?;
+                    let output_index =
+                        u32::try_from(output_index).map_err(|_| PayloadError::OutOfRange("output_index"))?;
                     Ok(RelayPayload::Mint {
                         contract, chain_id, to, amount, beldex_txid, output_index, sig,
                     })
@@ -264,5 +270,19 @@ mod tests {
             "11".repeat(19), "22".repeat(20), "cd".repeat(32)
         );
         assert_eq!(RelayPayload::from_json(&bad), Err(PayloadError::BadLength("contract")));
+
+        // output_index is required and must fit u32: never defaulted, never truncated.
+        let mint = |extra: &str| {
+            format!(
+                r#"{{"kind":"mint","contract":"{}","chain_id":1,"to":"{}","amount":"1","beldex_txid":"{}"{extra},"sig":"ab"}}"#,
+                "11".repeat(20), "22".repeat(20), "cd".repeat(32)
+            )
+        };
+        assert_eq!(RelayPayload::from_json(&mint("")), Err(PayloadError::MissingField("output_index")));
+        assert_eq!(
+            RelayPayload::from_json(&mint(r#","output_index":4294967297"#)),
+            Err(PayloadError::OutOfRange("output_index"))
+        );
+        assert!(RelayPayload::from_json(&mint(r#","output_index":3"#)).is_ok());
     }
 }

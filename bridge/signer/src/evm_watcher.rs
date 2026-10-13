@@ -72,6 +72,9 @@ pub enum DecodeError {
     WrongTopic,
     /// The log is from a contract other than this chain's wBDX.
     ForeignContract,
+    /// `logIndex` does not fit the `u32` the release ref carries. Truncating it would name
+    /// a different burn, so the log is refused instead.
+    LogIndexOutOfRange,
 }
 
 /// A minimal Ethereum JSON-RPC client. `call` returns the JSON-RPC **result** value
@@ -156,7 +159,8 @@ pub fn decode_redeem_log(
     let block_hash = hex_to_fixed32(field("blockHash")?).ok_or(DecodeError::BadHex)?;
     let evm_txid = hex_to_fixed32(field("transactionHash")?).ok_or(DecodeError::BadHex)?;
     // Which burn within the transaction — one tx may emit several RedeemToNative logs.
-    let log_index = hex_to_u64(field("logIndex")?).ok_or(DecodeError::BadHex)? as u32;
+    let log_index = u32::try_from(hex_to_u64(field("logIndex")?).ok_or(DecodeError::BadHex)?)
+        .map_err(|_| DecodeError::LogIndexOutOfRange)?;
 
     let data = hex_to_bytes(field("data")?).ok_or(DecodeError::BadHex)?;
     if data.len() < 96 {
@@ -988,6 +992,15 @@ mod tests {
 
     /// A log with no `logIndex` is refused rather than assumed to be index 0 — guessing
     /// would silently collide with a real burn at index 0.
+    #[test]
+    fn a_log_index_past_u32_is_rejected_not_truncated() {
+        // 2^32 + 1 would truncate to 1 and name another burn in the same transaction.
+        let l = burn_log_at(10, [0xBB; 32], [0xAA; 32], (1u64 << 32) + 1, 500, b"bx");
+        assert_eq!(decode_redeem_log(&l, ChainId(1), [0x22; 20]), Err(DecodeError::LogIndexOutOfRange));
+        let ok = burn_log_at(10, [0xBB; 32], [0xAA; 32], u32::MAX as u64, 500, b"bx");
+        assert_eq!(decode_redeem_log(&ok, ChainId(1), [0x22; 20]).unwrap().event.log_index, u32::MAX);
+    }
+
     #[test]
     fn burn_log_without_log_index_is_rejected() {
         let mut l = burn_log_at(10, [0xBB; 32], [0xAA; 32], 0, 500, b"bx");
