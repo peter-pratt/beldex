@@ -415,7 +415,23 @@ struct BridgeChain
   uint64_t         chain_id;   // real EIP-155 chain id
   network_type     nettype;    // Beldex network this chain is accepted on
   std::string_view name;
+  // The wBDX contract (40 hex chars, no 0x) whose rotation acknowledgements count on this
+  // chain. On MAINNET and TESTNET an ack is accepted only for this exact contract, so a
+  // chain stays closed to acks until its contract is deployed and pinned here. Empty = not
+  // pinned yet. (Local networks bind each chain to the first contract an ack names.)
+  std::string_view wbdx_contract = {};
 };
+
+// Whether this network takes the bridge's identities only from pins in this file: the
+// reserve gateway (master_node_list.cpp bridge_gateway_id) and each chain's wBDX contract
+// (BridgeChain::wbdx_contract). On a public network "the first one registered" would let
+// whoever registers first decide which gateway's owner changes count as committee
+// hand-overs, and so when departing members' bonds come back. Unpinned there means
+// nothing counts, which holds those bonds until the pins land; it never means first-come.
+constexpr bool bridge_requires_pins(network_type n)
+{
+  return n == network_type::MAINNET || n == network_type::TESTNET;
+}
 
 inline constexpr std::array SUPPORTED_BRIDGE_CHAINS = {
   BridgeChain{1,        MAINNET, "ethereum"},
@@ -448,6 +464,22 @@ inline constexpr std::array SUPPORTED_BRIDGE_CHAINS = {
 // Returns nullptr if the chain is not supported at all. Callers that need the
 // network check should compare the returned entry's `nettype` with their own,
 // so they can tell "unknown chain" apart from "wrong network for this chain".
+// A pinned contract is compared as lowercase hex, so a pin in any other form would never
+// match and would leave its chain closed to acks with nothing saying why. Refuse it at build.
+constexpr bool bridge_contract_pins_well_formed()
+{
+  for (const auto& c : SUPPORTED_BRIDGE_CHAINS)
+  {
+    if (c.wbdx_contract.empty()) continue;
+    if (c.wbdx_contract.size() != 40) return false;
+    for (char ch : c.wbdx_contract)
+      if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) return false;
+  }
+  return true;
+}
+static_assert(bridge_contract_pins_well_formed(),
+              "a BridgeChain::wbdx_contract pin must be 40 lowercase hex characters, without 0x");
+
 inline constexpr const BridgeChain* find_bridge_chain(uint64_t chain_id)
 {
   for (const auto& c : SUPPORTED_BRIDGE_CHAINS)

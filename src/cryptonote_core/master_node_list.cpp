@@ -2300,9 +2300,10 @@ namespace master_nodes
     // The bridge reserve gateway a network's bridge pays out of (hex gateway id). Anyone may
     // register a gateway carrying the bridge_reserve flag, so only THIS one's owner changes
     // count as the gateway's side of a committee rotation — the hand-over a departing seat's
-    // bond waits for. Empty = not pinned: the first bridge-reserve gateway registered on the
-    // chain is the one. That is fine on a local network; pin it before a public network's
-    // bridge launches, or whoever registers a flagged gateway first decides which one counts.
+    // bond waits for. Empty = not pinned. On a local network the first bridge-reserve
+    // gateway registered is then the one. On MAINNET and TESTNET (bridge_requires_pins) an
+    // unpinned gateway is never tracked: no owner change counts, so bonds that wait on the
+    // gateway stay locked until it is pinned here. Pin it before the bridge launches.
     std::string_view bridge_gateway_id(cryptonote::network_type nettype)
     {
       switch (nettype)
@@ -2428,11 +2429,11 @@ namespace master_nodes
     // hand-over to wait for: an empty baseline, and only the unbonding window gates it.
     if (!info.bridge_seat.seated)
       return true;
-    info.bridge_seat.serving_key_epoch = bridge_exit_baseline();
+    info.bridge_seat.serving_key_epoch = bridge_exit_baseline(nettype);
     return true;
   }
 
-  std::vector<bridge_chain_epoch> master_node_list::state_t::bridge_exit_baseline() const
+  std::vector<bridge_chain_epoch> master_node_list::state_t::bridge_exit_baseline(cryptonote::network_type nettype) const
   {
     std::vector<bridge_chain_epoch> baseline = observed_key_epoch;
     // The seat also holds a share of the NATIVE gateway owner key, and that share keeps
@@ -2441,8 +2442,10 @@ namespace master_nodes
     // live — the very thing the bond is there to prevent. Ensure the baseline carries a
     // gateway entry even when none has been observed yet, or `rotation_completed_for`,
     // which walks only the baseline, would never require it. (With no bridge
-    // gateway registered at all there is no gateway key to hold a share of.)
-    if (!bridge_gateway_owners.empty() &&
+    // gateway registered at all there is no gateway key to hold a share of. Except on a
+    // network that takes the gateway only from its pin: there an untracked gateway means
+    // "not pinned yet", not "none", and the bond must wait for its hand-over regardless.)
+    if ((!bridge_gateway_owners.empty() || cryptonote::bridge_requires_pins(nettype)) &&
         !chain_epoch_present(baseline, cryptonote::BRIDGE_GATEWAY_CHAIN_ID))
     {
       bridge_chain_epoch gw{};
@@ -2473,7 +2476,7 @@ namespace master_nodes
     // its key was retired, holds nothing live and stays on the window alone.
     std::vector<bridge_chain_epoch> baseline;
     if (bs.seated)
-      baseline = bs.requested_unbond_height != 0 ? bs.serving_key_epoch : bridge_exit_baseline();
+      baseline = bs.requested_unbond_height != 0 ? bs.serving_key_epoch : bridge_exit_baseline(nettype);
 
     bridge_departed_bond departed{};
     for (const auto &contribution : bs.bond_contributions)
@@ -2663,6 +2666,23 @@ namespace master_nodes
         reason = "chain " + std::to_string(ack.chain_id) + " is not a bridge chain on this network";
         return false;
       }
+      // On a public network the contract comes from the pin, never from the first ack: a
+      // chain with none pinned accepts no acks at all.
+      if (cryptonote::bridge_requires_pins(nettype))
+      {
+        if (chain->wbdx_contract.empty())
+        {
+          reason = "no wBDX contract is pinned for chain " + std::to_string(ack.chain_id) + " on this network";
+          return false;
+        }
+        if (oxenc::to_hex(ack.contract.begin(), ack.contract.end()) != chain->wbdx_contract)
+        {
+          reason = "ack names contract " + oxenc::to_hex(ack.contract.begin(), ack.contract.end())
+                   + " but chain " + std::to_string(ack.chain_id) + " is pinned to "
+                   + std::string{chain->wbdx_contract};
+          return false;
+        }
+      }
     }
     if (ack.chain_id == cryptonote::BRIDGE_GATEWAY_CHAIN_ID)
     {
@@ -2727,7 +2747,8 @@ namespace master_nodes
         // sight is its registration — nothing is handed over yet.
         const auto pinned = bridge_gateway_id(nettype);
         const bool is_the_bridge_gateway =
-            pinned.empty() ? bridge_gateway_owners.empty() : tools::type_to_hex(gateway_id) == pinned;
+            pinned.empty() ? !cryptonote::bridge_requires_pins(nettype) && bridge_gateway_owners.empty()
+                           : tools::type_to_hex(gateway_id) == pinned;
         if (desc.is_bridge_reserve() && is_the_bridge_gateway)
           bridge_gateway_owners.push_back(bridge_gateway_owner{gateway_id, owner_hash(desc.owner_key)});
         return;

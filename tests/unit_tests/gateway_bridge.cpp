@@ -948,8 +948,11 @@ TEST(GatewayBridgeRotation, an_ack_must_be_for_a_bridge_chain_of_this_network)
   tx_extra_bridge_rotation_ack ack{};
   ack.key_epoch = 2; ack.contract = addr20(0x22); ack.new_signer = addr20(0x11);
   std::string reason;
-  ack.chain_id = 56;    EXPECT_TRUE(st.check_bridge_rotation_ack(ack, network_type::MAINNET, reason)) << reason;
+  // A mainnet chain is on the list, but no contract is pinned for it yet: closed.
+  ack.chain_id = 56;    EXPECT_FALSE(st.check_bridge_rotation_ack(ack, network_type::MAINNET, reason));
+  EXPECT_NE(reason.find("no wBDX contract is pinned"), std::string::npos) << reason;
   ack.chain_id = 31337; EXPECT_FALSE(st.check_bridge_rotation_ack(ack, network_type::MAINNET, reason));
+  EXPECT_NE(reason.find("not a bridge chain"), std::string::npos) << reason;
   ack.chain_id = 31337; EXPECT_TRUE(st.check_bridge_rotation_ack(ack, network_type::DEVNET, reason)) << reason;
   ack.chain_id = 56;    EXPECT_FALSE(st.check_bridge_rotation_ack(ack, network_type::TESTNET, reason));
   ack.chain_id = 999999; EXPECT_FALSE(st.check_bridge_rotation_ack(ack, network_type::MAINNET, reason));
@@ -2025,4 +2028,63 @@ TEST(GatewayBridgeGovernanceApply, freeze_repoint_apply_and_rewind)
   ASSERT_TRUE(rewind_gateways_from_transactions(db, {rp}, h + 1, true, &reason)) << reason;
   ASSERT_TRUE(rewind_gateways_from_transactions(db, {fz}, h, true, &reason)) << reason;
   EXPECT_EQ(blob_of(gw, db), before) << "governance rewind must restore the byte-identical pre-bridge blob";
+}
+
+// On a public network the bridge's identities come only from pins. An unpinned reserve
+// gateway is never "the" gateway, however early it registers, so its owner changes count
+// for nothing; and a departing seat's bond still waits for a gateway hand-over, so the
+// bonds stay locked until the gateway is pinned rather than coming back early.
+TEST(GatewayBridgeRotation, a_public_network_takes_the_gateway_only_from_its_pin)
+{
+  static_assert(cryptonote::bridge_requires_pins(network_type::MAINNET));
+  static_assert(cryptonote::bridge_requires_pins(network_type::TESTNET));
+  static_assert(!cryptonote::bridge_requires_pins(network_type::DEVNET));
+  static_assert(!cryptonote::bridge_requires_pins(network_type::FAKECHAIN));
+
+  master_node_list::state_t cur(nullptr);
+  const crypto::public_key gw = rand_pubkey();
+  auto gateway_tx = [&](gateway_descriptor_op_type type, const crypto::public_key& owner) {
+    tx_extra_gateway_descriptor_operation op{};
+    op.op_type               = type;
+    op.address_id            = gw;
+    op.descriptor.version    = 1;
+    op.descriptor.owner_key  = owner;
+    op.descriptor.flags      = GATEWAY_FLAG_BRIDGE_RESERVE;
+    transaction tx{};
+    add_gateway_descriptor_operation_to_tx_extra(tx.extra, op);
+    return tx;
+  };
+
+  // Registered first, then its owner changed twice: on mainnet none of it counts.
+  EXPECT_FALSE(cur.process_bridge_gateway_owner_tx(network_type::MAINNET,
+                                                   gateway_tx(gateway_descriptor_op_type::register_address, rand_pubkey())));
+  EXPECT_FALSE(cur.process_bridge_gateway_owner_tx(network_type::MAINNET,
+                                                   gateway_tx(gateway_descriptor_op_type::update_address, rand_pubkey())));
+  EXPECT_FALSE(cur.process_bridge_gateway_owner_tx(network_type::MAINNET,
+                                                   gateway_tx(gateway_descriptor_op_type::update_address, rand_pubkey())));
+  EXPECT_TRUE(cur.bridge_gateway_owners.empty()) << "an unpinned gateway is never tracked on mainnet";
+  EXPECT_EQ(observed_epoch(cur, BRIDGE_GATEWAY_CHAIN_ID), 0u);
+
+  // And a seat leaving now must still wait for the gateway's hand-over.
+  const auto baseline = cur.bridge_exit_baseline(network_type::MAINNET);
+  EXPECT_TRUE(std::any_of(baseline.begin(), baseline.end(),
+                          [](const bridge_chain_epoch& e) { return e.chain_id == BRIDGE_GATEWAY_CHAIN_ID; }))
+      << "with no gateway tracked yet, the bond still waits on it";
+
+  // On a local network the same registration is tracked, as before.
+  master_node_list::state_t local(nullptr);
+  EXPECT_FALSE(local.process_bridge_gateway_owner_tx(NET_FC,
+                                                     gateway_tx(gateway_descriptor_op_type::register_address, rand_pubkey())));
+  EXPECT_EQ(local.bridge_gateway_owners.size(), 1u);
+  EXPECT_TRUE(local.process_bridge_gateway_owner_tx(NET_FC,
+                                                    gateway_tx(gateway_descriptor_op_type::update_address, rand_pubkey())));
+}
+
+// Every pin that exists has the form it is compared in.
+TEST(GatewayBridgeRotation, contract_pins_are_well_formed)
+{
+  static_assert(cryptonote::bridge_contract_pins_well_formed());
+  for (const auto& c : cryptonote::SUPPORTED_BRIDGE_CHAINS)
+    if (!c.wbdx_contract.empty())
+      EXPECT_EQ(c.wbdx_contract.size(), 40u) << c.name;
 }

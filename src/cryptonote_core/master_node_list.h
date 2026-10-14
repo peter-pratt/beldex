@@ -945,7 +945,7 @@ namespace master_nodes
       void finalize_bridge_unbonds(uint64_t block_height);
       // The per-chain baseline a departing SEATED member's bond waits on: two hand-overs past
       // where every wBDX chain and the bridge gateway stand now.
-      std::vector<bridge_chain_epoch> bridge_exit_baseline() const;
+      std::vector<bridge_chain_epoch> bridge_exit_baseline(cryptonote::network_type nettype) const;
       // Blacklist the bridge bond of a seat being deregistered: until its keys are retired
       // and the window has passed if it may still hold a share of a live key, and on the
       // window alone otherwise.
