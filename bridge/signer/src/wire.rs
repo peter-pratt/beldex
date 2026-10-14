@@ -356,6 +356,61 @@ pub fn note_barrier_send(f: &mut BarrierSendFailures, r: Result<(), MeshError>) 
     }
 }
 
+/// The most frames one peer may deliver into a single protocol run.
+///
+/// A run reads everything its peers send and keeps protocol frames until the protocol
+/// takes them, so a member that keeps sending (a bug, or on purpose) would grow the reader's
+/// memory without bound. A legitimate peer sends a few dozen protocol frames and at most a
+/// few hundred barrier HELLOs (one per ~150ms for up to 60s); this is about five times that.
+pub const MAX_FRAMES_PER_PEER_PER_RUN: u32 = 2048;
+
+/// A transport that drops a peer's frames once it has sent [`MAX_FRAMES_PER_PEER_PER_RUN`]
+/// in this run. Every MPC driver reads through one, so no peer can make a run hold more
+/// than that much of its traffic. The run then usually cannot finish;
+/// [`Budgeted::explain`] makes its error name the peer instead of reading as a timeout.
+pub struct Budgeted<'a, T: SessionTransport + ?Sized> {
+    inner: &'a mut T,
+    counts: std::collections::BTreeMap<u16, u32>,
+    flooder: Option<u16>,
+}
+
+impl<'a, T: SessionTransport + ?Sized> Budgeted<'a, T> {
+    pub fn new(inner: &'a mut T) -> Self {
+        Budgeted { inner, counts: std::collections::BTreeMap::new(), flooder: None }
+    }
+
+    /// The first peer that went over the budget, if any did.
+    pub fn flooder(&self) -> Option<u16> {
+        self.flooder
+    }
+}
+
+impl<T: SessionTransport + ?Sized> SessionTransport for Budgeted<'_, T> {
+    fn broadcast(&mut self, msg: &WireMsg) -> Result<(), MeshError> {
+        self.inner.broadcast(msg)
+    }
+    fn send_to(&mut self, peer: u16, msg: &WireMsg) -> Result<(), MeshError> {
+        self.inner.send_to(peer, msg)
+    }
+    fn poll(&mut self) -> Result<Option<WireMsg>, MeshError> {
+        loop {
+            let Some(w) = self.inner.poll()? else { return Ok(None) };
+            let n = self.counts.entry(w.from).or_insert(0);
+            *n = n.saturating_add(1);
+            if *n <= MAX_FRAMES_PER_PEER_PER_RUN {
+                return Ok(Some(w));
+            }
+            if self.flooder.is_none() {
+                eprintln!(
+                    "  mesh: peer {} sent more than {MAX_FRAMES_PER_PEER_PER_RUN} frames in one run; dropping the rest",
+                    w.from
+                );
+                self.flooder = Some(w.from);
+            }
+        }
+    }
+}
+
 /// How long [`deliver`] keeps re-sending to peers that missed a frame. A peer that cannot
 /// take a frame for this long is treated as gone: the run stops and names it, instead of
 /// waiting out its whole protocol timeout for a message that never left.
@@ -735,5 +790,32 @@ mod delivery_tests {
             f.describe(),
             "; HELLO not delivered to peer 4 (queue full), anyone (sign: no key) [41 failed sends]"
         );
+    }
+
+    /// A peer that keeps sending is cut off at the budget and named; the others' frames
+    /// keep flowing.
+    #[test]
+    fn a_flooding_peer_is_cut_off_at_the_budget_and_named() {
+        struct Inbox(std::collections::VecDeque<WireMsg>);
+        impl SessionTransport for Inbox {
+            fn broadcast(&mut self, _m: &WireMsg) -> Result<(), MeshError> { Ok(()) }
+            fn send_to(&mut self, _p: u16, _m: &WireMsg) -> Result<(), MeshError> { Ok(()) }
+            fn poll(&mut self) -> Result<Option<WireMsg>, MeshError> { Ok(self.0.pop_front()) }
+        }
+        let from = |p: u16| WireMsg { from: p, ..frame() };
+        let mut q = std::collections::VecDeque::new();
+        for _ in 0..MAX_FRAMES_PER_PEER_PER_RUN + 50 {
+            q.push_back(from(4));
+        }
+        q.push_back(from(1));
+        let mut inbox = Inbox(q);
+        let mut t = Budgeted::new(&mut inbox);
+        let mut got = std::collections::BTreeMap::<u16, u32>::new();
+        while let Some(w) = t.poll().unwrap() {
+            *got.entry(w.from).or_default() += 1;
+        }
+        assert_eq!(got.get(&4), Some(&MAX_FRAMES_PER_PEER_PER_RUN), "the flood stops at the budget");
+        assert_eq!(got.get(&1), Some(&1), "another peer's frame still arrives");
+        assert_eq!(t.flooder(), Some(4));
     }
 }

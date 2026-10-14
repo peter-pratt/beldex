@@ -38,7 +38,68 @@
 
 use crate::wire::{MeshError, SessionTransport, WireMsg};
 use crate::wire_auth::{AuthKeyBook, Ed25519, MsgSigner};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+/// The largest frame the listener accepts. Bigger ones make libzmq drop the connection
+/// before the frame is held in memory: without a limit, anyone able to connect could send
+/// one frame of any size and exhaust a signer's memory. The largest legitimate frame,
+/// measured, is a cggmp21 aux-info message of about 217 KB; this leaves ~19x headroom.
+pub const MAX_FRAME_BYTES: i64 = 4 * 1024 * 1024;
+
+/// Answers libzmq's ZAP requests for this mesh's CURVE listener: a client is let in only
+/// if its CURVE public key is one of the committee peers'. Without a ZAP handler a CURVE
+/// server accepts any client that knows its public key, and those keys are published by
+/// consensus, so anyone could connect and make the signer receive and check frames.
+struct ZapHandler {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ZapHandler {
+    /// Bind the context's ZAP endpoint and answer from `allowed`. Must run before the
+    /// listener binds, so no connection is ever accepted unchecked.
+    fn start(ctx: &zmq::Context, allowed: BTreeSet<[u8; 32]>) -> Result<ZapHandler, MeshError> {
+        let sock = ctx.socket(zmq::REP).map_err(|e| MeshError::Io(format!("zap socket: {e}")))?;
+        sock.set_rcvtimeo(200).map_err(|e| MeshError::Io(format!("zap rcvtimeo: {e}")))?;
+        sock.bind("inproc://zeromq.zap.01").map_err(|e| MeshError::Io(format!("zap bind: {e}")))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let thread = std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                let req = match sock.recv_multipart(0) {
+                    Ok(r) => r,
+                    Err(zmq::Error::EAGAIN) => continue,
+                    Err(_) => break,
+                };
+                let _ = sock.send_multipart(zap_reply(&req, &allowed), 0);
+            }
+        });
+        Ok(ZapHandler { stop, thread: Some(thread) })
+    }
+}
+
+impl Drop for ZapHandler {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// The ZAP reply to one request (RFC 27): `200` for a CURVE client whose key is in
+/// `allowed`, `400` for anything else.
+fn zap_reply(req: &[Vec<u8>], allowed: &BTreeSet<[u8; 32]>) -> Vec<Vec<u8>> {
+    // [version, request_id, domain, address, identity, mechanism, credentials...]
+    let request_id = req.get(1).cloned().unwrap_or_default();
+    let admitted = req.first().map(Vec::as_slice) == Some(b"1.0")
+        && req.get(5).map(Vec::as_slice) == Some(b"CURVE")
+        && req.get(6).and_then(|k| <[u8; 32]>::try_from(k.as_slice()).ok()).is_some_and(|k| allowed.contains(&k));
+    let (code, text): (&[u8], &[u8]) = if admitted { (b"200", b"OK") } else { (b"400", b"not a committee peer") };
+    vec![b"1.0".to_vec(), request_id, code.to_vec(), text.to_vec(), Vec::new(), Vec::new()]
+}
 
 /// A peer's address book entry, as read from `beldexd`'s masternode list /
 /// `bridge_get_seats`.
@@ -118,6 +179,9 @@ pub struct OmqMeshConfig {
 
 /// A curve-authenticated peer-to-peer session transport.
 pub struct OmqPeerTransport {
+    /// The CURVE allow-list's handler (CURVE only). Dropped, and its thread joined, with
+    /// the transport.
+    _zap: Option<ZapHandler>,
     _ctx: zmq::Context,
     listener: zmq::Socket,
     /// Outbound PUSH sockets keyed by peer committee index.
@@ -146,6 +210,14 @@ impl OmqPeerTransport {
     pub fn bind(cfg: &OmqMeshConfig) -> Result<OmqPeerTransport, MeshError> {
         let ctx = zmq::Context::new();
 
+        // With CURVE, only the committee peers' keys may connect (see ZapHandler). Started
+        // before the listener binds, so nothing is ever accepted unchecked.
+        let zap = if cfg.use_curve {
+            Some(ZapHandler::start(&ctx, cfg.peers.iter().map(|p| p.curve_pubkey).collect())?)
+        } else {
+            None
+        };
+
         // Inbound: PULL, curve server (if enabled), holding our secret. Peers PUSH to it.
         let listener = ctx
             .socket(zmq::PULL)
@@ -157,7 +229,13 @@ impl OmqPeerTransport {
             listener
                 .set_curve_secretkey(&cfg.self_curve_secret)
                 .map_err(|e| MeshError::Io(format!("curve_secretkey: {e}")))?;
+            listener
+                .set_zap_domain("beldex-bridge-mesh")
+                .map_err(|e| MeshError::Io(format!("zap_domain: {e}")))?;
         }
+        listener
+            .set_maxmsgsize(MAX_FRAME_BYTES)
+            .map_err(|e| MeshError::Io(format!("maxmsgsize: {e}")))?;
         listener
             .set_rcvtimeo(0) // non-blocking recv (poll semantics)
             .map_err(|e| MeshError::Io(format!("rcvtimeo: {e}")))?;
@@ -189,7 +267,7 @@ impl OmqPeerTransport {
             peers.insert(p.index, sock);
         }
 
-        Ok(OmqPeerTransport { _ctx: ctx, listener, peers, auth: None })
+        Ok(OmqPeerTransport { _zap: zap, _ctx: ctx, listener, peers, auth: None })
     }
 
     /// Serialize a message for the wire: signed frame (`canonical ‖ sig`) when
@@ -390,6 +468,80 @@ mod tests {
             got += 1;
         }
         assert_eq!(got, frames, "the live peer got every frame");
+    }
+
+    fn curve_node(index: u16, port: u16, keys: &zmq::CurveKeyPair, peers: Vec<PeerAddr>) -> OmqPeerTransport {
+        OmqPeerTransport::bind(&OmqMeshConfig {
+            self_index: index,
+            listen_endpoint: format!("tcp://127.0.0.1:{port}"),
+            use_curve: true,
+            self_curve_secret: keys.secret_key,
+            self_curve_public: keys.public_key,
+            peers,
+        })
+        .expect("bind")
+    }
+
+    /// With CURVE, the listener admits only committee peers' keys. A stranger that knows
+    /// the listener's public key (published by consensus) and holds a valid CURVE keypair
+    /// of its own gets nothing through; the peer does.
+    #[test]
+    #[ignore = "binds real ZMQ sockets on localhost; needs libzmq+libsodium"]
+    fn a_curve_client_outside_the_committee_cannot_deliver_frames() {
+        if zmq::CurveKeyPair::new().is_err() {
+            eprintln!("SKIP: linked libzmq has no CURVE support");
+            return;
+        }
+        let (a, b, stranger) = (zmq::CurveKeyPair::new().unwrap(), zmq::CurveKeyPair::new().unwrap(), zmq::CurveKeyPair::new().unwrap());
+        let ep = |p: u16| format!("tcp://127.0.0.1:{p}");
+        let peer = |index: u16, port: u16, k: &zmq::CurveKeyPair| PeerAddr {
+            index,
+            endpoint: ep(port),
+            curve_pubkey: k.public_key,
+            signer_ed25519: [0; 32],
+        };
+        // A's committee is just B.
+        let mut ta = curve_node(0, 55840, &a, vec![peer(1, 55841, &b)]);
+        let mut tb = curve_node(1, 55841, &b, vec![peer(0, 55840, &a)]);
+        // The stranger dials A with A's real public key pinned.
+        let mut ts = curve_node(2, 55842, &stranger, vec![peer(0, 55840, &a)]);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        for _ in 0..5 {
+            let _ = ts.broadcast(&wire(2, SessionMsg::Ack));
+            tb.broadcast(&wire(1, SessionMsg::Ack)).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let mut from = Vec::new();
+        while let Some(m) = poll_until(&mut ta) {
+            from.push(m.from);
+        }
+        assert!(from.contains(&1), "the committee peer's frames arrive");
+        assert!(!from.contains(&2), "the stranger's never do");
+    }
+
+    /// A frame over MAX_FRAME_BYTES is refused before it is held in memory, and the
+    /// sender's ordinary frames still get through afterwards.
+    #[test]
+    #[ignore = "binds real ZMQ sockets on localhost"]
+    fn a_frame_over_the_size_limit_is_never_delivered() {
+        let (mut ta, mut tb) = pair(55843, 55844, false);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let huge = wire(1, SessionMsg::Round(vec![7u8; MAX_FRAME_BYTES as usize + 1]));
+        let _ = tb.broadcast(&huge);
+        // libzmq drops the connection on the oversized frame and the PUSH side reconnects.
+        let mut got_small = false;
+        for _ in 0..40 {
+            let _ = tb.broadcast(&wire(1, SessionMsg::Ack));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            while let Ok(Some(m)) = ta.poll() {
+                assert!(!matches!(&m.body, SessionMsg::Round(b) if b.len() > MAX_FRAME_BYTES as usize), "the oversized frame was delivered");
+                got_small |= m.body == SessionMsg::Ack;
+            }
+            if got_small {
+                break;
+            }
+        }
+        assert!(got_small, "ordinary frames still arrive");
     }
 
     // Curve-authenticated — the production path. Skips (does not fail) if the

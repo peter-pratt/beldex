@@ -102,6 +102,16 @@ pub fn run_cggmp21_keygen_over_transport<T: SessionTransport>(
     transport: &mut T,
     timeout: Duration,
 ) -> Result<([u8; 33], Vec<u8>), DriverError> {
+    crate::dkg_driver::with_frame_budget(transport, |t| run_keygen_unbudgeted(committee, self_index, key_generation, t, timeout))
+}
+
+fn run_keygen_unbudgeted<T: SessionTransport>(
+    committee: &CommitteeView,
+    self_index: u16,
+    key_generation: u32,
+    transport: &mut T,
+    timeout: Duration,
+) -> Result<([u8; 33], Vec<u8>), DriverError> {
     let n = committee.members.len() as u16;
     let t = committee.threshold as u16;
     if (self_index as usize) >= committee.members.len() || !committee.can_sign() {

@@ -76,6 +76,27 @@ pub enum DriverError {
     Undelivered(String),
 }
 
+/// Run a driver over a [`crate::wire::Budgeted`] view of `transport`, and if a peer went
+/// over its frame budget, say so in the error rather than leaving a bare timeout.
+pub(crate) fn with_frame_budget<T, Out>(
+    transport: &mut T,
+    run: impl FnOnce(&mut crate::wire::Budgeted<'_, T>) -> Result<Out, DriverError>,
+) -> Result<Out, DriverError>
+where
+    T: SessionTransport + ?Sized,
+{
+    let mut budgeted = crate::wire::Budgeted::new(transport);
+    let result = run(&mut budgeted);
+    match (result, budgeted.flooder()) {
+        (Err(e), Some(peer)) => Err(DriverError::Protocol(format!(
+            "peer {peer} sent more than {} frames in this run and the rest were dropped; the run \
+             could not finish ({e:?})",
+            crate::wire::MAX_FRAMES_PER_PEER_PER_RUN
+        ))),
+        (r, _) => r,
+    }
+}
+
 /// Send one protocol frame that will not be sent again, or stop the run.
 ///
 /// Every MPC driver sends each round's frames exactly once, so a frame a peer never
@@ -445,6 +466,21 @@ where
 /// Shared driver loop: begin the ceremony, pump [`FrostDkgDriver`] steps over the
 /// transport until complete or `timeout` elapses, and return the finished driver.
 fn drive_to_completion<T, R>(
+    committee: &CommitteeView,
+    self_index: u16,
+    key_generation: u32,
+    transport: &mut T,
+    rng: &mut R,
+    timeout: Duration,
+) -> Result<FrostDkgDriver, DriverError>
+where
+    T: SessionTransport,
+    R: RngCore + CryptoRng,
+{
+    with_frame_budget(transport, |t| drive_unbudgeted(committee, self_index, key_generation, t, rng, timeout))
+}
+
+fn drive_unbudgeted<T, R>(
     committee: &CommitteeView,
     self_index: u16,
     key_generation: u32,
@@ -939,5 +975,33 @@ mod tests {
     #[ignore = "binds real ZMQ sockets on localhost"]
     fn dkg_over_real_plain_sockets() {
         socket_dkg_harness(false, 55920);
+    }
+
+    /// A run that fails after a peer went over its frame budget says which peer.
+    #[test]
+    fn a_failed_run_names_the_peer_that_flooded_it() {
+        struct Flood(u32);
+        impl SessionTransport for Flood {
+            fn broadcast(&mut self, _m: &WireMsg) -> Result<(), crate::wire::MeshError> { Ok(()) }
+            fn send_to(&mut self, _p: u16, _m: &WireMsg) -> Result<(), crate::wire::MeshError> { Ok(()) }
+            fn poll(&mut self) -> Result<Option<WireMsg>, crate::wire::MeshError> {
+                if self.0 == 0 { return Ok(None) }
+                self.0 -= 1;
+                Ok(Some(WireMsg { leg: Leg::Pgw, epoch: 2, payload_hash: [7; 32], attempt: 0, from: 3, body: SessionMsg::Ack }))
+            }
+        }
+        let mut t = Flood(crate::wire::MAX_FRAMES_PER_PEER_PER_RUN + 10);
+        let r: Result<(), DriverError> = with_frame_budget(&mut t, |b| {
+            while b.poll().unwrap().is_some() {}
+            Err(DriverError::Timeout)
+        });
+        match r {
+            Err(DriverError::Protocol(m)) => assert!(m.contains("peer 3 sent more than"), "{m}"),
+            other => panic!("expected the flooder named, got {other:?}"),
+        }
+        // Without a flood, the run's own error comes through unchanged.
+        let mut quiet = Flood(5);
+        let r: Result<(), DriverError> = with_frame_budget(&mut quiet, |_| Err(DriverError::Timeout));
+        assert_eq!(r, Err(DriverError::Timeout));
     }
 }

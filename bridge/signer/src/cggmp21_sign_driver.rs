@@ -191,6 +191,19 @@ pub fn run_cggmp21_sign_over_transport<T: SessionTransport>(
     transport: &mut T,
     timeout: Duration,
 ) -> Result<([u8; 64], [u8; 33]), DriverError> {
+    crate::dkg_driver::with_frame_budget(transport, |t| run_sign_unbudgeted(committee, self_index, signers, key_share_blob, preimage, attempt, t, timeout))
+}
+
+fn run_sign_unbudgeted<T: SessionTransport>(
+    committee: &CommitteeView,
+    self_index: u16,
+    signers: &[u16],
+    key_share_blob: &[u8],
+    preimage: &[u8],
+    attempt: u32,
+    transport: &mut T,
+    timeout: Duration,
+) -> Result<([u8; 64], [u8; 33]), DriverError> {
     if !committee.can_sign() || !signers.contains(&self_index) {
         return Err(DriverError::BadCommittee);
     }

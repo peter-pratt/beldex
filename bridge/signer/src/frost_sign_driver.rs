@@ -281,6 +281,25 @@ where
     T: SessionTransport,
     R: RngCore + CryptoRng,
 {
+    crate::dkg_driver::with_frame_budget(transport, |t| run_frost_sign_unbudgeted(committee, self_index, signers, key_package, pubkey_package, message, attempt, t, rng, timeout))
+}
+
+fn run_frost_sign_unbudgeted<T, R>(
+    committee: &CommitteeView,
+    self_index: u16,
+    signers: &[u16],
+    key_package: frost::keys::KeyPackage,
+    pubkey_package: frost::keys::PublicKeyPackage,
+    message: [u8; 32],
+    attempt: u32,
+    transport: &mut T,
+    rng: &mut R,
+    timeout: Duration,
+) -> Result<[u8; 64], DriverError>
+where
+    T: SessionTransport,
+    R: RngCore + CryptoRng,
+{
     let (mut driver, first) = FrostSignDriver::begin(
         committee,
         self_index,

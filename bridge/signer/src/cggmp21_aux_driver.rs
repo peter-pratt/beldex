@@ -109,6 +109,16 @@ pub fn run_cggmp21_aux_over_transport<T: SessionTransport>(
     transport: &mut T,
     timeout: Duration,
 ) -> Result<Vec<u8>, DriverError> {
+    crate::dkg_driver::with_frame_budget(transport, |t| run_aux_unbudgeted(committee, self_index, key_generation, t, timeout))
+}
+
+fn run_aux_unbudgeted<T: SessionTransport>(
+    committee: &CommitteeView,
+    self_index: u16,
+    key_generation: u32,
+    transport: &mut T,
+    timeout: Duration,
+) -> Result<Vec<u8>, DriverError> {
     let n = committee.members.len() as u16;
     if (self_index as usize) >= committee.members.len() || !committee.can_sign() {
         return Err(DriverError::BadCommittee);

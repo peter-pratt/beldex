@@ -2591,8 +2591,6 @@ dependencies = [
 [[package]]
 name = "zmq-sys"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e8351dc72494b4d7f5652a681c33634063bbad58046c1689e75270908fdc864"
 dependencies = [
  "libc",
  "system-deps",
