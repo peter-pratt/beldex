@@ -643,6 +643,12 @@ void omq_rpc::on_bridge_committee(oxenmq::Message& m)
       {"threshold", cryptonote::bridge_committee_threshold(nettype)},
       {"size", cryptonote::bridge_committee_size(nettype)},
       {"active", (q && !q->validators.empty())},
+      // Which network this is, so a signer can refuse its test-network-only settings
+      // anywhere but a devnet (bridge/signer network_policy).
+      {"nettype", nettype == cryptonote::network_type::MAINNET   ? "mainnet"
+                : nettype == cryptonote::network_type::TESTNET   ? "testnet"
+                : nettype == cryptonote::network_type::DEVNET    ? "devnet"
+                                                                  : "fakechain"},
   };
 
   m.send_reply(OMQ_OK, resp.dump());

@@ -124,6 +124,8 @@ pub mod solvency;
 /// **Watcher cursors** — how far each chain has been fully handled, saved so a restart
 /// resumes there instead of rescanning from the start. std-only.
 pub mod watch_cursor;
+/// **Network policy** — test-network-only settings refused on mainnet and testnet. std-only.
+pub mod network_policy;
 /// **Mint outbox** — each signed mint payload, kept on disk until `processedDeposits` shows
 /// it minted, so a missed hand-off is re-delivered instead of stranding the deposit.
 /// std-only.

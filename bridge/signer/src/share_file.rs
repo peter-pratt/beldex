@@ -148,6 +148,19 @@ pub fn find_key(
     Ok(None)
 }
 
+/// Whether the share key would come from `BRIDGE_SIGNER_SHARE_KEY` in the environment:
+/// set, with no key file and no systemd credential ahead of it. A test-network setting
+/// (see `network_policy`).
+pub fn key_comes_from_env() -> bool {
+    let file = std::env::var("BRIDGE_SIGNER_SHARE_KEY_FILE").ok().filter(|s| !s.trim().is_empty());
+    let cred = std::env::var("CREDENTIALS_DIRECTORY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .is_some_and(|d| Path::new(&d).join(CREDENTIAL_NAME).exists());
+    let env = std::env::var("BRIDGE_SIGNER_SHARE_KEY").ok().is_some_and(|h| !h.trim().is_empty());
+    file.is_none() && !cred && env
+}
+
 /// [`find_key`] from this process's configuration.
 pub fn configured_key(share_dir: Option<&Path>) -> Result<Option<ShareKey>, String> {
     let file = std::env::var("BRIDGE_SIGNER_SHARE_KEY_FILE").ok().filter(|s| !s.trim().is_empty());

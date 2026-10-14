@@ -85,6 +85,42 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The test-network-only settings this process is using (see `network_policy`): each is
+/// refused unless the daemon confirms a devnet.
+#[cfg(feature = "live-dkg")]
+fn test_network_settings() -> Vec<String> {
+    use beldex_bridge_signer::share_file;
+    let mut v = Vec::new();
+    if std::env::var("BRIDGE_SIGNER_MESH_USE_CURVE").is_ok_and(|x| x == "false" || x == "0") {
+        v.push("mesh CURVE disabled (BRIDGE_SIGNER_MESH_USE_CURVE)".to_string());
+    }
+    if share_file::plaintext_allowed() {
+        v.push("plaintext shares allowed (BRIDGE_SIGNER_ALLOW_PLAINTEXT_SHARES)".to_string());
+    }
+    if share_file::key_comes_from_env() {
+        v.push("share key read from the environment (BRIDGE_SIGNER_SHARE_KEY)".to_string());
+    }
+    v
+}
+
+/// Refuse `settings` unless this node's daemon says it is on a devnet or fakechain. Asks
+/// only when there is something to refuse.
+#[cfg(feature = "live-dkg")]
+fn enforce_network_policy(cfg: &Config, settings: &[String]) -> Result<(), String> {
+    use beldex_bridge_signer::network_policy;
+    use beldex_bridge_signer::omq_client::OmqCommitteeClient;
+    if settings.is_empty() {
+        return Ok(());
+    }
+    let reply = OmqCommitteeClient::new(cfg.oxenmq_endpoint.clone())
+        .fetch_committee_json(None)
+        .map_err(|e| format!("asking the daemon which network this is: {e}"))?;
+    let network = network_policy::network_of_committee_reply(&reply);
+    network_policy::enforce(network, settings)?;
+    println!("  test-network settings, allowed on {network:?}: {}", settings.join("; "));
+    Ok(())
+}
+
 /// `dkg` subcommand: fetch the live committee and run the `Pgw` FROST DKG across
 /// the authenticated mesh (C.2). Only built with `--features live-dkg`.
 #[cfg(feature = "live-dkg")]
@@ -93,6 +129,7 @@ fn run_dkg(cfg: &Config) -> Result<(), String> {
     use beldex_bridge_signer::ffi;
     use beldex_bridge_signer::omq_client::OmqCommitteeClient;
     use std::time::Duration;
+    enforce_network_policy(cfg, &test_network_settings())?;
 
     let env = |k: &str| std::env::var(k).map_err(|_| format!("missing env {k}"));
     let h32 = |s: &str, k: &str| config::parse_hex32(s).ok_or(format!("{k} must be 32-byte hex"));
@@ -553,6 +590,7 @@ fn run_sign(cfg: &Config) -> Result<(), String> {
     use beldex_bridge_signer::dkg_driver::live::{MeshIdentity, PeerTransportAddr};
     use beldex_bridge_signer::ffi;
     use std::time::Duration;
+    enforce_network_policy(cfg, &test_network_settings())?;
 
     // 1) Committee + self_index: the committee that holds the key in the share dir.
     let dir = std::env::var("BRIDGE_SIGNER_SHARE_DIR")
@@ -1703,6 +1741,16 @@ where
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::rc::Rc;
+
+    // Test-network settings: the signers' own, plus how this node settles each chain.
+    let mut settings = test_network_settings();
+    for c in configs.iter().filter(|c| c.depth_only_finality) {
+        settings.push(format!("chain {} settles burns on depth alone (depth_only_finality)", c.chain_id));
+    }
+    if std::env::var("BRIDGE_SIGNER_BELDEX_CONFIRMATIONS").is_ok_and(|v| !v.trim().is_empty()) {
+        settings.push("deposits settle on a confirmation count (BRIDGE_SIGNER_BELDEX_CONFIRMATIONS)".to_string());
+    }
+    enforce_network_policy(cfg, &settings)?;
 
     let ls = Rc::new(build_live_signers(cfg)?);
     let committee = ls.committee.clone();
