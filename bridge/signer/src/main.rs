@@ -800,7 +800,12 @@ fn sign_pevm(
     println!("  over digest : {}", hex(&digest32));
     println!("  wBDX signer : 0x{}", hex(&expected));
     match recovered {
-        Some(rec) => println!("  ecrecover   : VERIFIED (v={})", 27 + rec),
+        Some(rec) => {
+            println!("  ecrecover   : VERIFIED (v={})", 27 + rec);
+            // The 65 bytes a contract takes: the low-s form `rec` was found for (the raw s
+            // above may be the high one, which recovers another key with this v) and v.
+            println!("  eth signature: 0x{}{:02x}", hex(&k_sig.to_bytes()), 27 + rec);
+        }
         None => {
             println!("  ecrecover   : FAILED");
             return Err("the aggregated signature did not ecrecover to the wBDX signer".into());
