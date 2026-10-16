@@ -2331,3 +2331,45 @@ TEST(GatewayStandbyTakeover, a_standby_is_bound_to_the_owner_that_named_it)
   EXPECT_FALSE(validate_gateway_repoint_operation(db, NET_TO, transaction{}, rp, {}, reason));
   EXPECT_NE(reason.find("invalid standby"), std::string::npos) << reason;
 }
+
+// Governance's veto: freezing the gateway, or re-pointing it, ends a running takeover. A
+// frozen gateway refuses every update, but the takeover's clock used to keep running, so
+// it completed the moment the gateway was unfrozen.
+TEST(GatewayStandbyTakeover, a_freeze_or_repoint_cancels_a_running_takeover)
+{
+  MemGatewayDB db;
+  const OwnerKeys owner = new_owner_keys(), standby = new_owner_keys();
+  const crypto::public_key gw = seed_with_standby(db, owner, standby);
+  const uint64_t wait = gateway_standby_takeover_blocks(NET_TO);
+  std::string reason;
+
+  const auto begin = takeover_update(gw, current(db, gw), gateway_takeover_action::begin, standby);
+  ASSERT_TRUE(append_gateways_from_transactions(db, {begin}, 400, true, &reason)) << reason;
+  ASSERT_EQ(started(db, gw), 400u);
+  const std::string running = blob_of(gw, db);
+
+  const auto freeze = make_freeze_tx(gw, true, 0);
+  ASSERT_TRUE(append_gateways_from_transactions(db, {freeze}, 401, true, &reason)) << reason;
+  EXPECT_EQ(started(db, gw), 0u) << "the freeze ended it";
+  const auto unfreeze = make_freeze_tx(gw, false, 1);
+  ASSERT_TRUE(append_gateways_from_transactions(db, {unfreeze}, 402, true, &reason)) << reason;
+
+  // Unfrozen after the delay: nothing to complete.
+  db.chain_height = 400 + wait + 5;
+  gateway_descriptor_base taken = current(db, gw);
+  taken.owner_key = standby.pub; taken.has_standby = 0; taken.standby_owner = gateway_owner_key_v{};
+  EXPECT_FALSE(valid(db, takeover_update(gw, taken, gateway_takeover_action::complete, standby), reason));
+  EXPECT_NE(reason.find("no takeover"), std::string::npos) << reason;
+
+  // Rewinding the unfreeze and the freeze brings the running takeover back, byte for byte.
+  ASSERT_TRUE(rewind_gateways_from_transactions(db, {unfreeze}, 402, true, &reason)) << reason;
+  ASSERT_TRUE(rewind_gateways_from_transactions(db, {freeze}, 401, true, &reason)) << reason;
+  EXPECT_EQ(blob_of(gw, db), running);
+
+  // A re-point ends it too, and rewinds the same way.
+  const auto repoint = make_repoint_tx(gw, new_owner_keys().pub, 0);
+  ASSERT_TRUE(append_gateways_from_transactions(db, {repoint}, 403, true, &reason)) << reason;
+  EXPECT_EQ(started(db, gw), 0u);
+  ASSERT_TRUE(rewind_gateways_from_transactions(db, {repoint}, 403, true, &reason)) << reason;
+  EXPECT_EQ(blob_of(gw, db), running);
+}

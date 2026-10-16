@@ -2017,6 +2017,12 @@ namespace
         acct.descriptor_history.push_back(op.new_owner_descriptor);
         ++acct.governance_seq;
         if (acct.version < 1) acct.version = 1;
+        // Governance chose the owner: a running takeover ends here.
+        if (acct.takeover_started_height() != 0)
+        {
+          acct.takeover_log.push_back(gateway_takeover_entry{get_transaction_hash(tx), 0});
+          if (acct.version < 3) acct.version = 3;
+        }
       }
 
       // 1c) governance freeze/unfreeze (HF23): toggle the flag and bump the nonce.
@@ -2031,6 +2037,14 @@ namespace
         acct.frozen = (op.freeze != 0) ? 1 : 0;
         ++acct.governance_seq;
         if (acct.version < 1) acct.version = 1;
+        // A freeze is governance's veto of a running takeover. Without this the clock kept
+        // running while the gateway was frozen, and the takeover completed the moment it
+        // was unfrozen.
+        if (op.freeze != 0 && acct.takeover_started_height() != 0)
+        {
+          acct.takeover_log.push_back(gateway_takeover_entry{get_transaction_hash(tx), 0});
+          if (acct.version < 3) acct.version = 3;
+        }
       }
 
       // 2) deposits (tx_out_gateway): increase balance
@@ -2235,6 +2249,8 @@ bool rewind_gateways_from_transactions(BlockchainDB& db, const std::vector<trans
       }
       acct.frozen = (op.freeze != 0) ? 0 : 1;
       --acct.governance_seq;
+      if (!acct.takeover_log.empty() && acct.takeover_log.back().tx == tx_hash)
+        acct.takeover_log.pop_back();
     }
 
     // undo repoints: pop the appended descriptor and roll back the nonce.
@@ -2254,6 +2270,8 @@ bool rewind_gateways_from_transactions(BlockchainDB& db, const std::vector<trans
       }
       acct.descriptor_history.pop_back();
       --acct.governance_seq;
+      if (!acct.takeover_log.empty() && acct.takeover_log.back().tx == tx_hash)
+        acct.takeover_log.pop_back();
     }
 
     // undo descriptor ops (reverse order), popping the matching last descriptor
