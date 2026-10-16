@@ -449,6 +449,20 @@ impl Session {
     /// `t+1` subset remains).
     pub fn on_timeout(&mut self) -> Result<(), SessionError> {
         self.ensure_live()?;
+        // `threshold` ACKs are in, so the leader did drive its stage: what holds the round
+        // is a lower-indexed member that never answered (see `canonical_signers`). Excluding
+        // the leader would not help — the leader order is fixed per duty, so a requeue
+        // replays it and a silent member that is never picked blocks the duty for good.
+        // Exclude the silent members instead and retry under the same leader.
+        if self.acks.len() >= self.threshold && self.canonical_signers().is_none() {
+            let silent: Vec<usize> = (0..self.members.len())
+                .filter(|m| !self.acks.contains(m) && !self.nacks.contains(m) && !self.excluded.contains(m))
+                .collect();
+            if !silent.is_empty() {
+                self.retry_without(&silent);
+                return Ok(());
+            }
+        }
         self.retry();
         Ok(())
     }
@@ -489,6 +503,25 @@ impl Session {
             excluded: failed_leader,
         });
         self.leader = new_leader;
+        self.restart_attempt();
+    }
+
+    /// A failed attempt whose leader was live: exclude the members that stayed silent, keep
+    /// the leader, and restart at Consensus. Aborts if fewer than `t+1` members remain.
+    fn retry_without(&mut self, silent: &[usize]) {
+        self.excluded.extend(silent.iter().copied());
+        if self.eligible_count() < self.threshold {
+            self.stage = Stage::Aborted;
+            return;
+        }
+        self.id.attempt = self.id.attempt.wrapping_add(1);
+        for &m in silent {
+            self.transcript.push(TranscriptEntry::Retry { attempt: self.id.attempt, excluded: m });
+        }
+        self.restart_attempt();
+    }
+
+    fn restart_attempt(&mut self) {
         self.stage = Stage::Consensus;
         // Per-attempt tallies reset; exclusions and the transcript persist.
         self.acks.clear();
@@ -578,6 +611,37 @@ mod tests {
         s.exclude_for_test(0);
         assert_eq!(s.canonical_signers(), Some(vec![1, 2, 3, 4]),
                    "excluded member no longer blocks determination");
+    }
+
+    /// The stage timeout itself does that exclusion. A dead member below the prefix used
+    /// to be untouched by it (only the leader was excluded, and the leader order replays on
+    /// every requeue), so one lost holder at a low index stopped every duty.
+    #[test]
+    fn a_timeout_excludes_the_silent_member_and_keeps_the_live_leader() {
+        let mut s = start_session(6, 4);
+        let leader = s.leader();
+        let silent = (0..6).find(|&m| m != leader).unwrap();
+        for m in (0..6).filter(|&m| m != silent) { s.on_ack(m).unwrap(); }
+        assert_eq!(s.canonical_signers(), None, "held by the silent lower member");
+
+        s.on_timeout().unwrap();
+        assert_eq!(s.stage(), Stage::Consensus);
+        assert_eq!(s.leader(), leader, "the leader proposed; it is not the one at fault");
+        for m in (0..6).filter(|&m| m != silent) { s.on_ack(m).unwrap(); }
+        let set = s.canonical_signers().expect("determined without the silent member");
+        assert!(!set.contains(&(silent as u16)));
+        assert_eq!(set.len(), 4);
+        s.on_ack(silent).unwrap();
+        assert_eq!(s.ack_count(), 5, "its late ACK is ignored");
+    }
+
+    /// Below `threshold` ACKs the leader is the suspect, as before.
+    #[test]
+    fn a_timeout_without_threshold_acks_still_rotates_the_leader() {
+        let mut s = start_session(6, 4);
+        let leader = s.leader();
+        s.on_timeout().unwrap();
+        assert_ne!(s.leader(), leader);
     }
 
     #[test]
