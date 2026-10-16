@@ -24,6 +24,7 @@
 #include "blockchain_db/testdb.h"
 #include "cryptonote_core/uptime_proof.h" // complete uptime_proof::Proof for BaseTestDB's proof_info map
 #include "cryptonote_basic/cryptonote_basic.h"
+#include "cryptonote_core/cryptonote_tx_utils.h"
 #include "cryptonote_basic/cryptonote_format_utils.h"
 #include "cryptonote_core/gateway_utils.h"
 #include "cryptonote_core/master_node_list.h"     // state_t + bridge_committee_resolver (Phase F consensus action)
@@ -49,6 +50,8 @@ namespace
   {
   public:
     std::map<crypto::public_key, std::string> store;
+    uint64_t chain_height = 1;
+    uint64_t height() const override { return chain_height; }
 
     void set_gateway_account(const crypto::public_key& id, const std::string& data) override { store[id] = data; }
     bool get_gateway_account(const crypto::public_key& id, std::string& data) const override
@@ -2087,4 +2090,196 @@ TEST(GatewayBridgeRotation, contract_pins_are_well_formed)
   for (const auto& c : cryptonote::SUPPORTED_BRIDGE_CHAINS)
     if (!c.wbdx_contract.empty())
       EXPECT_EQ(c.wbdx_contract.size(), 40u) << c.name;
+}
+
+// --------------------------------------------------------------------------
+// Standby owner takeover: a standby committee takes the bridge gateway over when the
+// owner key has gone silent, after a delay in which a live owner can cancel it.
+// --------------------------------------------------------------------------
+namespace
+{
+  struct OwnerKeys { crypto::public_key pub; crypto::secret_key sec; };
+  OwnerKeys new_owner_keys() { OwnerKeys k; crypto::generate_keys(k.pub, k.sec); return k; }
+
+  constexpr network_type NET_TO = network_type::FAKECHAIN;
+
+  crypto::public_key seed_with_standby(MemGatewayDB& db, const OwnerKeys& owner, const OwnerKeys& standby)
+  {
+    const crypto::public_key id = rand_pubkey();
+    gateway_account_data acct{};
+    gateway_descriptor_base d{};
+    d.version = 2;
+    d.flags |= GATEWAY_FLAG_BRIDGE_RESERVE;
+    d.owner_key = owner.pub;
+    d.has_standby = 1;
+    d.standby_owner = standby.pub;
+    acct.descriptor_history.push_back(d);
+    acct.balances.push_back(gateway_balance_entry{crypto::null_aid, 1000});
+    store_gateway_account(db, id, acct);
+    return id;
+  }
+
+  transaction takeover_update(const crypto::public_key& gw, const gateway_descriptor_base& d,
+                              std::optional<gateway_takeover_action> action, const OwnerKeys& signer)
+  {
+    transaction tx{};
+    tx.version = txversion::v4_tx_types;
+    tx.type    = txtype::update_gateway_address;
+    tx.vin.push_back(txin_gen{0});
+    tx_extra_gateway_descriptor_operation op{};
+    op.op_type    = gateway_descriptor_op_type::update_address;
+    op.address_id = gw;
+    op.descriptor = d;
+    add_gateway_descriptor_operation_to_tx_extra(tx.extra, op);
+    if (action)
+    {
+      tx_extra_gateway_takeover t{};
+      t.gateway_id = gw;
+      t.action     = *action;
+      add_gateway_takeover_to_tx_extra(tx.extra, t);
+    }
+    crypto::signature sig;
+    crypto::generate_signature(gateway_ownership_message(NET_TO, tx), signer.pub, signer.sec, sig);
+    EXPECT_TRUE(attach_gateway_ownership_proof(NET_TO, tx, sig));
+    return tx;
+  }
+
+  bool valid(MemGatewayDB& db, const transaction& tx, std::string& reason)
+  {
+    tx_extra_gateway_descriptor_operation op{};
+    EXPECT_TRUE(get_field_from_tx_extra(tx.extra, op));
+    return validate_gateway_descriptor_operation(db, NET_TO, tx, op, hf::hf23_bridge, reason);
+  }
+
+  gateway_descriptor_base current(MemGatewayDB& db, const crypto::public_key& gw)
+  {
+    gateway_account_data a; EXPECT_TRUE(load_gateway_account(db, gw, a)); return a.latest_descriptor();
+  }
+  uint64_t started(MemGatewayDB& db, const crypto::public_key& gw)
+  {
+    gateway_account_data a; EXPECT_TRUE(load_gateway_account(db, gw, a)); return a.takeover_started_height();
+  }
+}
+
+TEST(GatewayStandbyTakeover, the_standby_takes_over_a_silent_owner_after_the_delay)
+{
+  MemGatewayDB db;
+  const OwnerKeys owner = new_owner_keys(), standby = new_owner_keys(), stranger = new_owner_keys();
+  const crypto::public_key gw = seed_with_standby(db, owner, standby);
+  const std::string before = blob_of(gw, db);
+  const uint64_t wait = gateway_standby_takeover_blocks(NET_TO);
+  std::string reason;
+
+  // Begin: signed by the standby, descriptor unchanged. Not by the owner, not by anyone else.
+  const auto d0 = current(db, gw);
+  EXPECT_FALSE(valid(db, takeover_update(gw, d0, gateway_takeover_action::begin, owner), reason));
+  EXPECT_NE(reason.find("standby"), std::string::npos) << reason;
+  EXPECT_FALSE(valid(db, takeover_update(gw, d0, gateway_takeover_action::begin, stranger), reason));
+  auto changed = d0; changed.meta_info = "x";
+  EXPECT_FALSE(valid(db, takeover_update(gw, changed, gateway_takeover_action::begin, standby), reason));
+  EXPECT_NE(reason.find("unchanged"), std::string::npos) << reason;
+
+  db.chain_height = 100;
+  const auto begin = takeover_update(gw, d0, gateway_takeover_action::begin, standby);
+  ASSERT_TRUE(valid(db, begin, reason)) << reason;
+  ASSERT_TRUE(append_gateways_from_transactions(db, {begin}, 100, true, &reason)) << reason;
+  EXPECT_EQ(started(db, gw), 100u);
+  EXPECT_FALSE(valid(db, takeover_update(gw, d0, gateway_takeover_action::begin, standby), reason))
+      << "one takeover at a time";
+
+  // Complete: only after the delay, only to exactly the standby as owner.
+  gateway_descriptor_base taken = d0;
+  taken.owner_key = standby.pub; taken.has_standby = 0; taken.standby_owner = gateway_owner_key_v{};
+  db.chain_height = 100 + wait - 1;
+  EXPECT_FALSE(valid(db, takeover_update(gw, taken, gateway_takeover_action::complete, standby), reason));
+  EXPECT_NE(reason.find("not ready"), std::string::npos) << reason;
+  db.chain_height = 100 + wait;
+  auto wrong = taken; wrong.owner_key = stranger.pub;
+  EXPECT_FALSE(valid(db, takeover_update(gw, wrong, gateway_takeover_action::complete, standby), reason));
+  const auto complete = takeover_update(gw, taken, gateway_takeover_action::complete, standby);
+  ASSERT_TRUE(valid(db, complete, reason)) << reason;
+  ASSERT_TRUE(append_gateways_from_transactions(db, {complete}, 100 + wait, true, &reason)) << reason;
+  const auto after = current(db, gw);
+  EXPECT_TRUE(after.owner_key == gateway_owner_key_v{standby.pub});
+  EXPECT_EQ(after.has_standby, 0);
+  EXPECT_TRUE(after.is_bridge_reserve()) << "the sticky flag is carried over";
+  EXPECT_EQ(started(db, gw), 0u);
+
+  // The old owner's key no longer controls the gateway.
+  EXPECT_FALSE(valid(db, takeover_update(gw, after, std::nullopt, owner), reason));
+
+  // Rewinding both blocks restores the exact prior state.
+  ASSERT_TRUE(rewind_gateways_from_transactions(db, {complete}, 100 + wait, true, &reason)) << reason;
+  EXPECT_EQ(started(db, gw), 100u);
+  ASSERT_TRUE(rewind_gateways_from_transactions(db, {begin}, 100, true, &reason)) << reason;
+  EXPECT_EQ(blob_of(gw, db), before) << "byte-exact rewind";
+}
+
+TEST(GatewayStandbyTakeover, a_live_owner_cancels_by_signing_any_update)
+{
+  MemGatewayDB db;
+  const OwnerKeys owner = new_owner_keys(), standby = new_owner_keys();
+  const crypto::public_key gw = seed_with_standby(db, owner, standby);
+  std::string reason;
+  const auto d0 = current(db, gw);
+
+  db.chain_height = 200;
+  const auto begin = takeover_update(gw, d0, gateway_takeover_action::begin, standby);
+  ASSERT_TRUE(append_gateways_from_transactions(db, {begin}, 200, true, &reason)) << reason;
+  ASSERT_EQ(started(db, gw), 200u);
+
+  // The owner is alive: a no-change update it signs cancels the takeover.
+  db.chain_height = 201;
+  const auto cancel = takeover_update(gw, d0, std::nullopt, owner);
+  ASSERT_TRUE(valid(db, cancel, reason)) << reason;
+  ASSERT_TRUE(append_gateways_from_transactions(db, {cancel}, 201, true, &reason)) << reason;
+  EXPECT_EQ(started(db, gw), 0u);
+
+  // After the delay, completing is refused: nothing is running any more.
+  db.chain_height = 200 + gateway_standby_takeover_blocks(NET_TO);
+  gateway_descriptor_base taken = d0;
+  taken.owner_key = standby.pub; taken.has_standby = 0; taken.standby_owner = gateway_owner_key_v{};
+  EXPECT_FALSE(valid(db, takeover_update(gw, taken, gateway_takeover_action::complete, standby), reason));
+  EXPECT_NE(reason.find("no takeover"), std::string::npos) << reason;
+
+  // Rewinding the cancel brings the running takeover back.
+  ASSERT_TRUE(rewind_gateways_from_transactions(db, {cancel}, 201, true, &reason)) << reason;
+  EXPECT_EQ(started(db, gw), 200u);
+}
+
+TEST(GatewayStandbyTakeover, standby_rules)
+{
+  MemGatewayDB db;
+  const OwnerKeys owner = new_owner_keys(), standby = new_owner_keys();
+  std::string reason;
+
+  // A gateway without a standby cannot be taken over.
+  const crypto::public_key plain = seed_gateway(db, 10, true);
+  gateway_account_data a; ASSERT_TRUE(load_gateway_account(db, plain, a));
+  EXPECT_FALSE(valid(db, takeover_update(plain, a.latest_descriptor(), gateway_takeover_action::begin, standby), reason));
+  EXPECT_NE(reason.find("no standby"), std::string::npos) << reason;
+
+  // A standby must differ from the owner.
+  const crypto::public_key gw = seed_with_standby(db, owner, standby);
+  auto d = current(db, gw);
+  d.standby_owner = owner.pub;
+  EXPECT_FALSE(valid(db, takeover_update(gw, d, std::nullopt, owner), reason));
+  EXPECT_NE(reason.find("must differ"), std::string::npos) << reason;
+
+  // A marker must ride with a descriptor update of the same gateway.
+  transaction lone{};
+  lone.version = txversion::v4_tx_types;
+  lone.type    = txtype::standard;
+  lone.vin.push_back(txin_gen{0});
+  tx_extra_gateway_takeover t{}; t.gateway_id = gw; t.action = gateway_takeover_action::begin;
+  add_gateway_takeover_to_tx_extra(lone.extra, t);
+  EXPECT_FALSE(validate_tx_gateway_operations_against_db(db, NET_TO, lone, hf::hf23_bridge, nullptr, reason));
+  EXPECT_NE(reason.find("takeover marker"), std::string::npos) << reason;
+
+  // Descriptor v2 is HF23-only.
+  EXPECT_FALSE(validate_gateway_descriptor_operation(
+      db, NET_TO, takeover_update(gw, current(db, gw), std::nullopt, owner),
+      [&] { tx_extra_gateway_descriptor_operation op{}; op.op_type = gateway_descriptor_op_type::update_address;
+            op.address_id = gw; op.descriptor = current(db, gw); return op; }(),
+      hf::hf22_gateway_addresses, reason));
 }

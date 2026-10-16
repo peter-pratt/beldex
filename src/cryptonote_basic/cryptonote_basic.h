@@ -241,6 +241,11 @@ namespace cryptonote
     std::string meta_info;
     // HF23 (version >= 1). Absent on v0 descriptors, which deserialize unchanged.
     uint8_t flags = 0;
+    // HF23 (version >= 2): a standby owner that may take the gateway over if the owner key
+    // goes silent (see tx_extra_gateway_takeover). Set and changed by the owner like any
+    // other field. Absent on v0/v1 descriptors.
+    uint8_t has_standby = 0;
+    gateway_owner_key_v standby_owner;
 
     bool is_bridge_reserve() const { return (flags & GATEWAY_FLAG_BRIDGE_RESERVE) != 0; }
 
@@ -250,6 +255,12 @@ namespace cryptonote
       FIELD(meta_info)
       if (version >= 1)
         FIELD(flags)
+      if (version >= 2)
+      {
+        FIELD(has_standby)
+        if (has_standby)
+          FIELD(standby_owner)
+      }
     END_SERIALIZE()
   };
 
@@ -368,6 +379,17 @@ namespace cryptonote
   // gateway address id. descriptor_history is append-only (latest entry is
   // authoritative for spend/update validation); balances is materialized with
   // exact-inverse rewind (deposits/withdrawals are unbounded, so no replay).
+  struct gateway_takeover_entry
+  {
+    crypto::hash tx;              // the tx that changed the takeover state
+    uint64_t     started_height;  // the takeover's start height after it (0 = none)
+
+    BEGIN_SERIALIZE_OBJECT()
+      FIELD(tx)
+      VARINT_FIELD(started_height)
+    END_SERIALIZE()
+  };
+
   struct gateway_account_data
   {
     uint8_t version = 0;
@@ -388,6 +410,15 @@ namespace cryptonote
     // v0/v1 blobs deserialize unchanged (same discipline as the v1 fields).
     std::vector<gateway_release_ref_window> release_ref_windows;
 
+    // ---- Standby takeover (HF23, version >= 3) ------------------------------
+    // One entry per tx that started or ended a takeover: the tx and the takeover's start
+    // height after it (0 = none running). Kept as a log rather than a single value so a
+    // rewound tx restores exactly the state before it. Absent on v0..v2 blobs.
+    std::vector<gateway_takeover_entry> takeover_log;
+
+    // Height the running takeover began at, or 0 if none is running.
+    uint64_t takeover_started_height() const { return takeover_log.empty() ? 0 : takeover_log.back().started_height; }
+
     BEGIN_SERIALIZE_OBJECT()
       FIELD(version)
       FIELD(descriptor_history)
@@ -401,6 +432,10 @@ namespace cryptonote
       if (version >= 2)
       {
         FIELD(release_ref_windows)
+      }
+      if (version >= 3)
+      {
+        FIELD(takeover_log)
       }
     END_SERIALIZE()
 

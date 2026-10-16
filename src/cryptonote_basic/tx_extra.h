@@ -72,6 +72,7 @@ constexpr uint8_t
   TX_EXTRA_TAG_BRIDGE_SLASH                 = 0x82, // HF23 (Phase F accountability)
   TX_EXTRA_TAG_BRIDGE_ROTATION_ACK          = 0x83, // HF23 (H.6.3 rotation observation)
   TX_EXTRA_TAG_GATEWAY_RELEASE_REF          = 0x84, // HF23 (release replay guard, §6a)
+  TX_EXTRA_TAG_GATEWAY_TAKEOVER             = 0x85, // HF23 (standby owner takeover)
   TX_EXTRA_TAG_SECURITY_SIGNATURE          = 0x88,
   TX_EXTRA_MYSTERIOUS_MINERGATE_TAG       = 0xDE;
 
@@ -657,6 +658,31 @@ namespace cryptonote
     END_SERIALIZE()
   };
 
+  // Standby takeover (HF23). Marks an update_gateway_address tx as one step of a standby
+  // owner taking over a gateway whose owner key has gone silent. The tx's ownership proof
+  // is then signed by the descriptor's STANDBY owner instead of its owner:
+  //  - begin:    the update's descriptor equals the current one exactly; the takeover clock
+  //              starts at this block.
+  //  - complete: allowed once gateway_standby_takeover_blocks have passed since begin; the
+  //              update's descriptor is the current one with the standby as owner and no
+  //              standby. That is an ordinary owner change from then on.
+  // Any update signed by the OWNER while a takeover runs cancels it: an owner that can
+  // still sign is alive, and that is all the takeover exists to establish.
+  enum class gateway_takeover_action : uint8_t { begin = 1, complete = 2 };
+
+  struct tx_extra_gateway_takeover
+  {
+    uint8_t                 version = 0;
+    crypto::public_key      gateway_id{};
+    gateway_takeover_action action = gateway_takeover_action::begin;
+
+    BEGIN_SERIALIZE()
+      FIELD(version)
+      FIELD(gateway_id)
+      ENUM_FIELD(action, action == gateway_takeover_action::begin || action == gateway_takeover_action::complete)
+    END_SERIALIZE()
+  };
+
   // Governance RE-POINT (HF23). Replaces a gateway's owner_key WITHOUT the old
   // owner's signature (plan §A.2, §9.2, S8) — required when an attacker also
   // holds the old key and could race an ordinary owner-update. Appends a new
@@ -967,6 +993,7 @@ namespace cryptonote
       tx_extra_gateway_freeze,
       tx_extra_gateway_repoint,
       tx_extra_gateway_release_ref,
+      tx_extra_gateway_takeover,
       tx_extra_bridge_registration,
       tx_extra_bridge_unbond,
       tx_extra_bridge_slash,
@@ -1002,6 +1029,7 @@ BINARY_VARIANT_TAG(cryptonote::tx_extra_gateway_bridge_memo,          cryptonote
 BINARY_VARIANT_TAG(cryptonote::tx_extra_gateway_freeze,               cryptonote::TX_EXTRA_TAG_GATEWAY_FREEZE);
 BINARY_VARIANT_TAG(cryptonote::tx_extra_gateway_repoint,              cryptonote::TX_EXTRA_TAG_GATEWAY_REPOINT);
 BINARY_VARIANT_TAG(cryptonote::tx_extra_gateway_release_ref,          cryptonote::TX_EXTRA_TAG_GATEWAY_RELEASE_REF);
+BINARY_VARIANT_TAG(cryptonote::tx_extra_gateway_takeover,             cryptonote::TX_EXTRA_TAG_GATEWAY_TAKEOVER);
 BINARY_VARIANT_TAG(cryptonote::tx_extra_bridge_registration,          cryptonote::TX_EXTRA_TAG_BRIDGE_REGISTRATION);
 BINARY_VARIANT_TAG(cryptonote::tx_extra_bridge_unbond,                cryptonote::TX_EXTRA_TAG_BRIDGE_UNBOND);
 BINARY_VARIANT_TAG(cryptonote::tx_extra_bridge_slash,                 cryptonote::TX_EXTRA_TAG_BRIDGE_SLASH);

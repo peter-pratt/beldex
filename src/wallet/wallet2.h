@@ -1495,7 +1495,7 @@ private:
     //
     // `bridge_reserve` must still be set for a gateway that already carries the
     // flag: it is STICKY and consensus rejects an update that would clear it.
-    std::vector<pending_tx> create_gateway_update_tx(const crypto::public_key& gateway_id, const cryptonote::gateway_owner_key_v& owner_key, const std::string& meta_info, std::string *reason, uint32_t priority = 0, uint32_t account_index = 0, std::set<uint32_t> subaddr_indices = {}, bool bridge_reserve = false);
+    std::vector<pending_tx> create_gateway_update_tx(const crypto::public_key& gateway_id, const cryptonote::gateway_owner_key_v& owner_key, const std::string& meta_info, std::string *reason, uint32_t priority = 0, uint32_t account_index = 0, std::set<uint32_t> subaddr_indices = {}, bool bridge_reserve = false, const cryptonote::gateway_owner_key_v* standby_owner = nullptr, std::optional<cryptonote::gateway_takeover_action> takeover = std::nullopt);
 
     // signature: (Optional) If set, use the signature given, otherwise by default derive the signature from the wallet spend key as an ed25519 key.
     //            The signature is derived from the hash of the previous txid blob and previous value blob of the mapping. By default this is signed using the wallet's spend key as an ed25519 keypair.

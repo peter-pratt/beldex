@@ -1231,6 +1231,9 @@ KV_SERIALIZE_MAP_CODE_BEGIN(GATEWAY_UPDATE_DESCRIPTOR::request)
   KV_SERIALIZE    (owner_key);
   KV_SERIALIZE    (meta_info);
   KV_SERIALIZE_OPT(bridge_reserve,  false);
+  KV_SERIALIZE    (standby_owner_key_type);
+  KV_SERIALIZE    (standby_owner_key);
+  KV_SERIALIZE    (takeover);
   KV_SERIALIZE_OPT(account_index,   (uint32_t)0);
   KV_SERIALIZE    (subaddr_indices);
   KV_SERIALIZE_OPT(priority,        (uint32_t)0);

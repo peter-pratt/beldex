@@ -125,6 +125,10 @@ struct extra_printer {
     std::cout << "Bridge rotation ack: chain " << x.chain_id << " -> key epoch " << x.key_epoch
               << " (" << x.observers.size() << " observers)";
   }
+  void operator()(const tx_extra_gateway_takeover& x) {
+    std::cout << "gateway takeover (" << (x.action == cryptonote::gateway_takeover_action::begin ? "begin" : "complete")
+              << ") for " << x.gateway_id;
+  }
   void operator()(const tx_extra_gateway_release_ref& x) {
     std::cout << "Gateway release ref: chain " << x.chain_id << " burn " << x.evm_txid
               << " log " << x.log_index;

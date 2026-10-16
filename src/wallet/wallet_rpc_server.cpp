@@ -3401,12 +3401,22 @@ namespace {
       throw wallet_rpc_error{error_code::WRONG_KEY, "Invalid gateway_id (expected 64-char hex)"};
 
     cryptonote::gateway_owner_key_v owner_key = parse_gateway_owner_key(req.owner_key_type, req.owner_key);
+    std::optional<cryptonote::gateway_owner_key_v> standby;
+    if (!req.standby_owner_key.empty())
+      standby = parse_gateway_owner_key(req.standby_owner_key_type, req.standby_owner_key);
+    std::optional<cryptonote::gateway_takeover_action> takeover;
+    if (req.takeover == "begin")
+      takeover = cryptonote::gateway_takeover_action::begin;
+    else if (req.takeover == "complete")
+      takeover = cryptonote::gateway_takeover_action::complete;
+    else if (!req.takeover.empty())
+      throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, "takeover must be \"begin\", \"complete\" or empty"};
 
     std::string reason;
     std::vector<wallet2::pending_tx> ptx_vector =
         m_wallet->create_gateway_update_tx(gateway_id, owner_key, req.meta_info, &reason,
                                            req.priority, req.account_index, req.subaddr_indices,
-                                           req.bridge_reserve);
+                                           req.bridge_reserve, standby ? &*standby : nullptr, takeover);
     if (ptx_vector.empty())
       throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, "Failed to create gateway update transaction: " + reason};
     // A descriptor op carries no destination, so it never splits; more than one tx

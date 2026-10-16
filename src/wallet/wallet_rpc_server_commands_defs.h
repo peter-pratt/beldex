@@ -2434,6 +2434,9 @@ sticky and consensus rejects an update that would clear it.)";
       std::string        owner_key;        // Hex NEW owner key (64 for schnorr/eddsa, 66 for eth-compressed).
       std::string        meta_info;        // (Optional) descriptor meta string.
       bool               bridge_reserve;   // (Optional) Carry the STICKY Sovereign Bridge reserve flag forward. Required if the gateway already has it. Defaults to false.
+      std::string        standby_owner_key_type; // (Optional, HF23) Standby owner key type, as owner_key_type. Empty = no standby.
+      std::string        standby_owner_key;      // (Optional, HF23) Hex standby owner key: may take the gateway over if the owner goes silent.
+      std::string        takeover;               // (Optional, HF23) "begin" or "complete": build a standby takeover step instead of an owner update. The descriptor fields must then be the current ones (begin) or the current ones with the standby as owner and no standby (complete), and hash_to_sign is signed by the STANDBY key.
 
       uint32_t           account_index;    // (Optional) Pay the fee from this account index. (Defaults to 0)
       std::set<uint32_t> subaddr_indices;  // (Optional) Pay the fee from this set of subaddresses. (Defaults to 0)

@@ -9404,7 +9404,9 @@ std::vector<wallet2::pending_tx> wallet2::create_gateway_update_tx(const crypto:
                                                                   uint32_t priority,
                                                                   uint32_t account_index,
                                                                   std::set<uint32_t> subaddr_indices,
-                                                                  bool bridge_reserve)
+                                                                  bool bridge_reserve,
+                                                                  const cryptonote::gateway_owner_key_v* standby_owner,
+                                                                  std::optional<cryptonote::gateway_takeover_action> takeover)
 {
   auto hf_version = get_hard_fork_version();
   if (!hf_version)
@@ -9437,9 +9439,34 @@ std::vector<wallet2::pending_tx> wallet2::create_gateway_update_tx(const crypto:
     op.descriptor.version = 1;
     op.descriptor.flags |= cryptonote::GATEWAY_FLAG_BRIDGE_RESERVE;
   }
+  // HF23 standby owner, and standby takeover steps: both use descriptor v2 (a takeover's
+  // descriptor must match the current v2 one, or that one with the standby made owner).
+  if (standby_owner || takeover)
+  {
+    if (*hf_version < hf::hf23_bridge)
+    {
+      if (reason) *reason = "standby owners and takeovers are only available from hardfork 23";
+      return {};
+    }
+    op.descriptor.version = 2;
+  }
+  if (standby_owner)
+  {
+    if (!gateway_owner_key_is_buildable(*standby_owner, reason))
+      return {};
+    op.descriptor.has_standby   = 1;
+    op.descriptor.standby_owner = *standby_owner;
+  }
 
   std::vector<uint8_t> extra;
   cryptonote::add_gateway_descriptor_operation_to_tx_extra(extra, op);
+  if (takeover)
+  {
+    cryptonote::tx_extra_gateway_takeover t{};
+    t.gateway_id = gateway_id;
+    t.action     = *takeover;
+    cryptonote::add_gateway_takeover_to_tx_extra(extra, t);
+  }
 
   // No burn: the registration fee is charged only on the register branch.
   beldex_construct_tx_params tx_params =

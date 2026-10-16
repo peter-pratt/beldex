@@ -388,6 +388,13 @@ constexpr uint64_t bridge_epoch_blocks(network_type n)
 {
   return is_local_bridge_net(n) ? 120 : BRIDGE_EPOCH_BLOCKS;
 }
+// Blocks a standby owner's takeover of the bridge gateway must wait after it begins, so a
+// live owner can cancel it: an hour at 30s blocks on public networks, a few minutes on
+// local ones so the failover can be exercised.
+constexpr uint64_t gateway_standby_takeover_blocks(network_type n)
+{
+  return is_local_bridge_net(n) ? 10 : 120;
+}
 constexpr uint64_t bridge_bond_unlock_blocks(network_type n)
 {
   return is_local_bridge_net(n) ? 360 : BRIDGE_BOND_UNLOCK_BLOCKS;

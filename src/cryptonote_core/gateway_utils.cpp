@@ -88,6 +88,27 @@ namespace
     return v;
   }
 
+  std::vector<tx_extra_gateway_takeover> extract_gateway_takeovers(const transaction& tx)
+  {
+    std::vector<tx_extra_gateway_takeover> v;
+    size_t skip = 0;
+    tx_extra_gateway_takeover op{};
+    while (get_field_from_tx_extra(tx.extra, op, skip++))
+      v.push_back(op);
+    return v;
+  }
+
+  // The descriptor a completed takeover leaves: the current one with its standby as owner
+  // and no standby left.
+  gateway_descriptor_base taken_over_descriptor(const gateway_descriptor_base& current)
+  {
+    gateway_descriptor_base d = current;
+    d.owner_key   = current.standby_owner;
+    d.has_standby = 0;
+    d.standby_owner = gateway_owner_key_v{};
+    return d;
+  }
+
   std::vector<tx_extra_gateway_repoint> extract_gateway_repoints(const transaction& tx)
   {
     std::vector<tx_extra_gateway_repoint> v;
@@ -884,9 +905,9 @@ bool validate_gateway_descriptor_operation(BlockchainDB& db, network_type nettyp
              std::to_string(GATEWAY_DESCRIPTOR_MAX_META_INFO_SIZE) + " bytes";
     return false;
   }
-  // Reject unknown descriptor versions: v0 at HF22, v1 (adds `flags`) from HF23.
-  // Future formats must be gated by a future hard fork, not silently accepted.
-  if (op.descriptor.version > (hf_version >= feature::BRIDGE ? 1 : 0))
+  // Reject unknown descriptor versions: v0 at HF22, v1 (adds `flags`) and v2 (adds a
+  // standby owner) from HF23. Future formats must be gated by a future hard fork.
+  if (op.descriptor.version > (hf_version >= feature::BRIDGE ? 2 : 0))
   {
     reason = "unsupported gateway descriptor version";
     return false;
@@ -902,6 +923,19 @@ bool validate_gateway_descriptor_operation(BlockchainDB& db, network_type nettyp
   {
     reason = "gateway descriptor sets unknown flag bits";
     return false;
+  }
+  if (op.descriptor.has_standby)
+  {
+    if (op.descriptor.has_standby != 1 || !is_valid_gateway_owner_key(op.descriptor.standby_owner))
+    {
+      reason = "gateway descriptor has an invalid standby owner";
+      return false;
+    }
+    if (op.descriptor.standby_owner == op.descriptor.owner_key)
+    {
+      reason = "a gateway's standby owner must differ from its owner";
+      return false;
+    }
   }
 
   switch (op.op_type)
@@ -1031,11 +1065,75 @@ bool validate_gateway_descriptor_operation(BlockchainDB& db, network_type nettyp
         return false;
       }
 
-      const crypto::hash msg = gateway_ownership_message(nettype, tx);
-      if (!verify_gateway_owner_signature(acct.latest_descriptor().owner_key, proof->sig, msg))
+      // A standby takeover step is signed by the standby owner; every other update by the
+      // owner (and, while a takeover is running, cancels it).
+      const gateway_descriptor_base& current = acct.latest_descriptor();
+      const tx_extra_gateway_takeover* takeover = nullptr;
+      const auto takeovers = extract_gateway_takeovers(tx);
+      for (const auto& t : takeovers)
       {
-        reason = "gateway ownership proof verification failed";
-        return false;
+        if (t.gateway_id != op.address_id || takeovers.size() > 1)
+        {
+          reason = "a takeover marker must name the updated gateway, once";
+          return false;
+        }
+        takeover = &t;
+      }
+      const crypto::hash msg = gateway_ownership_message(nettype, tx);
+      if (!takeover)
+      {
+        if (!verify_gateway_owner_signature(current.owner_key, proof->sig, msg))
+        {
+          reason = "gateway ownership proof verification failed";
+          return false;
+        }
+      }
+      else
+      {
+        if (hf_version < feature::BRIDGE || !current.has_standby)
+        {
+          reason = "gateway has no standby owner to take it over";
+          return false;
+        }
+        if (!verify_gateway_owner_signature(current.standby_owner, proof->sig, msg))
+        {
+          reason = "takeover proof is not signed by the gateway's standby owner";
+          return false;
+        }
+        const uint64_t started = acct.takeover_started_height();
+        const uint64_t height  = db.height();
+        if (takeover->action == gateway_takeover_action::begin)
+        {
+          if (started != 0)
+          {
+            reason = "a takeover of this gateway is already running";
+            return false;
+          }
+          if (!same_descriptor(op.descriptor, current))
+          {
+            reason = "a takeover begin must leave the descriptor unchanged";
+            return false;
+          }
+        }
+        else
+        {
+          const uint64_t wait = gateway_standby_takeover_blocks(nettype);
+          if (started == 0)
+          {
+            reason = "no takeover of this gateway has begun";
+            return false;
+          }
+          if (height < started + wait)
+          {
+            reason = "takeover not ready: " + std::to_string(started + wait - height) + " more block(s)";
+            return false;
+          }
+          if (!same_descriptor(op.descriptor, taken_over_descriptor(current)))
+          {
+            reason = "a takeover must make the standby the owner and change nothing else";
+            return false;
+          }
+        }
       }
 
       // The BRIDGE_RESERVE flag is STICKY (HF23): an update may set it but never
@@ -1592,6 +1690,14 @@ bool validate_tx_gateway_operations_against_db(BlockchainDB& db, network_type ne
   const bool is_gateway_type =
       tx.type == txtype::register_gateway_address || tx.type == txtype::update_gateway_address;
 
+  // A takeover marker only means something on the update it rides with.
+  if (!extract_gateway_takeovers(tx).empty() &&
+      (ops.empty() || ops.front().op_type != gateway_descriptor_op_type::update_address))
+  {
+    reason = "gateway takeover marker without a descriptor update";
+    return false;
+  }
+
   if (ops.empty())
   {
     if (is_gateway_type)
@@ -1775,6 +1881,10 @@ namespace
   // bridge state, so a full reorg of bridge activity leaves an identical blob.
   void normalize_bridge_state(gateway_account_data& acct)
   {
+    if (!acct.takeover_log.empty())
+      return; // v3 state still present: keep every field it implies
+    if (acct.version >= 3)
+      acct.version = 2;
     if (acct.release_ref_windows.empty() && acct.version >= 2)
       acct.version = 1;
     if (acct.frozen == 0 && acct.governance_seq == 0 && acct.release_windows.empty() &&
@@ -1838,6 +1948,21 @@ namespace
           {
             set_reason(reason, "update op for an unknown gateway");
             return false;
+          }
+          // Takeover state (validated already): a begin starts the clock, a complete ends
+          // it, and any owner-signed update while one runs cancels it.
+          const crypto::hash txh = get_transaction_hash(tx);
+          const auto takeovers = extract_gateway_takeovers(tx);
+          if (!takeovers.empty() && takeovers.front().gateway_id == op.address_id)
+          {
+            const bool begin = takeovers.front().action == gateway_takeover_action::begin;
+            acct.takeover_log.push_back(gateway_takeover_entry{txh, begin ? block_height : 0});
+            if (acct.version < 3) acct.version = 3;
+          }
+          else if (acct.takeover_started_height() != 0)
+          {
+            acct.takeover_log.push_back(gateway_takeover_entry{txh, 0});
+            if (acct.version < 3) acct.version = 3;
           }
         }
         acct.descriptor_history.push_back(op.descriptor);
@@ -2111,6 +2236,9 @@ bool rewind_gateways_from_transactions(BlockchainDB& db, const std::vector<trans
         return false;
       }
       acct.descriptor_history.pop_back();
+      // Undo this tx's takeover step, if it made one.
+      if (!acct.takeover_log.empty() && acct.takeover_log.back().tx == tx_hash)
+        acct.takeover_log.pop_back();
     }
   }
 

@@ -826,6 +826,13 @@ namespace cryptonote::rpc {
         json_binary_proxy{ack["new_signer"], format} =
             std::string_view{reinterpret_cast<const char*>(x.new_signer.data()), x.new_signer.size()};
       }
+      void operator()(const tx_extra_gateway_takeover& x) {
+        set("gateway_takeover", json{
+            {"version", x.version},
+            {"gateway_id", tools::type_to_hex(x.gateway_id)},
+            {"action", x.action == gateway_takeover_action::begin ? "begin" : "complete"},
+        });
+      }
       void operator()(const tx_extra_gateway_release_ref& x) {
         set("gateway_release_ref", json{
             {"version", x.version},
@@ -3751,6 +3758,21 @@ namespace cryptonote::rpc {
       // ref mandatory on every withdrawal (sticky, HF23 §3.6).
       cmd.response["frozen"]         = acct.frozen != 0;
       cmd.response["bridge_reserve"] = acct.latest_descriptor().is_bridge_reserve();
+      // Standby owner and takeover state (HF23): what a standby committee needs to take
+      // the gateway over, and what the owner needs to see one coming.
+      const auto& d = acct.latest_descriptor();
+      cmd.response["descriptor_version"] = d.version;
+      cmd.response["has_standby"] = d.has_standby != 0;
+      if (d.has_standby)
+      {
+        cmd.response["standby_owner_key_type"] = d.standby_owner.index();
+        cmd.response["standby_owner_key"] =
+            std::visit([](const auto& k) { return tools::type_to_hex(k); }, d.standby_owner);
+      }
+      const uint64_t started = acct.takeover_started_height();
+      cmd.response["takeover_started_height"] = started;
+      cmd.response["takeover_ready_height"] =
+          started ? started + cryptonote::gateway_standby_takeover_blocks(m_core.get_nettype()) : uint64_t{0};
 
       auto balances = json::array();
       for (const auto& b : acct.balances)

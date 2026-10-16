@@ -173,6 +173,7 @@ namespace cryptonote
   bool add_gateway_descriptor_operation_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_gateway_descriptor_operation& op);
   bool add_gateway_bridge_memo_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_gateway_bridge_memo& memo);
   bool add_gateway_freeze_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_gateway_freeze& op);
+  bool add_gateway_takeover_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_gateway_takeover& op);
   bool add_gateway_repoint_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_gateway_repoint& op);
   bool add_gateway_release_ref_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_gateway_release_ref& ref);
   bool add_bridge_registration_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_bridge_registration& reg);
