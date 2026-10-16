@@ -2283,3 +2283,51 @@ TEST(GatewayStandbyTakeover, standby_rules)
             op.address_id = gw; op.descriptor = current(db, gw); return op; }(),
       hf::hf22_gateway_addresses, reason));
 }
+
+// A standby belongs to the owner that named it. A member's bond comes back two owner
+// hand-overs after it asks to leave, so a standby carried past a hand-over, or named again
+// later, could leave a live failover key with holders who no longer have a bond.
+TEST(GatewayStandbyTakeover, a_standby_is_bound_to_the_owner_that_named_it)
+{
+  MemGatewayDB db;
+  const OwnerKeys owner = new_owner_keys(), standby = new_owner_keys();
+  const OwnerKeys next = new_owner_keys(), fresh = new_owner_keys();
+  const crypto::public_key gw = seed_with_standby(db, owner, standby);
+  std::string reason;
+
+  // The owner may restate its own standby (any no-change update, a cancel among them).
+  EXPECT_TRUE(valid(db, takeover_update(gw, current(db, gw), std::nullopt, owner), reason)) << reason;
+
+  // A hand-over cannot carry the standby to the next owner.
+  auto handover = current(db, gw);
+  handover.owner_key = next.pub;
+  EXPECT_FALSE(valid(db, takeover_update(gw, handover, std::nullopt, owner), reason));
+  EXPECT_NE(reason.find("never had"), std::string::npos) << reason;
+
+  // With a fresh standby (or none) it can.
+  handover.standby_owner = fresh.pub;
+  const auto tx = takeover_update(gw, handover, std::nullopt, owner);
+  ASSERT_TRUE(valid(db, tx, reason)) << reason;
+  ASSERT_TRUE(append_gateways_from_transactions(db, {tx}, 300, true, &reason)) << reason;
+
+  // The next owner can name neither the old standby nor the old owner.
+  for (const OwnerKeys* old : {&standby, &owner})
+  {
+    auto d = current(db, gw);
+    d.standby_owner = old->pub;
+    EXPECT_FALSE(valid(db, takeover_update(gw, d, std::nullopt, next), reason));
+    EXPECT_NE(reason.find("never had"), std::string::npos) << reason;
+  }
+
+  // Nor can governance, re-pointing the gateway.
+  tx_extra_gateway_repoint rp{};
+  rp.gateway_id                         = gw;
+  rp.new_owner_descriptor               = current(db, gw);
+  rp.new_owner_descriptor.owner_key     = new_owner_keys().pub;
+  rp.new_owner_descriptor.standby_owner = standby.pub;
+  EXPECT_FALSE(validate_gateway_repoint_operation(db, NET_TO, transaction{}, rp, {}, reason));
+  EXPECT_NE(reason.find("never had"), std::string::npos) << reason;
+  rp.new_owner_descriptor.standby_owner = rp.new_owner_descriptor.owner_key;
+  EXPECT_FALSE(validate_gateway_repoint_operation(db, NET_TO, transaction{}, rp, {}, reason));
+  EXPECT_NE(reason.find("invalid standby"), std::string::npos) << reason;
+}

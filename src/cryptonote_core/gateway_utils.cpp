@@ -109,6 +109,30 @@ namespace
     return d;
   }
 
+  // A standby is bound to the owner that named it. Its holders are the committee that
+  // generated it, and a member's bond comes back two owner hand-overs after it asks to
+  // leave; a standby carried past a hand-over, or named again later, would leave a live
+  // failover key with holders who may have no bond. So a descriptor may keep the current
+  // standby only under the current owner, and may never name a key this gateway has had
+  // as owner or standby before.
+  bool standby_is_fresh(const gateway_account_data& acct, const gateway_descriptor_base& next, std::string& reason)
+  {
+    if (!next.has_standby)
+      return true;
+    const gateway_descriptor_base& current = acct.latest_descriptor();
+    if (current.has_standby && current.standby_owner == next.standby_owner && current.owner_key == next.owner_key)
+      return true; // the same standby, restated by the owner that named it
+    for (const auto& d : acct.descriptor_history)
+    {
+      if (d.owner_key == next.standby_owner || (d.has_standby && d.standby_owner == next.standby_owner))
+      {
+        reason = "a gateway's standby owner must be a key it has never had as owner or standby";
+        return false;
+      }
+    }
+    return true;
+  }
+
   std::vector<tx_extra_gateway_repoint> extract_gateway_repoints(const transaction& tx)
   {
     std::vector<tx_extra_gateway_repoint> v;
@@ -1136,6 +1160,9 @@ bool validate_gateway_descriptor_operation(BlockchainDB& db, network_type nettyp
         }
       }
 
+      if (!standby_is_fresh(acct, op.descriptor, reason))
+        return false;
+
       // The BRIDGE_RESERVE flag is STICKY (HF23): an update may set it but never
       // clear it. Otherwise the mandatory-release-ref rule (§3.6) would be trivially
       // bypassable — clear the flag, withdraw without a ref, set it back.
@@ -1196,6 +1223,16 @@ bool validate_gateway_repoint_operation(BlockchainDB& db, network_type nettype, 
     reason = "repoint new owner descriptor has an invalid owner key";
     return false;
   }
+  if (op.new_owner_descriptor.has_standby &&
+      (op.new_owner_descriptor.has_standby != 1 ||
+       !is_valid_gateway_owner_key(op.new_owner_descriptor.standby_owner) ||
+       op.new_owner_descriptor.standby_owner == op.new_owner_descriptor.owner_key))
+  {
+    reason = "repoint new owner descriptor has an invalid standby owner";
+    return false;
+  }
+  if (!standby_is_fresh(acct, op.new_owner_descriptor, reason))
+    return false;
   if (op.governance_seq != acct.governance_seq)
   {
     reason = "stale governance nonce on repoint (expected " + std::to_string(acct.governance_seq)
