@@ -2263,6 +2263,13 @@ where
     let key_probe_gw = HttpJsonRpc::new(format!("{}/json_rpc", beldexd_rpc.trim_end_matches('/')));
     let mut mint_key_replaced: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     let mut release_key_replaced = false;
+    // A key that differs from the contract's before this process ever saw it live is not
+    // replaced but incoming: promoted and restarted while the change that names it (a
+    // rotation's activation, a standby takeover) is still short of the probe's depth. Its
+    // mints are held, not dropped, until the contract answers with this key.
+    let mut mint_key_live: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    let mut mint_key_incoming: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    let mut held_mints: Vec<beldex_bridge_signer::watch::MintEvent> = Vec::new();
 
     // H.6.3 rotation acknowledgements. Each member observes a wBDX key change on its own
     // RPC, signs the fact, and shares that signature over the mesh; once threshold-many
@@ -2433,7 +2440,19 @@ where
                 let Ok(word) = client.call("eth_call", params) else { continue };
                 let Some(word) = word.as_str().filter(|w| w.len() == 66) else { continue };
                 let live = format!("0x{}", &word[26..]).to_lowercase();
-                if live != ours {
+                if live == ours {
+                    mint_key_live.insert(*chain_id);
+                    if mint_key_incoming.remove(chain_id) {
+                        println!("chain {chain_id}: this share set's key {ours} is now live; opening its held mints");
+                    }
+                } else if !mint_key_live.contains(chain_id) {
+                    if mint_key_incoming.insert(*chain_id) {
+                        println!(
+                            "chain {chain_id}: the wBDX signer is still {live}, not yet this share set's {ours}; \
+                             holding mints until the change is settled"
+                        );
+                    }
+                } else {
                     mint_key_replaced.insert(*chain_id);
                     eprintln!(
                         "!! KEY REPLACED on chain {chain_id}: the wBDX signer is now {live}, not this \
@@ -2505,8 +2524,11 @@ where
         };
         // Keep draining the watchers so their cursors advance, but do not turn events into
         // duties for a key that has been replaced — they belong to the successor committee.
-        for m in src.poll_mints() {
-            if !mint_key_replaced.contains(&m.dst_chain.0) {
+        held_mints.extend(src.poll_mints());
+        for m in std::mem::take(&mut held_mints) {
+            if mint_key_incoming.contains(&m.dst_chain.0) {
+                held_mints.push(m);
+            } else if !mint_key_replaced.contains(&m.dst_chain.0) {
                 ingest(orch, Duty::Mint(m));
             }
         }
@@ -2793,7 +2815,7 @@ where
             use beldex_bridge_signer::watch_cursor::{self, Cursor};
             let unfinished: Vec<&Duty> = orch.outstanding().into_iter().chain(deferred.iter()).collect();
             let h = src.beldex.finalized_up_to();
-            if h > beldex_saved && mint_key_replaced.is_empty() && watch_cursor::mints_settled(unfinished.iter().copied()) {
+            if h > beldex_saved && mint_key_replaced.is_empty() && held_mints.is_empty() && watch_cursor::mints_settled(unfinished.iter().copied()) {
                 match src.beldex.block_hash(h) {
                     Ok(hash) => match watch_cursor::save(dir, "beldex", &beldex_identity, &Cursor { height: h, hash }) {
                         Ok(()) => beldex_saved = h,
