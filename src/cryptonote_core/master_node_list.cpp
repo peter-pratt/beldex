@@ -2711,6 +2711,16 @@ namespace master_nodes
         return false;
       }
     }
+    // A chain's first ack is the contract's own first key: `initialize` announces it as
+    // Rotated(initialSigner, 1). Taking any epoch here would let a false first ack set the
+    // count every later hand-over is measured from: too high, and every departing seat's
+    // baseline on this chain is already passed or can never be reached.
+    else if (ack.key_epoch != 1)
+    {
+      reason = "chain " + std::to_string(ack.chain_id) + " has no observed key epoch; its first ack must be "
+               "epoch 1 (the contract's initial key), not " + std::to_string(ack.key_epoch);
+      return false;
+    }
     return true;
   }
 

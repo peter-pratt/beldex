@@ -202,6 +202,14 @@ TEST(GatewayBridgeSlash, non_ascending_and_unattributed_rejected)
   slash.accusers = {sig_of(0), sig_of(2), sig_of(2), sig_of(3)};
   EXPECT_FALSE(verify_bridge_slash_evidence(slash, pubs, 4, NET, reason));
 
+  // The accused (member 1) cannot be one of its own accusers: with it, four signatures
+  // would pass where only three honest members accuse.
+  slash.accusers = {sig_of(0), sig_of(1), sig_of(2), sig_of(3)};
+  EXPECT_FALSE(verify_bridge_slash_evidence(slash, pubs, 4, NET, reason));
+  EXPECT_NE(reason.find("its own accusers"), std::string::npos) << reason;
+  slash.accusers = {sig_of(0), sig_of(2), sig_of(3), sig_of(4)};
+  EXPECT_TRUE(verify_bridge_slash_evidence(slash, pubs, 4, NET, reason)) << reason;
+
   // A coarse/unattributed fault is never slashable, however many sign it.
   tx_extra_bridge_slash coarse{};
   coarse.version = 1; coarse.scheme = 0; coarse.failing_check = 3; // InvalidAggregateUnattributed
@@ -934,6 +942,7 @@ TEST(GatewayBridgeRotation, an_ack_must_name_exactly_the_next_key_epoch)
   cur.height = 5000;
   for (size_t i = 0; i < N; ++i) seat_member(cur, c.mn[i], c.ed_pub[i], 100 + i);
 
+  ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 1, {0, 1, 2, 3}, 3), 4999));
   ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 2, {0, 1, 2, 3}, 3), 5000));
   EXPECT_FALSE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 4, {0, 1, 2, 3}, 3), 5001)) << "skips 3";
   EXPECT_FALSE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 2, {0, 1, 2, 3}, 3), 5001)) << "repeats 2";
@@ -943,13 +952,39 @@ TEST(GatewayBridgeRotation, an_ack_must_name_exactly_the_next_key_epoch)
   EXPECT_EQ(observed_epoch(cur, 1), 4u);
 }
 
+// A chain's first ack is its contract's initial key, epoch 1. Any other first epoch would
+// set the count later hand-overs are measured from: a false high one leaves departing
+// seats' baselines already passed, or never reachable.
+TEST(GatewayBridgeRotation, a_chains_first_ack_must_be_epoch_1)
+{
+  const size_t N = cryptonote::bridge_committee_size(NET_FC);
+  auto c = make_committee(N);
+  master_node_list::state_t cur(nullptr);
+  cur.height = 5000;
+  for (size_t i = 0; i < N; ++i) seat_member(cur, c.mn[i], c.ed_pub[i], 100 + i);
+
+  std::string reason;
+  for (uint64_t e : {0, 2, 9})
+  {
+    auto ack = sign_rotation_ack(c, 1, e, {0, 1, 2, 3}, 3);
+    EXPECT_FALSE(cur.check_bridge_rotation_ack(ack, NET_FC, reason)) << e;
+    EXPECT_NE(reason.find("first ack must be epoch 1"), std::string::npos) << reason;
+    EXPECT_FALSE(run_rotation_ack(cur, c, ack, 5000)) << e;
+  }
+  EXPECT_EQ(observed_epoch(cur, 1), 0u);
+  EXPECT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 1, {0, 1, 2, 3}, 3), 5000));
+  EXPECT_EQ(observed_epoch(cur, 1), 1u);
+  // Each chain starts on its own: chain 2 still needs its own epoch 1.
+  EXPECT_FALSE(run_rotation_ack(cur, c, sign_rotation_ack(c, 2, 2, {0, 1, 2, 3}, 3), 5001));
+}
+
 // Only chains the bridge serves on this network, and never the gateway's reserved id
 // (its epoch moves with its owner hand-over).
 TEST(GatewayBridgeRotation, an_ack_must_be_for_a_bridge_chain_of_this_network)
 {
   master_node_list::state_t st(nullptr);
   tx_extra_bridge_rotation_ack ack{};
-  ack.key_epoch = 2; ack.contract = addr20(0x22); ack.new_signer = addr20(0x11);
+  ack.key_epoch = 1; ack.contract = addr20(0x22); ack.new_signer = addr20(0x11);
   std::string reason;
   // A mainnet chain is on the list, but no contract is pinned for it yet: closed.
   ack.chain_id = 56;    EXPECT_FALSE(st.check_bridge_rotation_ack(ack, network_type::MAINNET, reason));
@@ -993,7 +1028,8 @@ TEST(GatewayBridgeRotation, ack_advances_observed_key_epoch_monotonically)
   cur.height = 5000;
   for (size_t i = 0; i < N; ++i) seat_member(cur, c.mn[i], c.ed_pub[i], 100 + i);
 
-  // First ack for chain 1 → epoch 2 advances.
+  // First ack for chain 1 (the contract's initial key, epoch 1), then epoch 2 advances.
+  EXPECT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 1, {0, 1, 2, 3}, 3), 4999));
   EXPECT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 2, {0, 1, 2, 3}, 3), 5000));
   EXPECT_EQ(observed_epoch(cur, 1), 2u);
 
@@ -1310,6 +1346,7 @@ TEST(GatewayBridgeRotation, gate_never_releases_a_seated_baseline_without_a_wbdx
   }
 
   // Chains rotate afterwards; neither seat recorded them, so neither may use them.
+  ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 1, {0, 1, 2, 3}, 3), 5999));
   ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 2, {0, 1, 2, 3}, 3), 6000));
   ASSERT_TRUE(run_rotation_ack(cur, c, sign_rotation_ack(c, 1, 3, {0, 1, 2, 3}, 3), 6001));
   cur.finalize_bridge_unbonds(1000000);

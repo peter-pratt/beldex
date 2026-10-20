@@ -457,6 +457,13 @@ bool verify_bridge_slash_evidence(const tx_extra_bridge_slash& slash,
       reason = "slash accuser indices not strictly ascending";
       return false;
     }
+    // The accused cannot vouch for its own slashing: its signature would count toward the
+    // threshold that convicts it, so one fewer honest accuser would be needed.
+    if (a.voter_index == slash.accused_index)
+    {
+      reason = "the accused cannot be among its own accusers";
+      return false;
+    }
     if (crypto_sign_verify_detached(a.signature.data,
                                     reinterpret_cast<const unsigned char*>(msg.data()), msg.size(),
                                     signer_keys[a.voter_index].data) != 0)
