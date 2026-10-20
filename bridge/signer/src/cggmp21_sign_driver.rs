@@ -561,6 +561,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cggmp21-test-dealer")]
     #[ignore = "runs the full cggmp21 signing MPC across threads"]
     fn cggmp21_signing_over_the_mesh_recovers_wbdx_address() {
         let (n, t) = (3u16, 2u16);
@@ -709,6 +710,7 @@ mod tests {
     /// and produce a valid signature of its own. With an execution id that did not change
     /// between runs, those frames carried the same id and tags and were taken as this run's.
     #[test]
+    #[cfg(feature = "cggmp21-test-dealer")]
     #[ignore = "runs the full cggmp21 signing MPC across threads, twice"]
     fn a_rerun_of_the_same_duty_ignores_the_earlier_runs_frames() {
         let (n, t) = (3u16, 2u16);

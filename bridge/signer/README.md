@@ -99,8 +99,10 @@ cargo test --features tss-integration
 
 # + the real no-dealer CGGMP21 (Pevm) DKG (round-based simulation) AND the C.3
 #   Pevm signing proof (threshold ECDSA → ecrecover → wBDX signer address). Slow:
-#   the cggmp21 tests run real aux-info safe-prime generation.
-cargo test --features cggmp21-interop
+#   the cggmp21 tests run real aux-info safe-prime generation. Tests that make keys
+#   with cggmp21's trusted dealer need `cggmp21-test-dealer`, which no production
+#   build enables (it brings in the dealer and secret-key reconstruction).
+cargo test --features cggmp21-test-dealer
 ```
 
 Signing (C.3) has an explicit test per leg:
@@ -112,7 +114,7 @@ cargo test --features tss-integration -- --nocapture frost_gateway_release_signa
 
 # Pevm: CGGMP21 threshold ECDSA over a mint digest, verified via ecrecover →
 #       recovers the wBDX signer address
-cargo test --features cggmp21-interop -- --nocapture cggmp21_threshold_signature_recovers_wbdx_address
+cargo test --features cggmp21-test-dealer -- --nocapture cggmp21_threshold_signature_recovers_wbdx_address
 ```
 
 The `Pevm` signing test above uses the trusted dealer for its key material (fast).

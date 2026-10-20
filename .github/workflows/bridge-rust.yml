@@ -40,7 +40,7 @@ jobs:
         run: cargo test
       - name: Signer (live stack)
         working-directory: bridge/signer
-        run: cargo test --features live-pevm-dkg,serve-live
+        run: cargo test --features live-pevm-dkg,serve-live,cggmp21-test-dealer
       - name: Relayer (all features)
         working-directory: bridge/relayer
         run: cargo test --all-features

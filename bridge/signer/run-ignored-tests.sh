@@ -18,7 +18,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-cargo test --release --features live-pevm-dkg,serve-live --lib -- \
+cargo test --release --features live-pevm-dkg,serve-live,cggmp21-test-dealer --lib -- \
   --ignored \
   --skip fetches_live_committee \
   --skip cpp_cross_check_vector \

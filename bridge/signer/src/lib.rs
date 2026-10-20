@@ -277,14 +277,14 @@ pub mod cggmp21_aux_driver;
 /// cggmp21 (`Pevm`) key-material ↔ ecrecover interop: a cggmp21 key maps to the
 /// same Ethereum address as the canonical secp256k1 implementation. Test-only,
 /// behind the heavier `cggmp21-interop` feature.
-#[cfg(all(test, feature = "cggmp21-interop"))]
+#[cfg(all(test, feature = "cggmp21-test-dealer"))]
 mod cggmp21_interop;
 
 /// C.2 `Pevm` DKG: a CGGMP21 secp256k1 key generation driven through the [`dkg`]
 /// orchestration, binding the group key to the wBDX signer address and exercising
 /// the share-store hand-off (**trusted-dealer** keygen — the orchestration/wiring
 /// proof). Test-only, behind `cggmp21-interop`.
-#[cfg(all(test, feature = "cggmp21-interop"))]
+#[cfg(all(test, feature = "cggmp21-test-dealer"))]
 mod cggmp21_dkg;
 
 /// C.2 `Pevm` DKG: the **real, no-dealer** CGGMP21 keygen run across N parties via
@@ -297,7 +297,7 @@ mod cggmp21_real_dkg;
 /// C.3a `Pevm` signing: a CGGMP21 threshold ECDSA signature over a mint digest,
 /// verified by the library and by **`ecrecover`** (recovers the wBDX signer
 /// address). Test-only, behind `cggmp21-interop`.
-#[cfg(all(test, feature = "cggmp21-interop"))]
+#[cfg(all(test, feature = "cggmp21-test-dealer"))]
 mod cggmp21_sign;
 
 /// C.3 #1 `Pevm`: the **no-trusted-dealer** signing chain — real DKG →
