@@ -2275,6 +2275,14 @@ where
     let mut mint_key_live: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     let mut mint_key_incoming: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     let mut held_mints: Vec<beldex_bridge_signer::watch::MintEvent> = Vec::new();
+    // When each chain's key was first seen incoming, and when that was last reported. A key
+    // promoted for a change that never lands (a takeover cancelled after the shares were
+    // swapped) would otherwise hold its deposits silently for ever.
+    let mut incoming_since: BTreeMap<u64, (std::time::Instant, std::time::Instant)> = BTreeMap::new();
+    const HELD_REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+    // Whether each chain (and the gateway, as chain 0) was last seen naming no standby. Without
+    // one, a mass loss of this key's holders halts the bridge until governance steps in.
+    let mut no_standby: BTreeMap<u64, bool> = BTreeMap::new();
 
     // H.6.3 rotation acknowledgements. Each member observes a wBDX key change on its own
     // RPC, signs the fact, and shares that signature over the mesh; once threshold-many
@@ -2485,15 +2493,48 @@ where
                 let live = format!("0x{}", &word[26..]).to_lowercase();
                 if live == ours {
                     mint_key_live.insert(*chain_id);
+                    incoming_since.remove(chain_id);
                     if mint_key_incoming.remove(chain_id) {
                         println!("chain {chain_id}: this share set's key {ours} is now live; opening its held mints");
                     }
+                    // Is a standby named? Read at the tip: this is a warning, not a decision.
+                    let sel = format!("0x{}", hex(&Keccak256::digest(b"standbySigner()")[..4]));
+                    let q = serde_json::json!([{ "to": format!("0x{}", hex(contract)), "data": sel }, "latest"]);
+                    if let Ok(w) = client.call("eth_call", q) {
+                        if let Some(w) = w.as_str().filter(|w| w.len() == 66) {
+                            let missing = w[26..].bytes().all(|b| b == b'0');
+                            if no_standby.insert(*chain_id, missing) != Some(missing) {
+                                if missing {
+                                    eprintln!(
+                                        "!! chain {chain_id}: wBDX names no standby key. If this key loses its \
+                                         holders the bridge halts until governance acts: generate a standby \
+                                         with another committee and register it."
+                                    );
+                                } else {
+                                    println!("chain {chain_id}: wBDX names a standby key");
+                                }
+                            }
+                        }
+                    }
                 } else if !mint_key_live.contains(chain_id) {
+                    let now = std::time::Instant::now();
                     if mint_key_incoming.insert(*chain_id) {
+                        incoming_since.insert(*chain_id, (now, now));
                         println!(
                             "chain {chain_id}: the wBDX signer is still {live}, not yet this share set's {ours}; \
                              holding mints until the change is settled"
                         );
+                    } else if let Some((since, last)) = incoming_since.get_mut(chain_id) {
+                        if now.duration_since(*last) >= HELD_REPORT_EVERY {
+                            *last = now;
+                            let held = held_mints.iter().filter(|m| m.dst_chain.0 == *chain_id).count();
+                            eprintln!(
+                                "!! chain {chain_id}: still holding {held} mint(s) after {} min: the wBDX signer \
+                                 is {live}, not this share set's {ours}. If the change that named this key was \
+                                 cancelled, these shares should not be live: restore the previous ones.",
+                                now.duration_since(*since).as_secs() / 60
+                            );
+                        }
                     }
                 } else {
                     mint_key_replaced.insert(*chain_id);
@@ -2508,7 +2549,20 @@ where
                 let params = serde_json::json!({ "gateway_address": release_gateway });
                 if let Ok(info) = key_probe_gw.call("get_gateway_info", params) {
                     if let Some(owner) = info.get("owner_key").and_then(|v| v.as_str()) {
-                        if !owner.eq_ignore_ascii_case(&hex(&ls.pgw_group_vk)) {
+                        if owner.eq_ignore_ascii_case(&hex(&ls.pgw_group_vk)) {
+                            if let Some(has) = info.get("has_standby").and_then(|v| v.as_bool()) {
+                                if no_standby.insert(0, !has) != Some(!has) {
+                                    if has {
+                                        println!("gateway: names a standby owner");
+                                    } else {
+                                        eprintln!(
+                                            "!! gateway: names no standby owner. If this key loses its holders the \
+                                             reserve is stuck until governance re-points it: register a standby."
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
                             release_key_replaced = true;
                             eprintln!(
                                 "!! KEY REPLACED on the gateway: its owner key is now {owner}, not \
