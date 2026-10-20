@@ -61,11 +61,17 @@ without spending anything.
 
 ```bash
 cargo build --features submit-http
-export RELAYER_GAS_KEY=<32-byte hex>
+install -m 600 /dev/null /etc/beldex-relayer/gas.key   # then write the 32-byte hex key into it
+export RELAYER_GAS_KEY_FILE=/etc/beldex-relayer/gas.key
 export RELAYER_CHAINS='[{"chain_id":31337,"rpc_url":"http://127.0.0.1:8545"}]'
 export RELAYER_STATE_DIR=/var/lib/beldex-relayer   # default ./relayer-state
 beldex-bridge-relayer relay payload.json           # or `relay -` for stdin
 ```
+
+The key is read from `RELAYER_GAS_KEY_FILE` (refused unless owner-only), else the systemd
+credential `relayer-gas-key` (`LoadCredential=`), else `RELAYER_GAS_KEY` with a warning. Keep
+it out of the environment in production: the signer starts the relayer through `RELAY_CMD`, so
+an `env RELAYER_GAS_KEY=…` there shows in every user's process listing.
 
 Each gas wallet's in-flight transactions are kept in `RELAYER_STATE_DIR`, one file per
 `(chain, wallet)`, and every run holds an exclusive lock on it while deciding. With that:

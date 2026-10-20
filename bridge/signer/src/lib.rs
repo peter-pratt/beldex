@@ -126,6 +126,10 @@ pub mod solvency;
 pub mod watch_cursor;
 /// **Network policy** — test-network-only settings refused on mainnet and testnet. std-only.
 pub mod network_policy;
+
+/// Logging in to the local wallet RPC that pays for rotation acks (HTTP Basic from an
+/// owner-only login file).
+pub mod rpc_login;
 /// **Mint outbox** — each signed mint payload, kept on disk until `processedDeposits` shows
 /// it minted, so a missed hand-off is re-delivered instead of stranding the deposit.
 /// std-only.

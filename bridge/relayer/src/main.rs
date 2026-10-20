@@ -59,7 +59,9 @@ fn main() {
                  `mint-digest` prints the 32-byte digest the Pevm committee signs for a mint\n\
                  (feed it to the signer as BRIDGE_SIGNER_SIGN_DIGEST).\n\n\
                  relay environment:\n  \
-                 RELAYER_GAS_KEY   32-byte hex secp256k1 gas key (NOT a bridge key)\n  \
+                 RELAYER_GAS_KEY_FILE owner-only file with the 32-byte hex secp256k1 gas key\n\
+                 \t\t    (NOT a bridge key); or the systemd credential relayer-gas-key;\n\
+                 \t\t    or, for test networks, RELAYER_GAS_KEY\n  \
                  RELAYER_CHAINS    JSON: [{{\"chain_id\":31337,\"rpc_url\":\"http://127.0.0.1:8545\"}}]\n\
                  \t\t    optional per chain: max_fee_cap_wei, priority_fee_wei, gas_limit_pct\n  \
                  RELAYER_STATE_DIR in-flight transactions per gas key (default relayer-state);\n\
@@ -163,9 +165,15 @@ fn run_relay(src: &str) -> Result<String, String> {
     let payload =
         RelayPayload::from_json(&json).map_err(|e| format!("invalid payload: {e:?}"))?;
 
-    let key_hex = std::env::var("RELAYER_GAS_KEY")
-        .map_err(|_| "set RELAYER_GAS_KEY (32-byte hex secp256k1 gas key)".to_string())?;
-    let key = hex32(key_hex.trim(), "RELAYER_GAS_KEY")?;
+    let (key_hex, source) = beldex_bridge_relayer::gas_key::configured()?;
+    if source == beldex_bridge_relayer::gas_key::Source::Environment {
+        eprintln!(
+            "WARNING: the gas key comes from RELAYER_GAS_KEY, which shows in process listings \
+             and saved settings. Prefer RELAYER_GAS_KEY_FILE or the systemd credential `{}`.",
+            beldex_bridge_relayer::gas_key::CREDENTIAL_NAME
+        );
+    }
+    let key = hex32(&key_hex, "gas key")?;
 
     let chains_json = std::env::var("RELAYER_CHAINS")
         .map_err(|_| "set RELAYER_CHAINS (JSON array of {chain_id, rpc_url, …})".to_string())?;

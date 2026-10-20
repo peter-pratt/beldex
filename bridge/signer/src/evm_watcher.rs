@@ -749,12 +749,20 @@ impl<C: JsonRpcClient> EvmWatcher<C> {
 pub struct HttpJsonRpc {
     url: String,
     id: std::cell::Cell<u64>,
+    /// An `Authorization` header value, for an RPC that requires a login.
+    auth: Option<String>,
 }
 
 #[cfg(feature = "evm-watcher-http")]
 impl HttpJsonRpc {
     pub fn new(url: impl Into<String>) -> HttpJsonRpc {
-        HttpJsonRpc { url: url.into(), id: std::cell::Cell::new(1) }
+        HttpJsonRpc { url: url.into(), id: std::cell::Cell::new(1), auth: None }
+    }
+
+    /// Log in with HTTP Basic (`user:password`), as beldex-wallet-rpc expects.
+    pub fn with_basic_auth(mut self, login: &str) -> HttpJsonRpc {
+        self.auth = Some(crate::rpc_login::basic_auth_header(login));
+        self
     }
 }
 
@@ -764,8 +772,11 @@ impl JsonRpcClient for HttpJsonRpc {
         let id = self.id.get();
         self.id.set(id.wrapping_add(1));
         let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        let resp = crate::http_agent()
-            .post(&self.url)
+        let mut post = crate::http_agent().post(&self.url);
+        if let Some(a) = &self.auth {
+            post = post.set("Authorization", a);
+        }
+        let resp = post
             .send_json(req)
             .map_err(|e| RpcError::Transport(e.to_string()))?;
         let v: Value = resp.into_json().map_err(|e| RpcError::BadResponse(e.to_string()))?;

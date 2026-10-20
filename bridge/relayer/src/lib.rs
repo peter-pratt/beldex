@@ -31,6 +31,7 @@
 
 pub mod abi;
 pub mod digest;
+pub mod gas_key;
 pub mod eip1559;
 pub mod payload;
 pub mod rlp;

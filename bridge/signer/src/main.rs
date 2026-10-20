@@ -1755,6 +1755,18 @@ where
     if std::env::var("BRIDGE_SIGNER_BELDEX_CONFIRMATIONS").is_ok_and(|v| !v.trim().is_empty()) {
         settings.push("deposits settle on a confirmation count (BRIDGE_SIGNER_BELDEX_CONFIRMATIONS)".to_string());
     }
+    // The rotation-ack wallet spends this node's funds. Without a login, anything that can
+    // reach its port can spend them too.
+    let nonempty = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
+    let ack_wallet_login = match nonempty("BRIDGE_SIGNER_ACK_WALLET_LOGIN_FILE") {
+        Some(p) => Some(beldex_bridge_signer::rpc_login::read_login_file(std::path::Path::new(p.trim()))?),
+        None => None,
+    };
+    if nonempty("BRIDGE_SIGNER_ACK_WALLET_RPC").is_some() && ack_wallet_login.is_none() {
+        settings.push(
+            "rotation-ack wallet RPC without a login (BRIDGE_SIGNER_ACK_WALLET_LOGIN_FILE)".to_string(),
+        );
+    }
     enforce_network_policy(cfg, &settings)?;
 
     let ls = Rc::new(build_live_signers(cfg)?);
@@ -2297,13 +2309,17 @@ where
     // one to the daemon is not the end: it still has to be paid for and mined, and until it
     // is, departing members' bonds stay locked. With a wallet RPC configured
     // (BRIDGE_SIGNER_ACK_WALLET_RPC, e.g. http://127.0.0.1:19092/json_rpc, a local wallet
-    // RPC run with --disable-rpc-login), this node pays for it itself. The mempool keeps
+    // RPC, logged in to with BRIDGE_SIGNER_ACK_WALLET_LOGIN_FILE), this node pays for it
+    // itself. The mempool keeps
     // one per (chain, key epoch), so several members doing so pays only once.
     let mut ack_submissions = beldex_bridge_signer::rotation_ack::AckSubmissions::new();
     let ack_wallet = std::env::var("BRIDGE_SIGNER_ACK_WALLET_RPC")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .map(HttpJsonRpc::new);
+        .map(|url| match &ack_wallet_login {
+            Some(login) => HttpJsonRpc::new(url).with_basic_auth(login),
+            None => HttpJsonRpc::new(url),
+        });
     match &ack_wallet {
         Some(_) => println!("  rotation acks: submitted and paid for by the configured wallet RPC"),
         None => println!(
