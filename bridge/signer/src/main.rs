@@ -2339,6 +2339,17 @@ where
     let evm_identity = |c: &beldex_bridge_signer::evm_watcher::EvmChainConfig| {
         format!("evm chain {} contract {}", c.chain_id, hex(&c.contract))
     };
+    // The key each cursor's progress was made under: the mint key for deposits, the gateway
+    // owner key for burns. After a key change, a cursor saved under the old one is not
+    // resumed from but rescanned behind (see watch_cursor), so work the old key signed and
+    // that never landed is seen, and signed, again. The windows default to the mint
+    // outbox's give-up time: a week of blocks.
+    let beldex_key = hex(&ls.pevm_address);
+    let evm_key = hex(&ls.pgw_group_vk);
+    let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(d);
+    let beldex_rekey_window = env_u64("BRIDGE_SIGNER_REKEY_RESCAN_BLOCKS", 20_160);
+    let evm_rekey_window = env_u64("BRIDGE_SIGNER_EVM_REKEY_RESCAN_BLOCKS", 50_400);
+    let beldex_start = env_u64("BRIDGE_SIGNER_BELDEX_START_HEIGHT", 0);
     let mut beldex_saved: u64 = 0;
     let mut evm_saved: BTreeMap<u64, u64> = BTreeMap::new();
     match &cursor_dir {
@@ -2346,8 +2357,20 @@ where
         Some(dir) => {
             use beldex_bridge_signer::watch_cursor;
             println!("  watch cursors kept in: {}", dir.display());
-            match watch_cursor::load(dir, "beldex", &beldex_identity) {
-                Ok(Some(c)) => match src.beldex.block_hash(c.height) {
+            match watch_cursor::load(dir, "beldex", &beldex_identity, &beldex_key) {
+                Ok(Some(watch_cursor::Loaded::OtherKey(c))) => match src.beldex.block_hash(c.height) {
+                    Ok(h) if h == c.hash => {
+                        let from = watch_cursor::rescan_from(&c, beldex_rekey_window, beldex_start);
+                        src.beldex.resume_after(from);
+                        println!(
+                            "  beldex watcher: the saved cursor ({}) was made under another mint key; rescanning \
+                             after height {from} for deposits that key signed and that never minted",
+                            c.height
+                        );
+                    }
+                    _ => println!("  beldex watcher: the saved cursor (another key) does not match this chain; scanning from the configured start"),
+                },
+                Ok(Some(watch_cursor::Loaded::Ours(c))) => match src.beldex.block_hash(c.height) {
                     Ok(h) if h == c.hash => {
                         src.beldex.resume_after(c.height);
                         beldex_saved = c.height;
@@ -2366,8 +2389,23 @@ where
                 Err(e) => eprintln!("  beldex watcher: ignoring the saved cursor: {e}"),
             }
             for (w, c) in src.evm.iter_mut().zip(configs) {
-                match watch_cursor::load(dir, &format!("evm-{}", c.chain_id), &evm_identity(c)) {
-                    Ok(Some(cur)) => match w.block_hash(cur.height) {
+                match watch_cursor::load(dir, &format!("evm-{}", c.chain_id), &evm_identity(c), &evm_key) {
+                    Ok(Some(watch_cursor::Loaded::OtherKey(cur))) => match w.block_hash(cur.height) {
+                        Ok(Some(h)) if h == cur.hash => {
+                            let from = watch_cursor::rescan_from(&cur, evm_rekey_window, c.start_block);
+                            w.resume_from(from);
+                            println!(
+                                "  evm chain {}: the saved cursor ({}) was made under another gateway key; rescanning \
+                                 from block {from} for burns that key signed and that were never released",
+                                c.chain_id, cur.height
+                            );
+                        }
+                        _ => println!(
+                            "  evm chain {}: the saved cursor (another key) does not match this chain; scanning from the configured start",
+                            c.chain_id
+                        ),
+                    },
+                    Ok(Some(watch_cursor::Loaded::Ours(cur))) => match w.block_hash(cur.height) {
                         Ok(Some(h)) if h == cur.hash => {
                             w.resume_from(cur.height + 1);
                             evm_saved.insert(c.chain_id, cur.height);
@@ -2822,7 +2860,7 @@ where
             let h = src.beldex.finalized_up_to();
             if h > beldex_saved && mint_key_replaced.is_empty() && held_mints.is_empty() && watch_cursor::mints_settled(unfinished.iter().copied()) {
                 match src.beldex.block_hash(h) {
-                    Ok(hash) => match watch_cursor::save(dir, "beldex", &beldex_identity, &Cursor { height: h, hash }) {
+                    Ok(hash) => match watch_cursor::save(dir, "beldex", &beldex_identity, &beldex_key, &Cursor { height: h, hash }) {
                         Ok(()) => beldex_saved = h,
                         Err(e) => eprintln!("  beldex cursor not saved: {e}"),
                     },
@@ -2844,7 +2882,7 @@ where
                 match w.block_hash(h) {
                     Ok(Some(hash)) => {
                         let name = format!("evm-{}", c.chain_id);
-                        match watch_cursor::save(dir, &name, &evm_identity(c), &Cursor { height: h, hash }) {
+                        match watch_cursor::save(dir, &name, &evm_identity(c), &evm_key, &Cursor { height: h, hash }) {
                             Ok(()) => {
                                 evm_saved.insert(c.chain_id, h);
                             }

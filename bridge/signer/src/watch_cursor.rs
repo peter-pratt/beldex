@@ -17,6 +17,15 @@
 //! still has that block there: a cursor from another chain (a fresh devnet deploys wBDX at
 //! the same address), from another gateway, or from before a reorg is ignored, and the
 //! watcher starts from its configured height instead.
+//!
+//! A cursor also names the key its progress was made under: the mint key for the Beldex
+//! side, the gateway owner key for an EVM chain. Work that key signed but that never landed
+//! (a mint its relayers could not get mined, a release still in the mempool when the
+//! gateway changed owner) can no longer complete once the key is replaced, and the
+//! successor has to sign it again. A member of both committees would otherwise resume past
+//! it and never see it again, and the successor cannot reach its threshold without that
+//! member's own observation. So a cursor saved under another key is not resumed from; the
+//! watcher rescans a window behind it (see [`Loaded::OtherKey`]).
 
 use crate::orchestrator::Duty;
 use std::io::Write;
@@ -37,9 +46,25 @@ fn path(dir: &Path, name: &str) -> std::path::PathBuf {
     dir.join(format!("{name}.cursor"))
 }
 
+/// A cursor read back for this chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Loaded {
+    /// Saved under this node's current key: resume after it.
+    Ours(Cursor),
+    /// Saved under another key (or before cursors named one). Work signed under that key may
+    /// still be owed again; rescan from [`rescan_from`] rather than resume.
+    OtherKey(Cursor),
+}
+
+/// Where to rescan from after a key change: `window` blocks behind the old cursor, but
+/// never before the configured start.
+pub fn rescan_from(old: &Cursor, window: u64, configured_start: u64) -> u64 {
+    old.height.saturating_sub(window).max(configured_start)
+}
+
 /// Read the cursor saved as `name`, if it was saved for `identity` (the gateway, or the
 /// chain and contract). A cursor for another identity is not this one's progress.
-pub fn load(dir: &Path, name: &str, identity: &str) -> Result<Option<Cursor>, String> {
+pub fn load(dir: &Path, name: &str, identity: &str, key: &str) -> Result<Option<Loaded>, String> {
     let p = path(dir, name);
     let text = match std::fs::read_to_string(&p) {
         Ok(t) => t,
@@ -59,17 +84,18 @@ pub fn load(dir: &Path, name: &str, identity: &str) -> Result<Option<Cursor>, St
         .and_then(Result::ok)
         .and_then(|b| <[u8; 32]>::try_from(b).ok())
         .ok_or_else(|| format!("{}: bad hash", p.display()))?;
-    Ok(Some(Cursor { height, hash }))
+    let c = Cursor { height, hash };
+    Ok(Some(if field("key ") == Some(key) { Loaded::Ours(c) } else { Loaded::OtherKey(c) }))
 }
 
 /// Save a cursor, atomically: a crash leaves the old one or the new one, never half.
-pub fn save(dir: &Path, name: &str, identity: &str, c: &Cursor) -> Result<(), String> {
+pub fn save(dir: &Path, name: &str, identity: &str, key: &str, c: &Cursor) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let p = path(dir, name);
     let tmp = p.with_extension(format!("cursor.{}.tmp", std::process::id()));
     {
         let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
-        writeln!(f, "identity {identity}\nheight {}\nhash {}", c.height, hex(&c.hash))
+        writeln!(f, "identity {identity}\nkey {key}\nheight {}\nhash {}", c.height, hex(&c.hash))
             .map_err(|e| format!("write {}: {e}", tmp.display()))?;
         f.sync_all().map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
     }
@@ -105,14 +131,14 @@ mod tests {
     fn a_cursor_reloads_only_for_its_own_identity() {
         let dir = tmpdir("roundtrip");
         let c = Cursor { height: 1234, hash: [0xAB; 32] };
-        save(&dir, "evm-31337", "evm chain 31337 contract e7f1", &c).unwrap();
-        assert_eq!(load(&dir, "evm-31337", "evm chain 31337 contract e7f1").unwrap(), Some(c));
-        assert_eq!(load(&dir, "evm-31337", "evm chain 31337 contract 9999").unwrap(), None, "another contract");
-        assert_eq!(load(&dir, "evm-1", "evm chain 1 contract e7f1").unwrap(), None, "never saved");
+        save(&dir, "evm-31337", "evm chain 31337 contract e7f1", "k1", &c).unwrap();
+        assert_eq!(load(&dir, "evm-31337", "evm chain 31337 contract e7f1", "k1").unwrap(), Some(Loaded::Ours(c)));
+        assert_eq!(load(&dir, "evm-31337", "evm chain 31337 contract 9999", "k1").unwrap(), None, "another contract");
+        assert_eq!(load(&dir, "evm-1", "evm chain 1 contract e7f1", "k1").unwrap(), None, "never saved");
         // Saving again replaces it in place.
         let later = Cursor { height: 2000, hash: [0xCD; 32] };
-        save(&dir, "evm-31337", "evm chain 31337 contract e7f1", &later).unwrap();
-        assert_eq!(load(&dir, "evm-31337", "evm chain 31337 contract e7f1").unwrap(), Some(later));
+        save(&dir, "evm-31337", "evm chain 31337 contract e7f1", "k1", &later).unwrap();
+        assert_eq!(load(&dir, "evm-31337", "evm chain 31337 contract e7f1", "k1").unwrap(), Some(Loaded::Ours(later)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -121,7 +147,25 @@ mod tests {
         let dir = tmpdir("damaged");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("beldex.cursor"), "identity gw\nheight 10\nhash zz\n").unwrap();
-        assert!(load(&dir, "beldex", "gw").is_err());
+        assert!(load(&dir, "beldex", "gw", "k").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Progress made under another key is not resumed from: what that key signed may have
+    /// to be signed again by its successor, so the watcher rescans a window behind it. A
+    /// cursor from before cursors named a key counts as another key's.
+    #[test]
+    fn a_cursor_saved_under_another_key_is_rescanned_behind() {
+        let dir = tmpdir("rekey");
+        let c = Cursor { height: 50_000, hash: [0x11; 32] };
+        save(&dir, "beldex", "gw", "old-key", &c).unwrap();
+        assert_eq!(load(&dir, "beldex", "gw", "new-key").unwrap(), Some(Loaded::OtherKey(c)));
+        assert_eq!(rescan_from(&c, 20_160, 0), 29_840);
+        assert_eq!(rescan_from(&c, 20_160, 40_000), 40_000, "never before the configured start");
+        assert_eq!(rescan_from(&c, 90_000, 0), 0);
+
+        std::fs::write(dir.join("beldex.cursor"), format!("identity gw\nheight 7\nhash {}\n", "22".repeat(32))).unwrap();
+        assert!(matches!(load(&dir, "beldex", "gw", "new-key").unwrap(), Some(Loaded::OtherKey(_))));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
