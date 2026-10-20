@@ -1138,6 +1138,15 @@ bool validate_gateway_descriptor_operation(BlockchainDB& db, network_type nettyp
             reason = "a takeover begin must leave the descriptor unchanged";
             return false;
           }
+          // One delay after a takeover ended, so the standby cannot begin on every block
+          // and make the owner sign a cancel each time.
+          const uint64_t ended = acct.takeover_ended_height();
+          if (ended != 0 && height < ended + gateway_standby_takeover_blocks(nettype))
+          {
+            reason = "takeover cooling down: " + std::to_string(ended + gateway_standby_takeover_blocks(nettype) - height)
+                     + " more block(s)";
+            return false;
+          }
         }
         else
         {
@@ -1993,12 +2002,12 @@ namespace
           if (!takeovers.empty() && takeovers.front().gateway_id == op.address_id)
           {
             const bool begin = takeovers.front().action == gateway_takeover_action::begin;
-            acct.takeover_log.push_back(gateway_takeover_entry{txh, begin ? block_height : 0});
+            acct.takeover_log.push_back(gateway_takeover_entry{txh, begin ? block_height : 0, block_height});
             if (acct.version < 3) acct.version = 3;
           }
           else if (acct.takeover_started_height() != 0)
           {
-            acct.takeover_log.push_back(gateway_takeover_entry{txh, 0});
+            acct.takeover_log.push_back(gateway_takeover_entry{txh, 0, block_height});
             if (acct.version < 3) acct.version = 3;
           }
         }
@@ -2020,7 +2029,7 @@ namespace
         // Governance chose the owner: a running takeover ends here.
         if (acct.takeover_started_height() != 0)
         {
-          acct.takeover_log.push_back(gateway_takeover_entry{get_transaction_hash(tx), 0});
+          acct.takeover_log.push_back(gateway_takeover_entry{get_transaction_hash(tx), 0, block_height});
           if (acct.version < 3) acct.version = 3;
         }
       }
@@ -2042,7 +2051,7 @@ namespace
         // was unfrozen.
         if (op.freeze != 0 && acct.takeover_started_height() != 0)
         {
-          acct.takeover_log.push_back(gateway_takeover_entry{get_transaction_hash(tx), 0});
+          acct.takeover_log.push_back(gateway_takeover_entry{get_transaction_hash(tx), 0, block_height});
           if (acct.version < 3) acct.version = 3;
         }
       }

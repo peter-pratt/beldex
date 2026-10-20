@@ -3773,6 +3773,11 @@ namespace cryptonote::rpc {
       cmd.response["takeover_started_height"] = started;
       cmd.response["takeover_ready_height"] =
           started ? started + cryptonote::gateway_standby_takeover_blocks(m_core.get_nettype()) : uint64_t{0};
+      // No takeover may begin before this height (0 = none pending): one delay after the
+      // last one ended.
+      const uint64_t ended = acct.takeover_ended_height();
+      cmd.response["takeover_cooldown_until_height"] =
+          ended ? ended + cryptonote::gateway_standby_takeover_blocks(m_core.get_nettype()) : uint64_t{0};
 
       auto balances = json::array();
       for (const auto& b : acct.balances)

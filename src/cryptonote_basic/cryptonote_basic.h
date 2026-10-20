@@ -383,10 +383,13 @@ namespace cryptonote
   {
     crypto::hash tx;              // the tx that changed the takeover state
     uint64_t     started_height;  // the takeover's start height after it (0 = none)
+    uint64_t     height = 0;      // the block it was applied in; an ended takeover's
+                                  // cooldown runs from here
 
     BEGIN_SERIALIZE_OBJECT()
       FIELD(tx)
       VARINT_FIELD(started_height)
+      VARINT_FIELD(height)
     END_SERIALIZE()
   };
 
@@ -418,6 +421,12 @@ namespace cryptonote
 
     // Height the running takeover began at, or 0 if none is running.
     uint64_t takeover_started_height() const { return takeover_log.empty() ? 0 : takeover_log.back().started_height; }
+    // Height of the block that last ended a takeover without it running on (a cancel,
+    // a freeze, a re-point or a completion), or 0 if none has.
+    uint64_t takeover_ended_height() const
+    {
+      return takeover_log.empty() || takeover_log.back().started_height != 0 ? 0 : takeover_log.back().height;
+    }
 
     BEGIN_SERIALIZE_OBJECT()
       FIELD(version)

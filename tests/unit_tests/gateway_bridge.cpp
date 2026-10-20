@@ -2373,3 +2373,30 @@ TEST(GatewayStandbyTakeover, a_freeze_or_repoint_cancels_a_running_takeover)
   ASSERT_TRUE(rewind_gateways_from_transactions(db, {repoint}, 403, true, &reason)) << reason;
   EXPECT_EQ(blob_of(gw, db), running);
 }
+
+// After a takeover ends without completing, the standby waits a full delay before it may
+// begin again, so it cannot make the owner sign a cancel on every block.
+TEST(GatewayStandbyTakeover, a_cancelled_takeover_cools_down_for_a_delay)
+{
+  MemGatewayDB db;
+  const OwnerKeys owner = new_owner_keys(), standby = new_owner_keys();
+  const crypto::public_key gw = seed_with_standby(db, owner, standby);
+  const uint64_t wait = gateway_standby_takeover_blocks(NET_TO);
+  std::string reason;
+
+  const auto begin = takeover_update(gw, current(db, gw), gateway_takeover_action::begin, standby);
+  ASSERT_TRUE(append_gateways_from_transactions(db, {begin}, 500, true, &reason)) << reason;
+  const auto cancel = takeover_update(gw, current(db, gw), std::nullopt, owner);
+  ASSERT_TRUE(append_gateways_from_transactions(db, {cancel}, 501, true, &reason)) << reason;
+
+  const auto again = takeover_update(gw, current(db, gw), gateway_takeover_action::begin, standby);
+  db.chain_height = 501 + wait - 1;
+  EXPECT_FALSE(valid(db, again, reason));
+  EXPECT_NE(reason.find("cooling down: 1 more"), std::string::npos) << reason;
+  db.chain_height = 501 + wait;
+  EXPECT_TRUE(valid(db, again, reason)) << reason;
+
+  // Rewinding the cancel brings the takeover back as it was, cooldown and all.
+  ASSERT_TRUE(rewind_gateways_from_transactions(db, {cancel}, 501, true, &reason)) << reason;
+  EXPECT_EQ(started(db, gw), 500u);
+}
