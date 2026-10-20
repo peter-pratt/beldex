@@ -937,12 +937,10 @@ namespace tools
                 "bridge_chain_id "s + std::to_string(it->bridge_chain_id) + " (" + std::string(chain->name) +
                 ") is not valid on this wallet's network. Supported: " +
                 cryptonote::supported_bridge_chains_str(m_wallet->nettype())};
-          std::string_view eth_hex = it->bridge_evm_address;
-          if (eth_hex.size() >= 2 && eth_hex[0] == '0' && (eth_hex[1] == 'x' || eth_hex[1] == 'X'))
-            eth_hex.remove_prefix(2);
           crypto::eth_address eth_addr{};
-          if (!tools::hex_to_type(eth_hex, eth_addr))
-            throw wallet_rpc_error{error_code::WRONG_ADDRESS, "invalid bridge_evm_address: "s + it->bridge_evm_address};
+          std::string why;
+          if (!cryptonote::parse_bridge_evm_address(it->bridge_evm_address, eth_addr, why))
+            throw wallet_rpc_error{error_code::WRONG_ADDRESS, "invalid bridge_evm_address "s + it->bridge_evm_address + ": " + why};
           de.gateway_bridge_chain_id = it->bridge_chain_id;
           de.gateway_bridge_evm_addr = eth_addr;
         }

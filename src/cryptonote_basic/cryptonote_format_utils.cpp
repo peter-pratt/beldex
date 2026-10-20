@@ -1010,6 +1010,53 @@ namespace cryptonote
     return result;
   }
   //---------------------------------------------------------------
+  bool parse_bridge_evm_address(std::string_view text, crypto::eth_address& out, std::string& reason)
+  {
+    std::string_view hex = text;
+    if (hex.size() >= 2 && hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X'))
+      hex.remove_prefix(2);
+    if (hex.size() != 40 || !tools::hex_to_type(hex, out))
+    {
+      reason = "not an EVM address (40 hex characters, optionally after 0x)";
+      return false;
+    }
+    if (out == crypto::eth_address{})
+    {
+      reason = "the zero address: tokens minted there can never be moved";
+      return false;
+    }
+    bool lower = false, upper = false;
+    for (char c : hex)
+    {
+      lower |= (c >= 'a' && c <= 'f');
+      upper |= (c >= 'A' && c <= 'F');
+    }
+    if (lower && upper)
+    {
+      // EIP-55: a letter is upper case iff the matching nibble of keccak256(lowercase hex)
+      // is 8 or more.
+      std::string low(hex);
+      for (char& c : low)
+        if (c >= 'A' && c <= 'F') c = c - 'A' + 'a';
+      const crypto::hash h = crypto::cn_fast_hash(low.data(), low.size());
+      const auto* hb = reinterpret_cast<const unsigned char*>(h.data);
+      for (size_t i = 0; i < 40; ++i)
+      {
+        const char c = hex[i];
+        if (!((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+          continue;
+        const int nibble = (i % 2 == 0) ? (hb[i / 2] >> 4) : (hb[i / 2] & 0x0f);
+        if ((nibble >= 8) != (c >= 'A' && c <= 'F'))
+        {
+          reason = "the EIP-55 checksum (its mix of upper and lower case) does not match: "
+                   "a character is probably mistyped";
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+  //---------------------------------------------------------------
   bool add_gateway_takeover_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_gateway_takeover& op)
   {
     tx_extra_field field = op;

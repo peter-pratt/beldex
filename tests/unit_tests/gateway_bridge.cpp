@@ -2437,3 +2437,33 @@ TEST(GatewayStandbyTakeover, a_cancelled_takeover_cools_down_for_a_delay)
   ASSERT_TRUE(rewind_gateways_from_transactions(db, {cancel}, 501, true, &reason)) << reason;
   EXPECT_EQ(started(db, gw), 500u);
 }
+
+// A deposit's EVM address decides who gets the minted wBDX, for good. Beyond the shape, the
+// wallet refuses the zero address and any mixed-case address whose EIP-55 checksum fails.
+TEST(GatewayBridgeMemo, evm_addresses_are_checked_before_a_deposit)
+{
+  crypto::eth_address a{};
+  std::string reason;
+  // The EIP-55 specification's own examples.
+  for (const char* ok : {"0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359",
+                         "0xdbF03B407c01E7cD3CBea99509d93f8DDDC8C6FB", "0xD1220A0cf47c7B9Be7A2E6BA89F429762e7b9aDb",
+                         "5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"})
+    EXPECT_TRUE(parse_bridge_evm_address(ok, a, reason)) << ok << ": " << reason;
+  EXPECT_EQ(a.data[0], 0x5a);
+
+  // No checksum to check: taken as written.
+  EXPECT_TRUE(parse_bridge_evm_address("0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed", a, reason)) << reason;
+  EXPECT_TRUE(parse_bridge_evm_address("0X5AAEB6053F3E94C9B9A09F33669435E7EF1BEAED", a, reason)) << reason;
+
+  // One letter's case flipped: a likely typo, caught.
+  EXPECT_FALSE(parse_bridge_evm_address("0x5aaEb6053F3E94C9b9A09f33669435E7Ef1BeAed", a, reason));
+  EXPECT_NE(reason.find("EIP-55"), std::string::npos) << reason;
+  EXPECT_FALSE(parse_bridge_evm_address("0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d35A", a, reason));
+
+  // The zero address, and anything not 20 bytes of hex.
+  EXPECT_FALSE(parse_bridge_evm_address("0x0000000000000000000000000000000000000000", a, reason));
+  EXPECT_NE(reason.find("zero address"), std::string::npos) << reason;
+  for (const char* bad : {"", "0x", "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAe", "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAedd",
+                          "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAeg"})
+    EXPECT_FALSE(parse_bridge_evm_address(bad, a, reason)) << bad;
+}

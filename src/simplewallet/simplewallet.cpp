@@ -6063,9 +6063,10 @@ bool simple_wallet::transfer_main(Transfer transfer_type, const std::vector<std:
             }
             crypto::eth_address evm_addr{};
             const std::string evm_hex = match[2].str(); // 40 hex chars, 0x already stripped by the regex
-            if (!tools::hex_to_type(evm_hex, evm_addr))
+            std::string why;
+            if (!cryptonote::parse_bridge_evm_address(evm_hex, evm_addr, why))
             {
-              fail_msg_writer() << tr("invalid bridge evm address: ") << evm_hex;
+              fail_msg_writer() << tr("invalid bridge evm address ") << evm_hex << ": " << why;
               return false;
             }
             de.gateway_bridge_chain_id = chain_id;

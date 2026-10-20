@@ -174,6 +174,12 @@ namespace cryptonote
   bool add_gateway_bridge_memo_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_gateway_bridge_memo& memo);
   bool add_gateway_freeze_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_gateway_freeze& op);
   bool add_gateway_takeover_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_gateway_takeover& op);
+
+  // Parse the EVM address a bridge deposit mints to: 40 hex characters, optionally after 0x.
+  // A wrong address mints to someone else for good, so beyond the shape: the zero address is
+  // refused, and a mixed-case address must carry a valid EIP-55 checksum (all-lowercase or
+  // all-uppercase carries none and is taken as written). `reason` says what is wrong.
+  bool parse_bridge_evm_address(std::string_view text, crypto::eth_address& out, std::string& reason);
   bool add_gateway_repoint_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_gateway_repoint& op);
   bool add_gateway_release_ref_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_gateway_release_ref& ref);
   bool add_bridge_registration_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_bridge_registration& reg);
