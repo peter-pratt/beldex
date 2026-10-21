@@ -212,6 +212,8 @@ namespace hashkey {
   // evidence non-interchangeable.
   inline constexpr std::string_view GW_FREEZE       = "gateway_freeze"sv;       // supermajority freeze/unfreeze attestation message
   inline constexpr std::string_view GW_REPOINT      = "gateway_repoint"sv;      // supermajority owner re-point attestation message
+  // Standby takeover (HF23): the owner's standalone cancel of a running takeover.
+  inline constexpr std::string_view GW_TAKEOVER_CANCEL = "gateway_takeover_cancel"sv;
   // Phase F accountability: the bridge-committee slash-report domain. MUST match the
   // off-chain signer's `slash::SLASH_REPORT_DOMAIN` byte-for-byte.
   inline constexpr std::string_view BRIDGE_SLASH    = "bridge_slash_report_v1"sv; // bridge accountability slash report

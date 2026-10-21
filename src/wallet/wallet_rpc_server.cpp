@@ -77,6 +77,7 @@ namespace
 
   constexpr const char default_rpc_username[] = "beldex";
 
+
   std::optional<tools::password_container> password_prompter(const char *prompt, bool verify)
   {
     auto pwd_container = tools::password_container::prompt(verify, prompt);
@@ -157,6 +158,33 @@ namespace
         message{std::move(message)}
     {}
   };
+
+  // A gateway owner's signature, as the RPCs that carry one take it: a type name and hex.
+  cryptonote::gateway_owner_sig_v parse_gateway_owner_sig(const std::string& type, const std::string& hex)
+  {
+    if (type == "schnorr" || type == "ed25519")
+    {
+      crypto::signature s;
+      if (!tools::hex_to_type(hex, s))
+        throw wallet_rpc_error{error_code::WRONG_SIGNATURE, "Invalid schnorr signature (expected 128-char hex)"};
+      return s;
+    }
+    if (type == "eth")
+    {
+      crypto::eth_signature s;
+      if (!tools::hex_to_type(hex, s))
+        throw wallet_rpc_error{error_code::WRONG_SIGNATURE, "Invalid eth signature (expected 130-char hex)"};
+      return s;
+    }
+    if (type == "eddsa")
+    {
+      crypto::eddsa_signature s;
+      if (!tools::hex_to_type(hex, s))
+        throw wallet_rpc_error{error_code::WRONG_SIGNATURE, "Invalid eddsa signature (expected 128-char hex)"};
+      return s;
+    }
+    throw wallet_rpc_error{error_code::WRONG_SIGNATURE, "signature_type must be one of: schnorr, eth, eddsa"};
+  }
 
   uint32_t convert_priority(uint32_t priority)
   {
@@ -3203,6 +3231,38 @@ namespace {
     return res;
   }
 
+  GATEWAY_TAKEOVER_CANCEL::response wallet_rpc_server::invoke(GATEWAY_TAKEOVER_CANCEL::request&& req)
+  {
+    require_open();
+    GATEWAY_TAKEOVER_CANCEL::response res{};
+
+    cryptonote::tx_extra_gateway_takeover cancel{};
+    cancel.version = 1;
+    cancel.action  = cryptonote::gateway_takeover_action::cancel;
+    if (!tools::hex_to_type(req.gateway_id, cancel.gateway_id))
+      throw wallet_rpc_error{error_code::WRONG_ADDRESS, "invalid gateway_id (expected 64-char hex)"};
+    cancel.started_height = req.started_height;
+    cancel.sig = parse_gateway_owner_sig(req.signature_type, req.signature);
+
+    tools::wallet2::bridge_rotation_ack_result built =
+        m_wallet->create_gateway_takeover_cancel_tx(cancel, req.priority);
+    if (!built.success)
+      throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, built.msg};
+    try
+    {
+      m_wallet->commit_tx(built.ptx, false /*flash*/);
+    }
+    catch (const std::exception& e)
+    {
+      // The daemon rejects a cancel for a takeover that is not running, or one the owner
+      // did not sign: surface its reason.
+      throw wallet_rpc_error{error_code::GENERIC_TRANSFER_ERROR,
+                             std::string("Failed to commit the takeover cancel: ") + e.what()};
+    }
+    res.tx_hash = tools::type_to_hex(cryptonote::get_transaction_hash(built.ptx.tx));
+    return res;
+  }
+
   BRIDGE_ROTATION_ACK::response wallet_rpc_server::invoke(BRIDGE_ROTATION_ACK::request&& req)
   {
     require_open();
@@ -3452,30 +3512,7 @@ namespace {
       throw wallet_rpc_error{error_code::BAD_TX_METADATA, "Failed to parse tx metadata."};
     }
 
-    cryptonote::gateway_owner_sig_v sig;
-    if (req.signature_type == "schnorr" || req.signature_type == "ed25519")
-    {
-      crypto::signature s;
-      if (!tools::hex_to_type(req.signature, s))
-        throw wallet_rpc_error{error_code::WRONG_SIGNATURE, "Invalid schnorr signature (expected 128-char hex)"};
-      sig = s;
-    }
-    else if (req.signature_type == "eth")
-    {
-      crypto::eth_signature s;
-      if (!tools::hex_to_type(req.signature, s))
-        throw wallet_rpc_error{error_code::WRONG_SIGNATURE, "Invalid eth signature (expected 130-char hex)"};
-      sig = s;
-    }
-    else if (req.signature_type == "eddsa")
-    {
-      crypto::eddsa_signature s;
-      if (!tools::hex_to_type(req.signature, s))
-        throw wallet_rpc_error{error_code::WRONG_SIGNATURE, "Invalid eddsa signature (expected 128-char hex)"};
-      sig = s;
-    }
-    else
-      throw wallet_rpc_error{error_code::WRONG_SIGNATURE, "signature_type must be one of: schnorr, eth, eddsa"};
+    const cryptonote::gateway_owner_sig_v sig = parse_gateway_owner_sig(req.signature_type, req.signature);
 
     if (!cryptonote::attach_gateway_ownership_proof(m_wallet->nettype(), ptx.tx, sig))
       throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, "Transaction is not an update_gateway_address tx"};

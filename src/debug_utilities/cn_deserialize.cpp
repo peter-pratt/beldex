@@ -126,8 +126,12 @@ struct extra_printer {
               << " (" << x.observers.size() << " observers)";
   }
   void operator()(const tx_extra_gateway_takeover& x) {
-    std::cout << "gateway takeover (" << (x.action == cryptonote::gateway_takeover_action::begin ? "begin" : "complete")
+    std::cout << "gateway takeover ("
+              << (x.action == cryptonote::gateway_takeover_action::begin ? "begin"
+                  : x.action == cryptonote::gateway_takeover_action::complete ? "complete" : "cancel")
               << ") for " << x.gateway_id;
+    if (x.version >= 1)
+      std::cout << " of the takeover begun at " << x.started_height;
   }
   void operator()(const tx_extra_gateway_release_ref& x) {
     std::cout << "Gateway release ref: chain " << x.chain_id << " burn " << x.evm_txid

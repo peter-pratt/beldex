@@ -2467,3 +2467,95 @@ TEST(GatewayBridgeMemo, evm_addresses_are_checked_before_a_deposit)
                           "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAeg"})
     EXPECT_FALSE(parse_bridge_evm_address(bad, a, reason)) << bad;
 }
+
+// The owner's standalone cancel (a version-1 takeover step): signed over the gateway and the
+// takeover's start height, not over the carrying tx, so the owner committee signs it from
+// chain state alone and any wallet carries it in a bridge_registration tx.
+namespace
+{
+  transaction standalone_cancel(const crypto::public_key& gw, uint64_t started, const OwnerKeys& signer,
+                                txtype type = txtype::bridge_registration)
+  {
+    transaction tx{};
+    tx.version = txversion::v4_tx_types;
+    tx.type    = type;
+    tx.vin.push_back(txin_gen{0});
+    tx_extra_gateway_takeover t{};
+    t.version = 1;
+    t.gateway_id = gw;
+    t.action = gateway_takeover_action::cancel;
+    t.started_height = started;
+    crypto::signature sig;
+    crypto::generate_signature(gateway_takeover_cancel_message(NET_TO, gw, started), signer.pub, signer.sec, sig);
+    t.sig = sig;
+    EXPECT_TRUE(add_gateway_takeover_to_tx_extra(tx.extra, t));
+    return tx;
+  }
+  bool tx_valid(MemGatewayDB& db, const transaction& tx, std::string& reason)
+  {
+    return validate_tx_gateway_operations_against_db(db, NET_TO, tx, hf::hf23_bridge, {}, reason);
+  }
+}
+
+TEST(GatewayStandbyTakeover, the_owner_cancels_with_a_standalone_signed_step)
+{
+  MemGatewayDB db;
+  const OwnerKeys owner = new_owner_keys(), standby = new_owner_keys(), stranger = new_owner_keys();
+  const crypto::public_key gw = seed_with_standby(db, owner, standby);
+  std::string reason;
+
+  // Nothing to cancel yet.
+  EXPECT_FALSE(tx_valid(db, standalone_cancel(gw, 700, owner), reason));
+  EXPECT_NE(reason.find("no running takeover"), std::string::npos) << reason;
+
+  const auto begin = takeover_update(gw, current(db, gw), gateway_takeover_action::begin, standby);
+  ASSERT_TRUE(append_gateways_from_transactions(db, {begin}, 700, true, &reason)) << reason;
+  const std::string running = blob_of(gw, db);
+  db.chain_height = 701;
+
+  // Only the owner, and only for the takeover that is running.
+  for (const OwnerKeys* who : {&standby, &stranger})
+  {
+    EXPECT_FALSE(tx_valid(db, standalone_cancel(gw, 700, *who), reason));
+    EXPECT_NE(reason.find("not signed by the gateway's owner"), std::string::npos) << reason;
+  }
+  EXPECT_FALSE(tx_valid(db, standalone_cancel(gw, 699, owner), reason));
+  EXPECT_NE(reason.find("no running takeover"), std::string::npos) << reason;
+
+  // It stands alone, in a bridge_registration tx.
+  EXPECT_FALSE(tx_valid(db, standalone_cancel(gw, 700, owner, txtype::standard), reason));
+  EXPECT_NE(reason.find("bridge_registration"), std::string::npos) << reason;
+
+  const auto cancel = standalone_cancel(gw, 700, owner);
+  ASSERT_TRUE(tx_valid(db, cancel, reason)) << reason;
+
+  // Two members' wallets carry the same cancel into one block: the first ends the takeover,
+  // the second changes nothing.
+  auto again = standalone_cancel(gw, 700, owner);
+  again.vin.front() = txin_gen{1}; // another carrier tx
+  ASSERT_TRUE(append_gateways_from_transactions(db, {cancel, again}, 701, true, &reason)) << reason;
+  EXPECT_EQ(started(db, gw), 0u);
+  gateway_account_data a;
+  ASSERT_TRUE(load_gateway_account(db, gw, a));
+  EXPECT_EQ(a.takeover_ended_height(), 701u) << "the cooldown runs from the cancel";
+  EXPECT_EQ(a.takeover_log.size(), 2u) << "one begin, one cancel";
+
+  // A reorg puts the takeover back exactly.
+  ASSERT_TRUE(rewind_gateways_from_transactions(db, {cancel, again}, 701, true, &reason)) << reason;
+  EXPECT_EQ(blob_of(gw, db), running);
+}
+
+// A version-0 marker cannot be a cancel: the standalone form is the only one.
+TEST(GatewayStandbyTakeover, a_cancel_is_never_a_descriptor_update_marker)
+{
+  MemGatewayDB db;
+  const OwnerKeys owner = new_owner_keys(), standby = new_owner_keys();
+  const crypto::public_key gw = seed_with_standby(db, owner, standby);
+  std::string reason;
+  const auto begin = takeover_update(gw, current(db, gw), gateway_takeover_action::begin, standby);
+  ASSERT_TRUE(append_gateways_from_transactions(db, {begin}, 800, true, &reason)) << reason;
+  db.chain_height = 801;
+  const auto marker = takeover_update(gw, current(db, gw), gateway_takeover_action::cancel, owner);
+  EXPECT_FALSE(tx_valid(db, marker, reason));
+  EXPECT_NE(reason.find("standalone"), std::string::npos) << reason;
+}

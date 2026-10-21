@@ -3066,7 +3066,10 @@ namespace master_nodes
         cryptonote::tx_extra_bridge_rotation_ack rot_ack{};
         cryptonote::tx_extra_bridge_slash        slash{};
         cryptonote::tx_extra_bridge_unbond       unbond{};
-        if (cryptonote::get_field_from_tx_extra(tx.extra, rot_ack))
+        cryptonote::tx_extra_gateway_takeover    takeover{};
+        if (cryptonote::get_field_from_tx_extra(tx.extra, takeover))
+          {} // a gateway owner's takeover cancel: gateway state only (gateway_utils)
+        else if (cryptonote::get_field_from_tx_extra(tx.extra, rot_ack))
           process_bridge_rotation_ack_tx(nettype, block, tx, resolve_bridge_committee);
         else if (cryptonote::get_field_from_tx_extra(tx.extra, slash))
           process_bridge_slash_tx(nettype, block, tx, resolve_bridge_committee);

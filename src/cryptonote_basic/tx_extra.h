@@ -668,18 +668,34 @@ namespace cryptonote
   //              standby. That is an ordinary owner change from then on.
   // Any update signed by the OWNER while a takeover runs cancels it: an owner that can
   // still sign is alive, and that is all the takeover exists to establish.
-  enum class gateway_takeover_action : uint8_t { begin = 1, complete = 2 };
+  //
+  // Version 1 is a standalone step, carried by a bridge_registration tx any wallet pays
+  // for: no descriptor update, and a signature over gateway_takeover_cancel_message
+  // (gateway, started_height) rather than over the carrying tx. So every member of the
+  // owner committee can rebuild what it signs from the chain alone, and any of them can
+  // submit it. Only `cancel` exists in this form: signed by the OWNER, it ends the
+  // takeover that began at started_height.
+  enum class gateway_takeover_action : uint8_t { begin = 1, complete = 2, cancel = 3 };
 
   struct tx_extra_gateway_takeover
   {
     uint8_t                 version = 0;
     crypto::public_key      gateway_id{};
     gateway_takeover_action action = gateway_takeover_action::begin;
+    // version >= 1 (standalone):
+    uint64_t                started_height = 0;
+    gateway_owner_sig_v     sig;
 
     BEGIN_SERIALIZE()
       FIELD(version)
       FIELD(gateway_id)
-      ENUM_FIELD(action, action == gateway_takeover_action::begin || action == gateway_takeover_action::complete)
+      ENUM_FIELD(action, action == gateway_takeover_action::begin || action == gateway_takeover_action::complete
+                         || action == gateway_takeover_action::cancel)
+      if (version >= 1)
+      {
+        VARINT_FIELD(started_height)
+        FIELD(sig)
+      }
     END_SERIALIZE()
   };
 

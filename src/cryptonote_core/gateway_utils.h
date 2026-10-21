@@ -76,6 +76,18 @@ crypto::hash gateway_repoint_message(network_type nettype, const crypto::public_
                                      const gateway_descriptor_base& new_owner_descriptor,
                                      uint64_t governance_seq, uint64_t epoch_height);
 
+// What a gateway's OWNER signs to cancel the standby takeover that began at
+// `started_height` (a version-1 tx_extra_gateway_takeover). Bound to the chain, the gateway
+// and that takeover, not to any tx, so the owner committee can sign it from chain state
+// alone and any wallet can carry it.
+crypto::hash gateway_takeover_cancel_message(network_type nettype, const crypto::public_key& gateway_id,
+                                             uint64_t started_height);
+
+// A version-1 takeover cancel against the stored state: a running takeover that began at
+// its started_height, and the gateway owner's signature over the cancel message.
+bool validate_gateway_takeover_cancel(BlockchainDB& db, network_type nettype,
+                                      const tx_extra_gateway_takeover& t, std::string& reason);
+
 // Verify a supermajority attestation set (`evidence`) over `msg` against the
 // checkpoint quorum resolved for `epoch_height`. Requires at least
 // ceil(SUPERMAJORITY_NUM/DEN · quorum_size) signatures, each from a distinct,

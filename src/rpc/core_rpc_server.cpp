@@ -827,11 +827,15 @@ namespace cryptonote::rpc {
             std::string_view{reinterpret_cast<const char*>(x.new_signer.data()), x.new_signer.size()};
       }
       void operator()(const tx_extra_gateway_takeover& x) {
-        set("gateway_takeover", json{
+        json j{
             {"version", x.version},
             {"gateway_id", tools::type_to_hex(x.gateway_id)},
-            {"action", x.action == gateway_takeover_action::begin ? "begin" : "complete"},
-        });
+            {"action", x.action == gateway_takeover_action::begin ? "begin"
+                       : x.action == gateway_takeover_action::complete ? "complete" : "cancel"},
+        };
+        if (x.version >= 1)
+          j["started_height"] = x.started_height;
+        set("gateway_takeover", std::move(j));
       }
       void operator()(const tx_extra_gateway_release_ref& x) {
         set("gateway_release_ref", json{
@@ -3773,6 +3777,12 @@ namespace cryptonote::rpc {
       cmd.response["takeover_started_height"] = started;
       cmd.response["takeover_ready_height"] =
           started ? started + cryptonote::gateway_standby_takeover_blocks(m_core.get_nettype()) : uint64_t{0};
+      // While one runs: exactly what the owner signs to cancel it (a version-1 cancel), so
+      // the owner committee's signers take it from their own daemon rather than rebuild the
+      // chain-bound hash themselves.
+      if (started)
+        cmd.response["takeover_cancel_message"] = tools::type_to_hex(
+            cryptonote::gateway_takeover_cancel_message(m_core.get_nettype(), gw_id, started));
       // No takeover may begin before this height (0 = none pending): one delay after the
       // last one ended.
       const uint64_t ended = acct.takeover_ended_height();

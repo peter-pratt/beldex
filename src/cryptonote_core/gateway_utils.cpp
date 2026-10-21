@@ -316,6 +316,15 @@ crypto::hash gateway_freeze_message(network_type nettype, const crypto::public_k
   return gateway_governance_message(hashkey::GW_FREEZE, nettype, fields);
 }
 
+crypto::hash gateway_takeover_cancel_message(network_type nettype, const crypto::public_key& gateway_id,
+                                             uint64_t started_height)
+{
+  std::string fields;
+  fields.append(reinterpret_cast<const char*>(&gateway_id), sizeof(gateway_id));
+  append_u64_le(fields, started_height);
+  return gateway_governance_message(hashkey::GW_TAKEOVER_CANCEL, nettype, fields);
+}
+
 crypto::hash gateway_repoint_message(network_type nettype, const crypto::public_key& gateway_id,
                                      const gateway_descriptor_base& new_owner_descriptor,
                                      uint64_t governance_seq, uint64_t epoch_height)
@@ -1585,6 +1594,36 @@ bool decrypt_gateway_bridge_memo(const transaction& tx, const tx_extra_gateway_b
   return true;
 }
 
+bool validate_gateway_takeover_cancel(BlockchainDB& db, network_type nettype,
+                                      const tx_extra_gateway_takeover& t, std::string& reason)
+{
+  if (t.version != 1 || t.action != gateway_takeover_action::cancel)
+  {
+    reason = "a standalone takeover step must be a version-1 cancel";
+    return false;
+  }
+  gateway_account_data acct;
+  if (!load_gateway_account(db, t.gateway_id, acct) || acct.descriptor_history.empty())
+  {
+    reason = "takeover cancel for an unknown gateway";
+    return false;
+  }
+  const uint64_t started = acct.takeover_started_height();
+  if (started == 0 || started != t.started_height)
+  {
+    reason = "takeover cancel names no running takeover (running: " + std::to_string(started)
+             + ", named: " + std::to_string(t.started_height) + ")";
+    return false;
+  }
+  const crypto::hash msg = gateway_takeover_cancel_message(nettype, t.gateway_id, t.started_height);
+  if (!verify_gateway_owner_signature(acct.latest_descriptor().owner_key, t.sig, msg))
+  {
+    reason = "takeover cancel is not signed by the gateway's owner";
+    return false;
+  }
+  return true;
+}
+
 bool validate_tx_gateway_operations_against_db(BlockchainDB& db, network_type nettype, const transaction& tx,
                                                hf hf_version, const checkpoint_quorum_resolver& resolve_quorum,
                                                std::string& reason)
@@ -1743,12 +1782,40 @@ bool validate_tx_gateway_operations_against_db(BlockchainDB& db, network_type ne
   const bool is_gateway_type =
       tx.type == txtype::register_gateway_address || tx.type == txtype::update_gateway_address;
 
-  // A takeover marker only means something on the update it rides with.
-  if (!extract_gateway_takeovers(tx).empty() &&
-      (ops.empty() || ops.front().op_type != gateway_descriptor_op_type::update_address))
+  // A version-0 takeover marker only means something on the update it rides with. A
+  // version-1 one stands alone: the owner's cancel, carried by any wallet.
   {
-    reason = "gateway takeover marker without a descriptor update";
-    return false;
+    const auto takeovers = extract_gateway_takeovers(tx);
+    const bool standalone = std::any_of(takeovers.begin(), takeovers.end(),
+                                        [](const auto& t) { return t.version >= 1; });
+    if (standalone)
+    {
+      if (hf_version < feature::BRIDGE)
+      {
+        reason = "standalone gateway takeover step before HF23";
+        return false;
+      }
+      if (takeovers.size() != 1 || !ops.empty() || tx_has_gateway_constructs(tx) || has_governance
+          || !release_refs.empty() || tx.type != txtype::bridge_registration)
+      {
+        reason = "a standalone gateway takeover step must be the only gateway content of a bridge_registration tx";
+        return false;
+      }
+      if (!validate_gateway_takeover_cancel(db, nettype, takeovers.front(), reason))
+        return false;
+    }
+    else if (!takeovers.empty() &&
+             (ops.empty() || ops.front().op_type != gateway_descriptor_op_type::update_address))
+    {
+      reason = "gateway takeover marker without a descriptor update";
+      return false;
+    }
+    else if (std::any_of(takeovers.begin(), takeovers.end(),
+                         [](const auto& t) { return t.action == gateway_takeover_action::cancel; }))
+    {
+      reason = "a takeover cancel is standalone (version 1), not a descriptor update";
+      return false;
+    }
   }
 
   if (ops.empty())
@@ -2053,10 +2120,32 @@ namespace
         acct.frozen = (op.freeze != 0) ? 1 : 0;
         ++acct.governance_seq;
         if (acct.version < 1) acct.version = 1;
+        // (see 1d for the owner's standalone cancel)
         // A freeze is governance's veto of a running takeover. Without this the clock kept
         // running while the gateway was frozen, and the takeover completed the moment it
         // was unfrozen.
         if (op.freeze != 0 && acct.takeover_started_height() != 0)
+        {
+          acct.takeover_log.push_back(gateway_takeover_entry{get_transaction_hash(tx), 0, block_height});
+          if (acct.version < 3) acct.version = 3;
+        }
+      }
+
+      // 1d) the owner's standalone takeover cancel (HF23): end the takeover it names. Every
+      // member of the owner committee may carry the same signed cancel, so one landing after
+      // another (or after the takeover ended otherwise) changes nothing, and its rewind,
+      // matching by tx hash, then pops nothing either.
+      for (const auto& t : extract_gateway_takeovers(tx))
+      {
+        if (t.version < 1 || t.action != gateway_takeover_action::cancel)
+          continue;
+        gateway_account_data& acct = get(t.gateway_id);
+        if (acct.descriptor_history.empty())
+        {
+          set_reason(reason, "takeover cancel for an unknown gateway");
+          return false;
+        }
+        if (acct.takeover_started_height() != 0 && acct.takeover_started_height() == t.started_height)
         {
           acct.takeover_log.push_back(gateway_takeover_entry{get_transaction_hash(tx), 0, block_height});
           if (acct.version < 3) acct.version = 3;
@@ -2250,6 +2339,17 @@ bool rewind_gateways_from_transactions(BlockchainDB& db, const std::vector<trans
           return false;
         }
       }
+    }
+
+    // undo standalone takeover cancels: pop the entry this tx pushed, if it pushed one.
+    for (const auto& t : extract_gateway_takeovers(tx))
+    {
+      if (t.version < 1)
+        continue;
+      bool ok = false;
+      gateway_account_data& acct = get(t.gateway_id, ok);
+      if (ok && !acct.takeover_log.empty() && acct.takeover_log.back().tx == tx_hash)
+        acct.takeover_log.pop_back();
     }
 
     // undo freezes: restore the prior flag (append validated freeze != prior) and
