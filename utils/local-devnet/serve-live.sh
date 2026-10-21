@@ -18,6 +18,14 @@
 #     checkpoints (every devnet). Without it NO deposit can ever mint, silently.
 #   * BRIDGE_SIGNER_SIGN_SIGNERS — lets committee indices >= t+1 start at all.
 #
+# ROLE=standby starts STANDBY signers instead, alongside the live ones, on every node that
+# holds SHARE_SUBDIR (default shares-standby there) with MESH_PORT_BASE (default 7000 there):
+# they sign only a takeover's begin and complete, once they see the live key failing
+# (OUTAGE_WINDOW_SECS, default 60 here; minutes on a public network). They keep their own
+# logs (serve-standby-<node>.log), cursors and settings (serve-standby.last), and stopping or
+# restarting them never touches the live signers. PROBE_* passes the optional probe deposit
+# through (BRIDGE_SIGNER_PROBE_*).
+#
 # Stop with:  pkill -f 'beldex-bridge-signer serve'
 # Logs:       testdata/serve-<node>.log   (watch the `tick N: opened/acked/...` lines)
 
@@ -41,6 +49,13 @@ RELEASE_GATEWAY="${RELEASE_GATEWAY:-$GATEWAY_ID}"
 : "${WBDX:?set WBDX (deployed WrappedBDX address, 0x…)}"
 EVM_RPC="${EVM_RPC:-http://127.0.0.1:8545}"
 CHAIN_ID="${CHAIN_ID:-31337}"
+ROLE="${ROLE:-live}"
+if [ "$ROLE" = standby ]; then
+  SHARE_SUBDIR="${SHARE_SUBDIR:-shares-standby}"; MESH_PORT_BASE="${MESH_PORT_BASE:-7000}"
+  TAG=serve-standby; SUFFIX=-standby
+else
+  TAG=serve; SUFFIX=
+fi
 NODES="${NODES:-all}"          # which committee indices to start (default: all with shares)
 THRESHOLD="${THRESHOLD:-4}"    # t+1, for the liveness warning below
 
@@ -159,9 +174,16 @@ SIGNER="${SIGNER:-$(git rev-parse --show-toplevel)/bridge/signer/target/debug/be
 [ -x "$SIGNER" ] || { echo "build first: cargo build -p beldex-bridge-signer --features serve-live"; exit 1; }
 ANY32=$(printf '11%.0s' {1..32})
 
-pkill -f 'beldex-bridge-signer serve' 2>/dev/null || true
-sleep 1
-rm -f serve-*.log
+if [ "$ROLE" = standby ]; then
+  # Only this script's earlier standby signers: the live ones keep running.
+  [ -s serve-standby.pids ] && xargs -r kill < serve-standby.pids 2>/dev/null || true
+  sleep 1
+  rm -f serve-standby-*.log serve-standby.pids
+else
+  pkill -f 'beldex-bridge-signer serve' 2>/dev/null || true
+  sleep 1
+  rm -f serve-*.log serve-standby.pids
+fi
 
 started=0
 PIDS=()
@@ -183,7 +205,9 @@ for d in beldex-127.0.0.1-*/; do
   # NB: read from the node's OWN `shares` tree, never from $share — under SHARE_SUBDIR=shares-pool
   # every node sees all six keypackages and `head -1` would report index 0 for all of them,
   # silently collapsing the NODES filter and handing RELAY_CMD to the whole fleet.
-  idx=$(ls "$SOCKBASE/${d}devnet/shares"/pgw-*.keypackage 2>/dev/null | sed -E 's/.*pgw-([0-9]+)\.keypackage/\1/' | head -1) || true
+  # (A standby signer reads it from its own standby tree: the node may hold no live share.)
+  own="$SOCKBASE/${d}devnet/shares"; [ "$ROLE" = standby ] && own="$share"
+  idx=$(ls "$own"/pgw-*.keypackage 2>/dev/null | sed -E 's/.*pgw-([0-9]+)\.keypackage/\1/' | head -1) || true
   [ -n "$idx" ] || { echo "skip ${d%/}: no pgw share (did dkg run here?)"; continue; }
   if [ "$NODES" != "all" ]; then
     case ",$NODES," in
@@ -224,14 +248,19 @@ for d in beldex-127.0.0.1-*/; do
   BRIDGE_SIGNER_BELDEX_START_HEIGHT="$START_HEIGHT" \
   BRIDGE_SIGNER_BELDEX_CONFIRMATIONS="$BELDEX_CONFIRMATIONS" \
   BRIDGE_SIGNER_EVM_CHAINS="$EVM_CHAINS" \
-  BRIDGE_SIGNER_EVM_FINALITY_DIR="$SOCKBASE/${d}devnet/evm-finality" \
-  BRIDGE_SIGNER_WATCH_CURSOR_DIR="$SOCKBASE/${d}devnet/watch-cursors" \
+  BRIDGE_SIGNER_EVM_FINALITY_DIR="$SOCKBASE/${d}devnet/evm-finality${SUFFIX}" \
+  BRIDGE_SIGNER_WATCH_CURSOR_DIR="$SOCKBASE/${d}devnet/watch-cursors${SUFFIX}" \
+  BRIDGE_SIGNER_ROLE="$ROLE" \
+  BRIDGE_SIGNER_OUTAGE_WINDOW_SECS="${OUTAGE_WINDOW_SECS:-60}" \
+  BRIDGE_SIGNER_PROBE_WALLET_RPC="${PROBE_WALLET_RPC:-}" BRIDGE_SIGNER_PROBE_EVERY_SECS="${PROBE_EVERY_SECS:-}" \
+  BRIDGE_SIGNER_PROBE_CHAIN_ID="${PROBE_CHAIN_ID:-}" BRIDGE_SIGNER_PROBE_EVM_ADDRESS="${PROBE_EVM_ADDRESS:-}" \
   BRIDGE_SIGNER_ACK_WALLET_RPC="${ACK_WALLET_RPC:-}" \
   BRIDGE_SIGNER_WATCH_POLL_SECS="$POLL_SECS" \
   BRIDGE_SIGNER_RELEASE_GATEWAY="$RELEASE_GATEWAY" \
   BRIDGE_SIGNER_RELEASE_FEE="$RELEASE_FEE" \
-    "$SIGNER" serve > "serve-${d%/}.log" 2>&1 &
+    "$SIGNER" serve > "$TAG-${d%/}.log" 2>&1 &
   PIDS+=("$!:${d%/}")
+  [ "$ROLE" = standby ] && echo "$!" >> serve-standby.pids
   started=$((started + 1))
 done
 
@@ -252,9 +281,9 @@ echo
 if [ "${#dead[@]}" -gt 0 ]; then
   echo "!! $alive of $started still alive after 2s — these exited immediately:"
   for node in ${dead[@]+"${dead[@]}"}; do
-    echo "   $node: $(grep -v '^(no .env file' "serve-${node}.log" | head -2 | tr '\n' ' ')"
+    echo "   $node: $(grep -v '^(no .env file' "$TAG-${node}.log" | head -2 | tr '\n' ' ')"
   done
-  echo "   full output: testdata/serve-<node>.log"
+  echo "   full output: testdata/$TAG-<node>.log"
   exit 1
 fi
 
@@ -271,7 +300,8 @@ fi
   done
   printf 'ACK_WALLET_RPC=%q\nMESH_PORT_BASE=%q\nSHARE_SUBDIR=%q\nSTAGE_TIMEOUT_TICKS=%q\n' \
     "${ACK_WALLET_RPC:-}" "${MESH_PORT_BASE:-6000}" "${SHARE_SUBDIR:-shares}" "${STAGE_TIMEOUT_TICKS:-4}"
-} > serve-live.last
+  printf 'ROLE=%q\nOUTAGE_WINDOW_SECS=%q\n' "$ROLE" "${OUTAGE_WINDOW_SECS:-60}"
+} > "$( [ "$ROLE" = standby ] && echo serve-standby.last || echo serve-live.last )"
 
 echo "$alive signer(s) serving (need >= $THRESHOLD observing the same event to sign)"
 echo "watch:  tail -f testdata/serve-*.log"
