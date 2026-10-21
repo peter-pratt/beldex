@@ -20,11 +20,17 @@ pub const ROTATE_SELECTOR: [u8; 4] = [0x95, 0x0c, 0x57, 0xf3];
 /// `cancelStandbyTakeover(bytes)` selector: the live committee's cancel of a standby
 /// takeover it can still sign against.
 pub const CANCEL_TAKEOVER_SELECTOR: [u8; 4] = [0x54, 0x76, 0x85, 0x8c];
+/// `beginStandbyTakeover(bytes)` selector: the standby committee starts the clock.
+pub const BEGIN_TAKEOVER_SELECTOR: [u8; 4] = [0xca, 0xbc, 0xec, 0xea];
+/// `completeStandbyTakeover(bytes)` selector: after the delay, the standby becomes the signer.
+pub const COMPLETE_TAKEOVER_SELECTOR: [u8; 4] = [0x42, 0x9d, 0x05, 0xe2];
 
 /// The canonical function signatures (used only by the drift-guard tests).
 pub const MINT_SIG: &[u8] = b"mint(address,uint256,bytes32,uint32,bytes)";
 pub const ROTATE_SIG: &[u8] = b"rotateSigner(address,uint64,uint64,uint256,bytes)";
 pub const CANCEL_TAKEOVER_SIG: &[u8] = b"cancelStandbyTakeover(bytes)";
+pub const BEGIN_TAKEOVER_SIG: &[u8] = b"beginStandbyTakeover(bytes)";
+pub const COMPLETE_TAKEOVER_SIG: &[u8] = b"completeStandbyTakeover(bytes)";
 
 /// `keccak256(fn_sig)[..4]` — the 4-byte selector for a function signature.
 pub fn selector_of(fn_sig: &[u8]) -> [u8; 4] {
@@ -86,14 +92,20 @@ pub fn build_mint_calldata(
     out
 }
 
-/// Build the calldata for `cancelStandbyTakeover(bytes sig)`: one head word, the offset
-/// (0x20) to `sig`, then `sig`.
-pub fn build_cancel_takeover_calldata(sig: &[u8]) -> Vec<u8> {
+/// Build the calldata for one of the `…StandbyTakeover(bytes sig)` calls (`selector` is
+/// one of the three takeover selectors): one head word, the offset (0x20) to `sig`, then
+/// `sig`.
+pub fn build_takeover_calldata(selector: [u8; 4], sig: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + 32 * 2 + sig.len() + 32);
-    out.extend_from_slice(&CANCEL_TAKEOVER_SELECTOR);
+    out.extend_from_slice(&selector);
     out.extend_from_slice(&word_u256(0x20));
     push_dynamic_bytes(&mut out, sig);
     out
+}
+
+/// `cancelStandbyTakeover(bytes sig)`.
+pub fn build_cancel_takeover_calldata(sig: &[u8]) -> Vec<u8> {
+    build_takeover_calldata(CANCEL_TAKEOVER_SELECTOR, sig)
 }
 
 /// Build the calldata for `rotateSigner(address newSigner, uint64 newKeyEpoch,
@@ -128,6 +140,8 @@ mod tests {
         assert_eq!(MINT_SELECTOR, selector_of(MINT_SIG));
         assert_eq!(ROTATE_SELECTOR, selector_of(ROTATE_SIG));
         assert_eq!(CANCEL_TAKEOVER_SELECTOR, selector_of(CANCEL_TAKEOVER_SIG));
+        assert_eq!(BEGIN_TAKEOVER_SELECTOR, selector_of(BEGIN_TAKEOVER_SIG));
+        assert_eq!(COMPLETE_TAKEOVER_SELECTOR, selector_of(COMPLETE_TAKEOVER_SIG));
         // Pin the exact bytes so a drift is caught even if the signature string changed.
         assert_eq!(MINT_SELECTOR, [0x7f, 0x00, 0x00, 0x0a]);
         assert_eq!(ROTATE_SELECTOR, [0x95, 0x0c, 0x57, 0xf3]);

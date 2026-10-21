@@ -5,7 +5,38 @@
 //! authorizing signature is already inside the payload, and the destination contract checks
 //! it. If every relayer vanishes, any user can build the same [`PreparedCall`] and broadcast.
 
-use crate::abi::{build_cancel_takeover_calldata, build_mint_calldata, build_rotate_calldata};
+use crate::abi::{
+    build_mint_calldata, build_rotate_calldata, build_takeover_calldata, BEGIN_TAKEOVER_SELECTOR,
+    CANCEL_TAKEOVER_SELECTOR, COMPLETE_TAKEOVER_SELECTOR,
+};
+
+/// Which step of a standby takeover a [`RelayPayload::TakeoverStep`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TakeoverStepKind {
+    /// The standby committee starts the clock (`beginStandbyTakeover`).
+    Begin,
+    /// After the delay, the standby committee takes over (`completeStandbyTakeover`).
+    Complete,
+    /// The live committee, still able to sign, stops it (`cancelStandbyTakeover`).
+    Cancel,
+}
+
+impl TakeoverStepKind {
+    fn json_kind(self) -> &'static str {
+        match self {
+            TakeoverStepKind::Begin => "takeover_begin",
+            TakeoverStepKind::Complete => "takeover_complete",
+            TakeoverStepKind::Cancel => "takeover_cancel",
+        }
+    }
+    fn selector(self) -> [u8; 4] {
+        match self {
+            TakeoverStepKind::Begin => BEGIN_TAKEOVER_SELECTOR,
+            TakeoverStepKind::Complete => COMPLETE_TAKEOVER_SELECTOR,
+            TakeoverStepKind::Cancel => CANCEL_TAKEOVER_SELECTOR,
+        }
+    }
+}
 
 /// A ready-to-broadcast EVM call: send `data` to `to` on chain `chain_id`, paying gas.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,10 +73,10 @@ pub enum RelayPayload {
         deadline: u128,
         sig: Vec<u8>,
     },
-    /// The live committee's `cancelStandbyTakeover`: its key can still sign, so a standby
-    /// takeover begun against it is cancelled. The signature is bound by the contract to
-    /// the running takeover's nonce and the key epoch.
-    TakeoverCancel { contract: [u8; 20], chain_id: u64, sig: Vec<u8> },
+    /// A step of a standby takeover: the standby committee's begin or complete, or the live
+    /// committee's cancel. The contract binds each signature to the takeover's nonce and the
+    /// key epoch, so a relayer can carry it and do nothing else with it.
+    TakeoverStep { step: TakeoverStepKind, contract: [u8; 20], chain_id: u64, sig: Vec<u8> },
 }
 
 impl RelayPayload {
@@ -53,7 +84,7 @@ impl RelayPayload {
         match self {
             RelayPayload::Mint { chain_id, .. }
             | RelayPayload::Rotate { chain_id, .. }
-            | RelayPayload::TakeoverCancel { chain_id, .. } => *chain_id,
+            | RelayPayload::TakeoverStep { chain_id, .. } => *chain_id,
         }
     }
 
@@ -61,7 +92,7 @@ impl RelayPayload {
         match self {
             RelayPayload::Mint { contract, .. }
             | RelayPayload::Rotate { contract, .. }
-            | RelayPayload::TakeoverCancel { contract, .. } => *contract,
+            | RelayPayload::TakeoverStep { contract, .. } => *contract,
         }
     }
 
@@ -74,7 +105,7 @@ impl RelayPayload {
             RelayPayload::Rotate { new_signer, new_key_epoch, nonce, deadline, sig, .. } => {
                 build_rotate_calldata(*new_signer, *new_key_epoch, *nonce, *deadline, sig)
             }
-            RelayPayload::TakeoverCancel { sig, .. } => build_cancel_takeover_calldata(sig),
+            RelayPayload::TakeoverStep { step, sig, .. } => build_takeover_calldata(step.selector(), sig),
         }
     }
 
@@ -131,7 +162,8 @@ mod json {
         ///   "amount": "1000", "beldex_txid": "<64hex>", "sig": "<130hex>" }
         /// { "kind": "rotate", "contract": "<40hex>", "chain_id": 1,
         ///   "new_signer": "<40hex>", "new_key_epoch": 7, "sig": "<130hex>" }
-        /// { "kind": "takeover_cancel", "contract": "<40hex>", "chain_id": 1, "sig": "<130hex>" }
+        /// { "kind": "takeover_begin" | "takeover_complete" | "takeover_cancel",
+        ///   "contract": "<40hex>", "chain_id": 1, "sig": "<130hex>" }
         /// ```
         ///
         /// `amount` is a decimal **string** (a wBDX unit is 1 atomic BDX; u128 to be safe).
@@ -140,7 +172,13 @@ mod json {
             let kind = get_str(&v, "kind")?;
             // Reject an unknown kind BEFORE parsing shared fields, so a bad kind
             // surfaces as UnknownKind rather than a field error on contract/sig.
-            if kind != "mint" && kind != "rotate" && kind != "takeover_cancel" {
+            let step = match kind {
+                "takeover_begin" => Some(TakeoverStepKind::Begin),
+                "takeover_complete" => Some(TakeoverStepKind::Complete),
+                "takeover_cancel" => Some(TakeoverStepKind::Cancel),
+                _ => None,
+            };
+            if kind != "mint" && kind != "rotate" && step.is_none() {
                 return Err(PayloadError::UnknownKind(kind.to_string()));
             }
             let chain_id = v.get("chain_id").and_then(Value::as_u64).ok_or(PayloadError::MissingField("chain_id"))?;
@@ -185,7 +223,9 @@ mod json {
                         contract, chain_id, new_signer, new_key_epoch, nonce, deadline, sig,
                     })
                 }
-                "takeover_cancel" => Ok(RelayPayload::TakeoverCancel { contract, chain_id, sig }),
+                _ if step.is_some() => Ok(RelayPayload::TakeoverStep {
+                    step: step.expect("checked"), contract, chain_id, sig,
+                }),
                 other => Err(PayloadError::UnknownKind(other.to_string())),
             }
         }
@@ -215,9 +255,9 @@ mod json {
                     hexs(contract), chain_id, hexs(new_signer), new_key_epoch, nonce,
                     deadline, hexs(sig),
                 ),
-                RelayPayload::TakeoverCancel { contract, chain_id, sig } => format!(
-                    r#"{{"kind":"takeover_cancel","contract":"{}","chain_id":{},"sig":"{}"}}"#,
-                    hexs(contract), chain_id, hexs(sig),
+                RelayPayload::TakeoverStep { step, contract, chain_id, sig } => format!(
+                    r#"{{"kind":"{}","contract":"{}","chain_id":{},"sig":"{}"}}"#,
+                    step.json_kind(), hexs(contract), chain_id, hexs(sig),
                 ),
             }
         }
@@ -252,14 +292,26 @@ mod tests {
     #[cfg(feature = "json")]
     #[cfg(feature = "json")]
     #[test]
-    fn a_takeover_cancel_round_trips_and_targets_its_contract() {
-        let p = RelayPayload::TakeoverCancel { contract: [0x22; 20], chain_id: 31337, sig: vec![0xAB; 65] };
-        let back = RelayPayload::from_json(&p.to_json()).unwrap();
-        assert_eq!(back, p);
-        let call = back.to_prepared();
-        assert_eq!(call.chain_id, 31337);
-        assert_eq!(call.to, [0x22; 20]);
-        assert_eq!(&call.data[..4], &crate::abi::CANCEL_TAKEOVER_SELECTOR);
+    fn takeover_steps_round_trip_and_target_their_contract() {
+        for (step, selector) in [
+            (TakeoverStepKind::Begin, crate::abi::BEGIN_TAKEOVER_SELECTOR),
+            (TakeoverStepKind::Complete, crate::abi::COMPLETE_TAKEOVER_SELECTOR),
+            (TakeoverStepKind::Cancel, crate::abi::CANCEL_TAKEOVER_SELECTOR),
+        ] {
+            let p = RelayPayload::TakeoverStep { step, contract: [0x22; 20], chain_id: 31337, sig: vec![0xAB; 65] };
+            let back = RelayPayload::from_json(&p.to_json()).unwrap();
+            assert_eq!(back, p);
+            let call = back.to_prepared();
+            assert_eq!(call.chain_id, 31337);
+            assert_eq!(call.to, [0x22; 20]);
+            assert_eq!(&call.data[..4], &selector);
+        }
+        // The signer's cancel payload, exactly as it emits it.
+        let cancel = r#"{"kind":"takeover_cancel","contract":"2222222222222222222222222222222222222222","chain_id":31337,"sig":"ab"}"#;
+        assert!(matches!(
+            RelayPayload::from_json(cancel).unwrap(),
+            RelayPayload::TakeoverStep { step: TakeoverStepKind::Cancel, .. }
+        ));
         assert!(matches!(
             RelayPayload::from_json(r#"{"kind":"takeover_cancel","chain_id":1,"contract":"22"}"#),
             Err(_)
