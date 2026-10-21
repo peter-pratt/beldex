@@ -56,6 +56,7 @@ pub fn session_key(leg: Leg, epoch: u64, key: &DutyKey) -> [u8; 32] {
     buf.push(match key.kind {
         DutyKind::Mint => 0,
         DutyKind::Release => 1,
+        DutyKind::Cancel => 2,
     });
     buf.extend_from_slice(&key.id);
     // One transaction can carry several duties; without `sub` they share a session key.
@@ -132,9 +133,7 @@ impl ProposalPolicy for MintPolicy {
                     Err(BuildError::Unactionable(format!("no contract for chain {}", ev.dst_chain.0)))
                 }
             }
-            Duty::Release(_) => Err(BuildError::Unactionable(
-                "release coordination requires the R1-R6 policy (not yet wired)".into(),
-            )),
+            _ => Err(BuildError::Unactionable("not a mint".into())),
         }
     }
 
@@ -147,9 +146,7 @@ impl ProposalPolicy for MintPolicy {
                     .ok_or_else(|| BuildError::Unactionable(format!("no contract for chain {}", ev.dst_chain.0)))?;
                 Ok(ev.mint_preimage(*contract))
             }
-            Duty::Release(_) => Err(BuildError::Unactionable(
-                "release coordination requires the R1-R6 policy (not yet wired)".into(),
-            )),
+            _ => Err(BuildError::Unactionable("not a mint".into())),
         }
     }
 
@@ -165,7 +162,7 @@ impl ProposalPolicy for MintPolicy {
                     ProposalVerdict::Reject(NackReason::PayloadMismatch)
                 }
             }
-            Duty::Release(_) => ProposalVerdict::Reject(NackReason::PayloadMismatch),
+            _ => ProposalVerdict::Reject(NackReason::PayloadMismatch),
         }
     }
 
@@ -505,11 +502,14 @@ where
     // ---- 2) open sessions for ready duties ---------------------------------
 
     fn open_ready(&mut self, orch: &mut Orchestrator, report: &mut StepReport) {
-        if self.hold.is_some() {
-            return; // held: ready duties wait in the orchestrator
-        }
         let ready: Vec<Duty> = orch.ready().into_iter().cloned().collect();
         for duty in ready {
+            // Held: mints and releases wait in the orchestrator. A takeover cancel never
+            // does: it moves no value, and a hold is exactly when a takeover must not slip
+            // through.
+            if self.hold.is_some() && !matches!(duty, Duty::Cancel(_)) {
+                continue;
+            }
             let key = duty.key();
             let sk = session_key(duty.leg(), self.committee.epoch, &key);
             if self.live.contains_key(&sk) {
@@ -643,7 +643,7 @@ where
                     // same duty first.
                     if live.signature.is_none()
                         && live.acked
-                        && self.hold.is_none()
+                        && (self.hold.is_none() || matches!(live.duty, Duty::Cancel(_)))
                         && !signed_this_step
                         && live.ticks_in_stage >= self.sign_settle_steps
                     {

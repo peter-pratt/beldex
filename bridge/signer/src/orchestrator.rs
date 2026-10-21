@@ -27,13 +27,16 @@
 //! coordination. This module is pure and std-only; the actual I/O is the outer loop's job.
 
 use crate::transport::Leg;
-use crate::watch::{MintEvent, ReleaseEvent};
+use crate::watch::{MintEvent, ReleaseEvent, TakeoverCancel};
 use std::collections::BTreeMap;
 
 /// Which kind of duty — part of the dedup key so a mint `beldex_txid` and a release `evm_txid`
 /// can never collide even if the 32-byte ids happened to coincide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DutyKind {
+    /// Declared first, so a ready cancel sorts (and opens) ahead of mints and releases: it
+    /// has a deadline, they do not.
+    Cancel,
     Mint,
     Release,
 }
@@ -56,6 +59,8 @@ pub enum Duty {
     Mint(MintEvent),
     /// A confirmed wBDX burn to release native BDX for (`Pgw`).
     Release(ReleaseEvent),
+    /// A standby takeover to cancel: `Pevm` on an EVM chain, `Pgw` on the gateway.
+    Cancel(TakeoverCancel),
 }
 
 impl Duty {
@@ -68,6 +73,7 @@ impl Duty {
             Duty::Release(e) => {
                 DutyKey { kind: DutyKind::Release, id: e.evm_txid, sub: e.log_index }
             }
+            Duty::Cancel(c) => DutyKey { kind: DutyKind::Cancel, id: c.id(), sub: 0 },
         }
     }
 
@@ -76,6 +82,8 @@ impl Duty {
         match self {
             Duty::Mint(_) => Leg::Pevm,
             Duty::Release(_) => Leg::Pgw,
+            Duty::Cancel(c) if c.on_gateway() => Leg::Pgw,
+            Duty::Cancel(_) => Leg::Pevm,
         }
     }
 }
@@ -156,6 +164,20 @@ impl Orchestrator {
         }
     }
 
+    /// Reopen a `Done` duty whose effect the chain still does not show: a takeover cancel
+    /// handed off but never landed (the relayer down, the wallet tx dropped). Dedup would
+    /// otherwise keep the takeover's re-sightings from ever producing another cancel, and the
+    /// takeover would complete. Only `Done` → `Pending`; anything else is left alone.
+    pub fn reopen(&mut self, key: &DutyKey) -> bool {
+        match self.duties.get_mut(key) {
+            Some(e) if e.status == DutyStatus::Done => {
+                e.status = DutyStatus::Pending;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Seed already-completed keys from on-chain reconciliation (crash-safety). A later
     /// [`observe`](Self::observe) of a seeded key finds it `Done` and does not re-work it.
     /// (The `duty` payload is unknown for a reconciled key, so we record it as a bare `Done`
@@ -180,6 +202,10 @@ impl Orchestrator {
                         amount: 0,
                         beldex_recipient: Vec::new(),
                     }),
+                    DutyKind::Cancel => {
+                        let word = |i: usize| u64::from_le_bytes(key.id[i..i + 8].try_into().unwrap());
+                        Duty::Cancel(TakeoverCancel { chain_id: word(0), takeover_id: word(8), key_epoch: word(16) })
+                    }
                 },
                 status: DutyStatus::Done,
             });
@@ -404,6 +430,33 @@ mod tests {
         // A finalized event for an already-on-chain deposit is not re-worked after a restart.
         assert!(!o.observe(mint(9)));
         assert!(o.ready().is_empty());
+    }
+
+    #[test]
+    fn only_a_done_duty_reopens() {
+        let mut o = Orchestrator::new();
+        let d = Duty::Cancel(crate::watch::TakeoverCancel { chain_id: 1, takeover_id: 2, key_epoch: 3 });
+        let k = d.key();
+        assert!(!o.reopen(&k), "unknown");
+        o.observe(d);
+        assert!(!o.reopen(&k), "pending");
+        o.mark_in_flight(&k);
+        assert!(!o.reopen(&k), "in flight");
+        o.mark_done(&k);
+        assert!(o.reopen(&k));
+        assert_eq!(o.status(&k), Some(DutyStatus::Pending));
+        assert_eq!(o.ready().len(), 1);
+    }
+
+    /// A ready cancel comes before ready mints and releases: it has a deadline.
+    #[test]
+    fn a_cancel_is_ready_first() {
+        let mut o = Orchestrator::new();
+        o.observe(Duty::Mint(MintEvent {
+            beldex_txid: [0; 32], output_index: 0, dst_chain: crate::chain_registry::ChainId(1), to: [0; 20], amount: 1,
+        }));
+        o.observe(Duty::Cancel(crate::watch::TakeoverCancel { chain_id: 9, takeover_id: 9, key_epoch: 9 }));
+        assert!(matches!(o.ready()[0], Duty::Cancel(_)));
     }
 
     #[test]

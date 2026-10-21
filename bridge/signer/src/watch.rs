@@ -61,6 +61,38 @@ fn addr32(a: [u8; 20]) -> [u8; 32] {
     out
 }
 
+/// A standby takeover begun against this committee's live key on one chain: the committee
+/// can still sign, so it cancels it. Read from the chain tip, not finality: a cancel aimed at
+/// a begin a reorg removes simply fails, while waiting for finality spends the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TakeoverCancel {
+    /// The EVM chain whose wBDX contract runs the takeover, or 0 for the Beldex gateway.
+    pub chain_id: u64,
+    /// Which takeover: the contract's `takeoverNonce`, or the gateway's takeover start height.
+    pub takeover_id: u64,
+    /// The key epoch the EVM takeover runs against (0 on the gateway). Bound into the
+    /// contract's cancel digest, so a rotation in between makes this cancel a new duty.
+    pub key_epoch: u64,
+}
+
+impl TakeoverCancel {
+    /// The Beldex gateway's pseudo chain id.
+    pub const GATEWAY: u64 = 0;
+
+    pub fn on_gateway(&self) -> bool {
+        self.chain_id == Self::GATEWAY
+    }
+
+    /// A stable 32-byte id for the duty key: chain, takeover and key epoch, little-endian.
+    pub fn id(&self) -> [u8; 32] {
+        let mut id = [0u8; 32];
+        id[..8].copy_from_slice(&self.chain_id.to_le_bytes());
+        id[8..16].copy_from_slice(&self.takeover_id.to_le_bytes());
+        id[16..24].copy_from_slice(&self.key_epoch.to_le_bytes());
+        id
+    }
+}
+
 /// A finalized Beldex gateway **deposit**, normalized to a mint intent (E.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MintEvent {

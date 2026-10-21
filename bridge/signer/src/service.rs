@@ -26,6 +26,11 @@ pub trait DutyBackend {
     fn handle_mint(&mut self, ev: &MintEvent) -> ExecOutcome;
     /// Build (`gateway_create_transfer`), sign (`Pgw`), and submit (`gateway_submit_transfer`).
     fn handle_release(&mut self, ev: &ReleaseEvent) -> ExecOutcome;
+    /// A takeover cancel. Only the live coordinated backend signs these; the dry-run
+    /// backends never see one, and drop it if they do.
+    fn handle_cancel(&mut self, _cancel: &crate::watch::TakeoverCancel) -> ExecOutcome {
+        ExecOutcome::Abandon
+    }
 }
 
 impl<B: DutyBackend> DutyExecutor for B {
@@ -33,6 +38,7 @@ impl<B: DutyBackend> DutyExecutor for B {
         match duty {
             Duty::Mint(e) => self.handle_mint(e),
             Duty::Release(e) => self.handle_release(e),
+            Duty::Cancel(c) => self.handle_cancel(c),
         }
     }
 }

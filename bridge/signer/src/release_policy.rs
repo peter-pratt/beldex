@@ -354,8 +354,8 @@ where
                 }
                 Ok(())
             }
-            Duty::Mint(_) => Err(BuildError::Unactionable(
-                "the release policy does not handle mints (use DualPolicy)".into(),
+            _ => Err(BuildError::Unactionable(
+                "the release policy handles only releases (use DualPolicy)".into(),
             )),
         }
     }
@@ -399,35 +399,41 @@ where
 // DualPolicy — the production composition (mints + releases in one Coordinator)
 // ============================================================================
 
-/// Dispatches by duty kind: mints to `M`, releases to `R`. This is what `serve --live` runs.
-pub struct DualPolicy<M: ProposalPolicy, R: ProposalPolicy> {
+/// Dispatches by duty kind: mints to `M`, releases to `R`, takeover cancels to `C`. This is
+/// what `serve --live` runs.
+pub struct DualPolicy<M: ProposalPolicy, R: ProposalPolicy, C: ProposalPolicy> {
     pub mint: M,
     pub release: R,
+    pub cancel: C,
 }
 
-impl<M: ProposalPolicy, R: ProposalPolicy> ProposalPolicy for DualPolicy<M, R> {
+impl<M: ProposalPolicy, R: ProposalPolicy, C: ProposalPolicy> ProposalPolicy for DualPolicy<M, R, C> {
     fn actionable(&self, duty: &Duty) -> Result<(), BuildError> {
         match duty {
             Duty::Mint(_) => self.mint.actionable(duty),
             Duty::Release(_) => self.release.actionable(duty),
+            Duty::Cancel(_) => self.cancel.actionable(duty),
         }
     }
     fn build(&mut self, duty: &Duty) -> Result<Vec<u8>, BuildError> {
         match duty {
             Duty::Mint(_) => self.mint.build(duty),
             Duty::Release(_) => self.release.build(duty),
+            Duty::Cancel(_) => self.cancel.build(duty),
         }
     }
     fn verify(&mut self, duty: &Duty, proposal: &[u8]) -> ProposalVerdict {
         match duty {
             Duty::Mint(_) => self.mint.verify(duty, proposal),
             Duty::Release(_) => self.release.verify(duty, proposal),
+            Duty::Cancel(_) => self.cancel.verify(duty, proposal),
         }
     }
     fn signing_message(&self, duty: &Duty, proposal: &[u8]) -> Vec<u8> {
         match duty {
             Duty::Mint(_) => self.mint.signing_message(duty, proposal),
             Duty::Release(_) => self.release.signing_message(duty, proposal),
+            Duty::Cancel(_) => self.cancel.signing_message(duty, proposal),
         }
     }
 }
@@ -742,7 +748,13 @@ mod tests {
 
     #[test]
     fn dual_policy_dispatches_by_duty_kind() {
-        let mut dual = DualPolicy { mint: MintPolicy { contracts: BTreeMap::new() }, release: policy() };
+        let mut dual = DualPolicy {
+            mint: MintPolicy { contracts: BTreeMap::new() },
+            release: policy(),
+            cancel: crate::takeover_guard::CancelPolicy {
+                read: |_: &crate::watch::TakeoverCancel| Ok(crate::takeover_guard::CancelView::Ended),
+            },
+        };
         let release = Duty::Release(burn(1000));
         assert!(dual.actionable(&release).is_ok(), "release routed to the release policy");
         let mint = Duty::Mint(crate::watch::MintEvent {

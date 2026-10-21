@@ -90,18 +90,20 @@ impl DutyReconciler for NoReconcile {
     }
 }
 
-/// Routes each leg to its own reconciler (mints → EVM `processedDeposits`, releases → the
-/// daemon's release-ref set).
-pub struct DualReconciler<M, R> {
+/// Routes each duty kind to its own reconciler (mints → EVM `processedDeposits`, releases →
+/// the daemon's release-ref set, takeover cancels → whether that takeover still runs).
+pub struct DualReconciler<M, R, C> {
     pub mint: M,
     pub release: R,
+    pub cancel: C,
 }
 
-impl<M: DutyReconciler, R: DutyReconciler> DutyReconciler for DualReconciler<M, R> {
+impl<M: DutyReconciler, R: DutyReconciler, C: DutyReconciler> DutyReconciler for DualReconciler<M, R, C> {
     fn is_settled(&mut self, duty: &Duty) -> Option<bool> {
         match duty {
             Duty::Mint(_) => self.mint.is_settled(duty),
             Duty::Release(_) => self.release.is_settled(duty),
+            Duty::Cancel(_) => self.cancel.is_settled(duty),
         }
     }
 }
@@ -428,6 +430,7 @@ mod tests {
         let mut rec = DualReconciler {
             mint: Scripted { answer: Some(true), calls: 0 },
             release: Scripted { answer: Some(false), calls: 0 },
+            cancel: Scripted { answer: None, calls: 0 },
         };
         assert_eq!(
             observe_reconciled(&mut orch, &mut rec, mint(6)),

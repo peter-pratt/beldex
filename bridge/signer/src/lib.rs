@@ -144,6 +144,9 @@ pub mod release_policy;
 /// retries. Fails closed; layered on top of the consensus replay guards, never instead of them.
 pub mod reconcile;
 
+/// The live committee's guard: cancel a standby takeover while this key can still sign.
+pub mod takeover_guard;
+
 /// libsodium consensus-verifier alignment for `Pgw` (C.1 gate (b)). Only built
 /// under the `tss-integration` feature (needs libsodium at link time).
 #[cfg(feature = "tss-integration")]
