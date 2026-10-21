@@ -17,10 +17,14 @@ pub const MINT_SELECTOR: [u8; 4] = [0x7f, 0x00, 0x00, 0x0a];
 /// relayed proposal cannot be replayed to revive a vetoed hand-off or restart the
 /// challenge window.
 pub const ROTATE_SELECTOR: [u8; 4] = [0x95, 0x0c, 0x57, 0xf3];
+/// `cancelStandbyTakeover(bytes)` selector: the live committee's cancel of a standby
+/// takeover it can still sign against.
+pub const CANCEL_TAKEOVER_SELECTOR: [u8; 4] = [0x54, 0x76, 0x85, 0x8c];
 
 /// The canonical function signatures (used only by the drift-guard tests).
 pub const MINT_SIG: &[u8] = b"mint(address,uint256,bytes32,uint32,bytes)";
 pub const ROTATE_SIG: &[u8] = b"rotateSigner(address,uint64,uint64,uint256,bytes)";
+pub const CANCEL_TAKEOVER_SIG: &[u8] = b"cancelStandbyTakeover(bytes)";
 
 /// `keccak256(fn_sig)[..4]` — the 4-byte selector for a function signature.
 pub fn selector_of(fn_sig: &[u8]) -> [u8; 4] {
@@ -82,6 +86,16 @@ pub fn build_mint_calldata(
     out
 }
 
+/// Build the calldata for `cancelStandbyTakeover(bytes sig)`: one head word, the offset
+/// (0x20) to `sig`, then `sig`.
+pub fn build_cancel_takeover_calldata(sig: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 32 * 2 + sig.len() + 32);
+    out.extend_from_slice(&CANCEL_TAKEOVER_SELECTOR);
+    out.extend_from_slice(&word_u256(0x20));
+    push_dynamic_bytes(&mut out, sig);
+    out
+}
+
 /// Build the calldata for `rotateSigner(address newSigner, uint64 newKeyEpoch,
 /// uint64 nonce, uint256 deadline, bytes sig)`.
 ///
@@ -113,9 +127,20 @@ mod tests {
     fn selectors_match_keccak_of_signatures() {
         assert_eq!(MINT_SELECTOR, selector_of(MINT_SIG));
         assert_eq!(ROTATE_SELECTOR, selector_of(ROTATE_SIG));
+        assert_eq!(CANCEL_TAKEOVER_SELECTOR, selector_of(CANCEL_TAKEOVER_SIG));
         // Pin the exact bytes so a drift is caught even if the signature string changed.
         assert_eq!(MINT_SELECTOR, [0x7f, 0x00, 0x00, 0x0a]);
         assert_eq!(ROTATE_SELECTOR, [0x95, 0x0c, 0x57, 0xf3]);
+    }
+
+    /// Byte-for-byte what `cast calldata "cancelStandbyTakeover(bytes)" 0xabab…` (65 bytes)
+    /// produces.
+    #[test]
+    fn cancel_takeover_calldata_matches_cast() {
+        let cd = build_cancel_takeover_calldata(&[0xAB; 65]);
+        let hex: String = cd.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "5476858c00000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000041ababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab00000000000000000000000000000000000000000000000000000000000000");
+        assert_eq!(cd.len(), 4 + 32 + 32 + 96);
     }
 
     #[test]
