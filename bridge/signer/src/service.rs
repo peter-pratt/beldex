@@ -28,7 +28,7 @@ pub trait DutyBackend {
     fn handle_release(&mut self, ev: &ReleaseEvent) -> ExecOutcome;
     /// A takeover cancel. Only the live coordinated backend signs these; the dry-run
     /// backends never see one, and drop it if they do.
-    fn handle_cancel(&mut self, _cancel: &crate::watch::TakeoverCancel) -> ExecOutcome {
+    fn handle_takeover(&mut self, _cancel: &crate::watch::TakeoverStep) -> ExecOutcome {
         ExecOutcome::Abandon
     }
 }
@@ -38,7 +38,7 @@ impl<B: DutyBackend> DutyExecutor for B {
         match duty {
             Duty::Mint(e) => self.handle_mint(e),
             Duty::Release(e) => self.handle_release(e),
-            Duty::Cancel(c) => self.handle_cancel(c),
+            Duty::Takeover(c) => self.handle_takeover(c),
         }
     }
 }

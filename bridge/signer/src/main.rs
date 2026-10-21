@@ -1127,7 +1127,7 @@ fn run_serve(cfg: &Config) -> Result<(), String> {
     println!("  polling every {poll_secs}s across {} EVM chain(s)", configs.len());
 
     let mut backend = LoggingBackend::new(|d: &Duty| match d {
-        Duty::Cancel(c) => println!(
+        Duty::Takeover(c) => println!(
             "CANCEL duty: chain={} takeover={} key_epoch={}",
             c.chain_id, c.takeover_id, c.key_epoch
         ),
@@ -1716,8 +1716,65 @@ impl MintHandoff {
     }
 }
 
-/// Standby-takeover state for this node's key, read from its own RPCs at the chain tip: for
-/// the guard's detection, and for its cancel policy and reconciler.
+/// One wBDX contract's takeover state, read at the tip.
+#[cfg(feature = "serve-live")]
+struct EvmTakeoverState {
+    signer: [u8; 20],
+    standby: [u8; 20],
+    started_at: u64,
+    nonce: u64,
+    key_epoch: u64,
+    delay: u64,
+    cooldown_until: u64,
+    /// The latest block's timestamp: the contract's clock.
+    now: u64,
+}
+
+#[cfg(feature = "serve-live")]
+impl EvmTakeoverState {
+    fn running(&self) -> bool {
+        self.started_at != 0
+    }
+    fn ready(&self) -> bool {
+        self.running() && self.now >= self.started_at.saturating_add(self.delay)
+    }
+    fn cooling(&self) -> bool {
+        self.now < self.cooldown_until
+    }
+}
+
+/// The gateway's takeover state, read from get_gateway_info.
+#[cfg(feature = "serve-live")]
+struct GatewayTakeoverState {
+    owner: String,
+    standby: String,
+    started: u64,
+    ready_height: u64,
+    cooldown_until: u64,
+    height: u64,
+    steps: u64,
+    cancel_message: Option<[u8; 32]>,
+    begin_message: Option<[u8; 32]>,
+    complete_message: Option<[u8; 32]>,
+}
+
+#[cfg(feature = "serve-live")]
+impl GatewayTakeoverState {
+    fn ready(&self) -> bool {
+        self.started != 0 && self.height >= self.ready_height
+    }
+    fn cooling(&self) -> bool {
+        self.height < self.cooldown_until
+    }
+}
+
+/// Standby-takeover state for this node's key, read from its own RPCs at the chain tip, and
+/// what that means for this node's role:
+///  - live: a takeover begun against its key is cancelled while the key can sign;
+///  - standby: when this node sees the live key failing (a deposit final for the outage
+///    window and still unminted), the takeover is begun on every chain, and once every half
+///    is ready, completed on every chain, never one alone.
+/// Shared by detection, the takeover policy and its reconciler.
 #[cfg(feature = "serve-live")]
 struct TakeoverReader {
     /// Each wBDX chain: id, client, contract.
@@ -1726,6 +1783,9 @@ struct TakeoverReader {
     gateway: String,
     pevm_address: [u8; 20],
     pgw_group_vk: [u8; 32],
+    standby_role: bool,
+    /// Standby role: whether this node itself sees the live key failing (set by the loop).
+    outage: std::cell::Cell<bool>,
 }
 
 #[cfg(feature = "serve-live")]
@@ -1749,78 +1809,281 @@ impl TakeoverReader {
         u64::from_be_bytes(w[24..].try_into().expect("8 bytes"))
     }
 
-    /// The takeover running on this wBDX contract against this node's key, as (nonce, key
-    /// epoch), or None when there is none or the key is no longer the signer.
-    fn evm_running(&self, client: &beldex_bridge_signer::evm_watcher::HttpJsonRpc, contract: &[u8; 20]) -> Result<Option<(u64, u64)>, String> {
-        let signer = Self::word(client, contract, "currentSigner()")?;
-        if signer[12..] != self.pevm_address {
-            return Ok(None);
-        }
-        if Self::word(client, contract, "takeoverStartedAt()")? == [0u8; 32] {
-            return Ok(None);
-        }
-        let nonce = Self::low_u64(&Self::word(client, contract, "takeoverNonce()")?);
-        let epoch = Self::low_u64(&Self::word(client, contract, "keyEpoch()")?);
-        Ok(Some((nonce, epoch)))
+    fn address(w: &[u8; 32]) -> [u8; 20] {
+        w[12..].try_into().expect("20 bytes")
     }
 
-    /// The gateway takeover running against this node's key: its start height and the
-    /// message the owner signs to cancel it.
-    fn gateway_running(&self) -> Result<Option<(u64, [u8; 32])>, String> {
+    fn evm_state(client: &beldex_bridge_signer::evm_watcher::HttpJsonRpc, contract: &[u8; 20]) -> Result<EvmTakeoverState, String> {
+        use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
+        let block = client
+            .call("eth_getBlockByNumber", serde_json::json!(["latest", false]))
+            .map_err(|e| format!("latest block: {e:?}"))?;
+        let now = block
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok())
+            .ok_or("latest block has no timestamp")?;
+        Ok(EvmTakeoverState {
+            signer: Self::address(&Self::word(client, contract, "currentSigner()")?),
+            standby: Self::address(&Self::word(client, contract, "standbySigner()")?),
+            started_at: Self::low_u64(&Self::word(client, contract, "takeoverStartedAt()")?),
+            nonce: Self::low_u64(&Self::word(client, contract, "takeoverNonce()")?),
+            key_epoch: Self::low_u64(&Self::word(client, contract, "keyEpoch()")?),
+            delay: Self::low_u64(&Self::word(client, contract, "standbyTakeoverDelayOrDefault()")?),
+            cooldown_until: Self::low_u64(&Self::word(client, contract, "takeoverCooldownUntil()")?),
+            now,
+        })
+    }
+
+    fn gateway_state(&self) -> Result<GatewayTakeoverState, String> {
         use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
         let info = self
             .gateway_rpc
             .call("get_gateway_info", serde_json::json!({ "gateway_address": self.gateway }))
             .map_err(|e| format!("get_gateway_info: {e:?}"))?;
-        let owner = info.get("owner_key").and_then(|v| v.as_str()).unwrap_or_default();
-        if !owner.eq_ignore_ascii_case(&hex(&self.pgw_group_vk)) {
-            return Ok(None);
-        }
-        let started = info.get("takeover_started_height").and_then(|v| v.as_u64()).unwrap_or(0);
-        if started == 0 {
-            return Ok(None);
-        }
-        let msg = info
-            .get("takeover_cancel_message")
-            .and_then(|v| v.as_str())
-            .and_then(config::parse_hex32)
-            .ok_or("a takeover runs but get_gateway_info gives no takeover_cancel_message (daemon too old?)")?;
-        Ok(Some((started, msg)))
+        let s = |k: &str| info.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_lowercase();
+        let n = |k: &str| info.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+        let m = |k: &str| info.get(k).and_then(|v| v.as_str()).and_then(config::parse_hex32);
+        let height = self
+            .gateway_rpc
+            .call("get_info", serde_json::json!({}))
+            .ok()
+            .and_then(|i| i.get("height").and_then(|h| h.as_u64()))
+            .ok_or("get_info: no height")?;
+        Ok(GatewayTakeoverState {
+            owner: s("owner_key"),
+            standby: s("standby_owner_key"),
+            started: n("takeover_started_height"),
+            ready_height: n("takeover_ready_height"),
+            cooldown_until: n("takeover_cooldown_until_height"),
+            height,
+            steps: n("takeover_steps"),
+            cancel_message: m("takeover_cancel_message"),
+            begin_message: m("takeover_begin_message"),
+            complete_message: m("takeover_complete_message"),
+        })
     }
 
-    /// Every takeover running against this node's key, on every chain it can read now.
-    fn running(&self) -> Vec<beldex_bridge_signer::watch::TakeoverCancel> {
-        use beldex_bridge_signer::watch::TakeoverCancel;
+    /// Every takeover step this node's role should sign now, with the exact bytes, from one
+    /// read of every chain. A chain that cannot be read contributes nothing, and in the
+    /// standby role blocks any complete: never finish one half without seeing the others.
+    fn wanted(&self) -> Vec<(beldex_bridge_signer::watch::TakeoverStep, Vec<u8>)> {
+        use beldex_bridge_signer::takeover_guard::{evm_begin_preimage, evm_cancel_preimage, evm_complete_preimage};
+        use beldex_bridge_signer::watch::{TakeoverStep, TakeoverStepKind};
+        let ours_vk = hex(&self.pgw_group_vk);
+        let evm: Vec<_> = self
+            .evm
+            .iter()
+            .map(|(id, client, contract)| (*id, client, *contract, Self::evm_state(client, contract)))
+            .collect();
+        let gw = self.gateway_state();
         let mut out = Vec::new();
-        for (chain_id, client, contract) in &self.evm {
-            if let Ok(Some((nonce, epoch))) = self.evm_running(client, contract) {
-                out.push(TakeoverCancel { chain_id: *chain_id, takeover_id: nonce, key_epoch: epoch });
+
+        if !self.standby_role {
+            for (chain_id, client, contract, st) in &evm {
+                let Ok(st) = st else { continue };
+                if st.signer != self.pevm_address || !st.running() {
+                    continue;
+                }
+                if let Ok(tag) = Self::word(client, contract, "TAKEOVER_CANCEL_TAG()") {
+                    out.push((
+                        TakeoverStep { chain_id: *chain_id, step: TakeoverStepKind::Cancel, takeover_id: st.nonce, key_epoch: st.key_epoch },
+                        evm_cancel_preimage(tag, *chain_id, *contract, st.key_epoch, st.nonce),
+                    ));
+                }
+            }
+            if let Ok(g) = &gw {
+                if g.owner == ours_vk && g.started != 0 {
+                    if let Some(m) = g.cancel_message {
+                        out.push((
+                            TakeoverStep { chain_id: TakeoverStep::GATEWAY, step: TakeoverStepKind::Cancel, takeover_id: g.started, key_epoch: 0 },
+                            m.to_vec(),
+                        ));
+                    }
+                }
+            }
+            return out;
+        }
+
+        // Standby role. Complete only when every half is ready or already ours: a half that is
+        // neither was cancelled by a live key, and completing the rest would split the bridge.
+        let evm_settled = |st: &EvmTakeoverState| st.signer == self.pevm_address || (st.standby == self.pevm_address && st.ready());
+        let all_ready = evm.iter().all(|(_, _, _, st)| st.as_ref().is_ok_and(|st| evm_settled(st)))
+            && gw.as_ref().is_ok_and(|g| g.owner == ours_vk || (g.standby == ours_vk && g.ready()));
+        let outage = self.outage.get();
+        for (chain_id, client, contract, st) in &evm {
+            let Ok(st) = st else { continue };
+            if st.standby != self.pevm_address || st.signer == self.pevm_address {
+                continue;
+            }
+            if !st.running() && !st.cooling() && outage {
+                if let Ok(tag) = Self::word(client, contract, "TAKEOVER_BEGIN_TAG()") {
+                    let next = st.nonce + 1;
+                    out.push((
+                        TakeoverStep { chain_id: *chain_id, step: TakeoverStepKind::Begin, takeover_id: next, key_epoch: st.key_epoch },
+                        evm_begin_preimage(tag, *chain_id, *contract, st.key_epoch, st.standby, next),
+                    ));
+                }
+            } else if st.ready() && all_ready {
+                if let Ok(tag) = Self::word(client, contract, "TAKEOVER_COMPLETE_TAG()") {
+                    out.push((
+                        TakeoverStep { chain_id: *chain_id, step: TakeoverStepKind::Complete, takeover_id: st.nonce, key_epoch: st.key_epoch },
+                        evm_complete_preimage(tag, *chain_id, *contract, st.key_epoch + 1, st.standby),
+                    ));
+                }
             }
         }
-        if let Ok(Some((started, _))) = self.gateway_running() {
-            out.push(TakeoverCancel { chain_id: TakeoverCancel::GATEWAY, takeover_id: started, key_epoch: 0 });
+        if let Ok(g) = &gw {
+            if g.standby == ours_vk && g.owner != ours_vk {
+                if g.started == 0 && !g.cooling() && outage {
+                    if let Some(m) = g.begin_message {
+                        out.push((
+                            TakeoverStep { chain_id: TakeoverStep::GATEWAY, step: TakeoverStepKind::Begin, takeover_id: g.steps, key_epoch: 0 },
+                            m.to_vec(),
+                        ));
+                    }
+                } else if g.ready() && all_ready {
+                    if let Some(m) = g.complete_message {
+                        out.push((
+                            TakeoverStep { chain_id: TakeoverStep::GATEWAY, step: TakeoverStepKind::Complete, takeover_id: g.started, key_epoch: 0 },
+                            m.to_vec(),
+                        ));
+                    }
+                }
+            }
         }
         out
     }
 
-    /// What this node would sign for `c` now (see takeover_guard::CancelView).
-    fn view(&self, c: &beldex_bridge_signer::watch::TakeoverCancel) -> Result<beldex_bridge_signer::takeover_guard::CancelView, String> {
-        use beldex_bridge_signer::takeover_guard::{evm_cancel_preimage, CancelView};
-        if c.on_gateway() {
-            return Ok(match self.gateway_running()? {
-                Some((started, msg)) if started == c.takeover_id => CancelView::Running(msg.to_vec()),
-                _ => CancelView::Ended,
-            });
+    /// What this node would sign for `s` now: its bytes while this node's role still wants
+    /// that step, Ended once it does not (see takeover_guard::TakeoverView).
+    fn view(&self, s: &beldex_bridge_signer::watch::TakeoverStep) -> Result<beldex_bridge_signer::takeover_guard::TakeoverView, String> {
+        use beldex_bridge_signer::takeover_guard::TakeoverView;
+        // A transport failure must not read as "ended": check the chain this step is on.
+        if s.on_gateway() {
+            self.gateway_state()?;
+        } else if let Some((_, client, contract)) = self.evm.iter().find(|(id, _, _)| *id == s.chain_id) {
+            Self::evm_state(client, contract)?;
         }
-        let Some((_, client, contract)) = self.evm.iter().find(|(id, _, _)| *id == c.chain_id) else {
-            return Ok(CancelView::Ended); // not a chain this node watches
-        };
-        match self.evm_running(client, contract)? {
-            Some((nonce, epoch)) if nonce == c.takeover_id && epoch == c.key_epoch => {
-                let tag = Self::word(client, contract, "TAKEOVER_CANCEL_TAG()")?;
-                Ok(CancelView::Running(evm_cancel_preimage(tag, c.chain_id, *contract, epoch, nonce)))
+        Ok(match self.wanted().into_iter().find(|(w, _)| w == s) {
+            Some((_, bytes)) => TakeoverView::Running(bytes),
+            None => TakeoverView::Ended,
+        })
+    }
+}
+
+/// Standby role: refresh whether this node sees the live key failing. A deposit seen final
+/// at least `window` ago and still unminted on its chain is that evidence; minted ones are
+/// dropped. Each standby member judges this from its own daemon and RPCs, so a begin needs
+/// `threshold` members who each saw it.
+#[cfg(feature = "serve-live")]
+fn update_outage(
+    reader: &TakeoverReader,
+    evidence: &mut std::collections::BTreeMap<([u8; 32], u32), (u64, std::time::Instant)>,
+    minted: &mut beldex_bridge_signer::reconcile::EvmMintReconciler<beldex_bridge_signer::evm_watcher::HttpJsonRpc>,
+    window: std::time::Duration,
+) {
+    use beldex_bridge_signer::reconcile::DutyReconciler;
+    let mut stuck: Option<([u8; 32], u32, u64, u64)> = None;
+    evidence.retain(|(txid, idx), (chain, seen)| {
+        let d = beldex_bridge_signer::orchestrator::Duty::Mint(beldex_bridge_signer::watch::MintEvent {
+            beldex_txid: *txid,
+            output_index: *idx,
+            dst_chain: beldex_bridge_signer::chain_registry::ChainId(*chain),
+            to: [0u8; 20],
+            amount: 0,
+        });
+        match minted.is_settled(&d) {
+            Some(true) => false,
+            Some(false) => {
+                if stuck.is_none() && seen.elapsed() >= window {
+                    stuck = Some((*txid, *idx, *chain, seen.elapsed().as_secs()));
+                }
+                true
             }
-            _ => Ok(CancelView::Ended),
+            None => true, // unreadable: keep it, decide nothing
+        }
+    });
+    let was = reader.outage.replace(stuck.is_some());
+    match (was, stuck) {
+        (false, Some((txid, idx, chain, age))) => eprintln!(
+            "!! LIVE KEY NOT MINTING: deposit {}:{idx} to chain {chain} has been final for {age}s and is \
+             still unminted",
+            hex(&txid)
+        ),
+        (true, None) => println!("the live key is minting again: no deposit is unminted past the outage window"),
+        _ => {}
+    }
+}
+
+/// Standby role, optional: a small deposit to the bridge every so often while none is
+/// pending, so the live key's failure shows even when nobody is using the bridge. It mints
+/// to the configured address like any deposit, so it costs only the fees.
+#[cfg(feature = "serve-live")]
+struct ProbeDeposit {
+    wallet: beldex_bridge_signer::evm_watcher::HttpJsonRpc,
+    daemon: beldex_bridge_signer::evm_watcher::HttpJsonRpc,
+    gateway: String,
+    every: std::time::Duration,
+    chain_id: u64,
+    evm_address: String,
+    amount: u64,
+}
+
+#[cfg(feature = "serve-live")]
+impl ProbeDeposit {
+    /// BRIDGE_SIGNER_PROBE_WALLET_RPC (+ _LOGIN_FILE), _EVERY_SECS (0 or unset: off),
+    /// _CHAIN_ID, _EVM_ADDRESS, _AMOUNT (atomic, default 1 BDX).
+    fn from_env(gateway: String, beldexd_rpc: &str) -> Option<ProbeDeposit> {
+        let v = |k: &str| std::env::var(k).ok().map(|x| x.trim().to_string()).filter(|x| !x.is_empty());
+        let every: u64 = v("BRIDGE_SIGNER_PROBE_EVERY_SECS")?.parse().ok().filter(|n| *n > 0)?;
+        let url = v("BRIDGE_SIGNER_PROBE_WALLET_RPC")?;
+        let wallet = match v("BRIDGE_SIGNER_PROBE_WALLET_LOGIN_FILE") {
+            Some(f) => match beldex_bridge_signer::rpc_login::read_login_file(std::path::Path::new(&f)) {
+                Ok(login) => beldex_bridge_signer::evm_watcher::HttpJsonRpc::new(url).with_basic_auth(&login),
+                Err(e) => {
+                    eprintln!("!! probe deposits off: {e}");
+                    return None;
+                }
+            },
+            None => beldex_bridge_signer::evm_watcher::HttpJsonRpc::new(url),
+        };
+        Some(ProbeDeposit {
+            wallet,
+            daemon: beldex_bridge_signer::evm_watcher::HttpJsonRpc::new(format!("{}/json_rpc", beldexd_rpc.trim_end_matches('/'))),
+            gateway,
+            every: std::time::Duration::from_secs(every),
+            chain_id: v("BRIDGE_SIGNER_PROBE_CHAIN_ID")?.parse().ok()?,
+            evm_address: v("BRIDGE_SIGNER_PROBE_EVM_ADDRESS")?,
+            amount: v("BRIDGE_SIGNER_PROBE_AMOUNT").and_then(|a| a.parse().ok()).unwrap_or(1_000_000_000),
+        })
+    }
+
+    fn maybe_probe(&self, idle: bool, last: &mut Option<std::time::Instant>) {
+        use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
+        if !idle || last.is_some_and(|t| t.elapsed() < self.every) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+        let address = match self.daemon.call("get_gateway_info", serde_json::json!({ "gateway_address": self.gateway })) {
+            Ok(info) => info.get("address").and_then(|a| a.as_str()).unwrap_or_default().to_string(),
+            Err(e) => {
+                eprintln!("  probe deposit skipped: get_gateway_info: {e:?}");
+                return;
+            }
+        };
+        let params = serde_json::json!({
+            "destinations": [{
+                "address": address,
+                "amount": self.amount,
+                "bridge_chain_id": self.chain_id,
+                "bridge_evm_address": self.evm_address,
+            }],
+            "priority": 1,
+        });
+        match self.wallet.call("transfer", params) {
+            Ok(r) => println!("  probe deposit sent: {}", r.get("tx_hash").cloned().unwrap_or_default()),
+            Err(e) => eprintln!("  probe deposit failed: {e:?}"),
         }
     }
 }
@@ -2077,18 +2340,24 @@ where
 
     // The guard (takeover_guard): this node's own view of any standby takeover begun against
     // its key, shared by detection, the cancel policy and its reconciler.
+    // The role: `live` (the default) serves the key the chains name, mints, releases and
+    // cancels takeovers begun against it; `standby` serves a standby key, and only begins
+    // and completes a takeover by it when this node sees the live key failing.
+    let standby_role = std::env::var("BRIDGE_SIGNER_ROLE").is_ok_and(|r| r.trim() == "standby");
     let takeover = Rc::new(TakeoverReader {
         evm: configs.iter().map(|c| (c.chain_id, HttpJsonRpc::new(c.rpc_url.clone()), c.contract)).collect(),
         gateway_rpc: HttpJsonRpc::new(format!("{}/json_rpc", beldexd_rpc.trim_end_matches('/'))),
         gateway: release_gateway.clone(),
         pevm_address: ls.pevm_address,
         pgw_group_vk: ls.pgw_group_vk,
+        standby_role,
+        outage: std::cell::Cell::new(false),
     });
     let policy_view = takeover.clone();
 
     let policy = DualPolicy {
-        cancel: beldex_bridge_signer::takeover_guard::CancelPolicy {
-            read: move |c: &beldex_bridge_signer::watch::TakeoverCancel| policy_view.view(c),
+        cancel: beldex_bridge_signer::takeover_guard::TakeoverPolicy {
+            read: move |c: &beldex_bridge_signer::watch::TakeoverStep| policy_view.view(c),
         },
         mint: MintPolicy { contracts: contracts.clone() },
         release: ReleasePolicy {
@@ -2252,84 +2521,105 @@ where
 
     let done_rpc = rpc.clone();
     let done_contracts = contracts;
+    let done_view = takeover.clone();
+    let done_pgw_vk = ls.pgw_group_vk;
     let complete = move |d: &Duty, proposal: &[u8], sig: &[u8]| -> ExecOutcome {
         match d {
-            Duty::Cancel(c) if c.on_gateway() => {
+            Duty::Takeover(c) if c.on_gateway() => {
+                use beldex_bridge_signer::watch::TakeoverStepKind;
                 if sig.len() != 64 {
                     return ExecOutcome::Retry;
                 }
+                let action = match c.step {
+                    TakeoverStepKind::Cancel => "cancel",
+                    TakeoverStepKind::Begin => "begin",
+                    TakeoverStepKind::Complete => "complete",
+                };
                 println!(
-                    "TAKEOVER-CANCEL gateway={cancel_gateway} started_height={} signature={}",
+                    "TAKEOVER-{} gateway={cancel_gateway} started_height={} signature={}",
+                    action.to_uppercase(),
                     c.takeover_id,
                     hex(sig)
                 );
                 let Some(wallet) = &cancel_wallet else {
                     eprintln!(
                         "!! no wallet RPC (BRIDGE_SIGNER_ACK_WALLET_RPC) to carry the gateway takeover \
-                         cancel: submit the line above with the wallet RPC gateway_takeover_cancel NOW"
+                         {action}: submit the line above with the wallet RPC gateway_takeover_step NOW"
                     );
                     return ExecOutcome::Submitted;
                 };
                 use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
-                let params = serde_json::json!({
+                let mut params = serde_json::json!({
                     "gateway_id": cancel_gateway,
+                    "action": action,
                     "started_height": c.takeover_id,
                     "signature": hex(sig),
                     "signature_type": "eddsa",
                 });
-                match wallet.call("gateway_takeover_cancel", params) {
+                if c.step == TakeoverStepKind::Complete {
+                    params["new_owner_key"] = serde_json::json!(hex(&done_pgw_vk));
+                    params["new_owner_key_type"] = serde_json::json!("eddsa");
+                }
+                match wallet.call("gateway_takeover_step", params) {
                     Ok(r) => {
-                        println!("TAKEOVER CANCEL submitted on the gateway: {}", r.get("tx_hash").cloned().unwrap_or_default());
+                        println!("TAKEOVER {} submitted on the gateway: {}", action.to_uppercase(), r.get("tx_hash").cloned().unwrap_or_default());
                         ExecOutcome::Submitted
                     }
-                    // Another member's wallet got there first (the pool keeps one per
-                    // takeover), or the takeover already ended: either way, done.
+                    // Another member's wallet got there first (the pool keeps one per step),
+                    // or the chain has moved past this step: either way, done.
                     Err(e) if {
                         let m = format!("{e:?}").to_lowercase();
-                        m.contains("double spend") || m.contains("no running takeover") || m.contains("same subject")
+                        m.contains("double spend") || m.contains("same subject")
+                            || matches!(done_view.view(c), Ok(beldex_bridge_signer::takeover_guard::TakeoverView::Ended))
                     } => {
-                        println!("TAKEOVER CANCEL on the gateway already submitted or landed (ok): {e:?}");
+                        println!("TAKEOVER {} on the gateway already submitted or no longer needed (ok): {e:?}", action.to_uppercase());
                         ExecOutcome::Submitted
                     }
                     Err(e) => {
-                        eprintln!("gateway takeover cancel not submitted (will retry): {e:?}");
+                        eprintln!("gateway takeover {action} not submitted (will retry): {e:?}");
                         ExecOutcome::Retry
                     }
                 }
             }
-            Duty::Cancel(c) => {
+            Duty::Takeover(c) => {
+                use beldex_bridge_signer::watch::TakeoverStepKind;
                 let Some(&contract) = done_contracts.get(&c.chain_id) else {
                     return ExecOutcome::Abandon;
                 };
+                let kind = match c.step {
+                    TakeoverStepKind::Cancel => "takeover_cancel",
+                    TakeoverStepKind::Begin => "takeover_begin",
+                    TakeoverStepKind::Complete => "takeover_complete",
+                };
                 let payload = format!(
-                    r#"{{"kind":"takeover_cancel","contract":"{}","chain_id":{},"sig":"{}"}}"#,
+                    r#"{{"kind":"{kind}","contract":"{}","chain_id":{},"sig":"{}"}}"#,
                     hex(&contract),
                     c.chain_id,
                     hex(sig)
                 );
-                println!("TAKEOVER-CANCEL-PAYLOAD {payload}");
+                println!("TAKEOVER-STEP-PAYLOAD {payload}");
                 match &cancel_relay_cmd {
                     Some(cmd) => match pipe_to_relay(cmd, &payload) {
                         Ok(out) => {
-                            println!("  takeover cancel relayed: {}", out.trim());
+                            println!("  {kind} relayed: {}", out.trim());
                             ExecOutcome::Submitted
                         }
-                        // NoTakeoverRunning(): another member's cancel landed first (or the
-                        // takeover ended otherwise). Nothing left to do.
-                        Err(e) if e.contains("0x48fcca65") => {
-                            println!("  takeover cancel not needed: no takeover is running on chain {} any more", c.chain_id);
+                        // The contract refused it because the chain has moved past this step
+                        // (another member's landed first, or the takeover ended): done.
+                        Err(e) if matches!(done_view.view(c), Ok(beldex_bridge_signer::takeover_guard::TakeoverView::Ended)) => {
+                            println!("  {kind} not needed any more on chain {} ({})", c.chain_id, e.lines().last().unwrap_or_default());
                             ExecOutcome::Submitted
                         }
-                        // Re-signing is cheap next to a takeover completing: try again.
+                        // Re-signing is cheap next to missing the window: try again.
                         Err(e) => {
-                            eprintln!("  takeover cancel RELAY FAILED ({e}); will sign and relay again");
+                            eprintln!("  {kind} RELAY FAILED ({e}); will sign and relay again");
                             ExecOutcome::Retry
                         }
                     },
                     None => {
                         eprintln!(
-                            "!! no relay command (BRIDGE_SIGNER_RELAY_CMD) for the wBDX takeover cancel: \
-                             relay the payload above NOW (beldex-bridge-relayer relay -)"
+                            "!! no relay command (BRIDGE_SIGNER_RELAY_CMD) for the wBDX {kind}: relay the \
+                             payload above NOW (beldex-bridge-relayer relay -)"
                         );
                         ExecOutcome::Submitted
                     }
@@ -2462,8 +2752,8 @@ where
         std::env::var("BRIDGE_SIGNER_RECONCILE").map(|v| v != "0" && v != "false").unwrap_or(true);
     let reconcile_view = takeover.clone();
     let mut reconciler = DualReconciler {
-        cancel: beldex_bridge_signer::takeover_guard::CancelReconciler {
-            read: move |c: &beldex_bridge_signer::watch::TakeoverCancel| reconcile_view.view(c),
+        cancel: beldex_bridge_signer::takeover_guard::TakeoverReconciler {
+            read: move |c: &beldex_bridge_signer::watch::TakeoverStep| reconcile_view.view(c),
         },
         // Per-chain client + contract, so a multi-chain deployment queries the right chain.
         mint: EvmMintReconciler {
@@ -2580,7 +2870,9 @@ where
     let cursor_dir: Option<std::path::PathBuf> = match std::env::var("BRIDGE_SIGNER_WATCH_CURSOR_DIR") {
         Ok(v) if v.trim() == "off" => None,
         Ok(v) if !v.trim().is_empty() => Some(v.trim().into()),
-        _ => Some("watch-cursors".into()),
+        // A standby process on the same node keeps its own: it must never move the live
+        // process's cursors.
+        _ => Some(if standby_role { "watch-cursors-standby" } else { "watch-cursors" }.into()),
     };
     let beldex_identity = format!("beldex gateway {gateway_id}");
     let evm_identity = |c: &beldex_bridge_signer::evm_watcher::EvmChainConfig| {
@@ -2687,6 +2979,26 @@ where
     const CANCEL_LAND_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
     let mut cancel_done_since: BTreeMap<beldex_bridge_signer::orchestrator::DutyKey, std::time::Instant> =
         BTreeMap::new();
+    // Standby role: the deposits seen final and when, as evidence of whether the live key
+    // still mints (update_outage), and the optional probe deposit that creates such evidence
+    // when the bridge is idle.
+    let mut evidence: BTreeMap<([u8; 32], u32), (u64, std::time::Instant)> = BTreeMap::new();
+    let mut evidence_reconciler = EvmMintReconciler {
+        chains: configs.iter().map(|c| (c.chain_id, (HttpJsonRpc::new(c.rpc_url.clone()), c.contract))).collect(),
+    };
+    let outage_window = std::time::Duration::from_secs(
+        std::env::var("BRIDGE_SIGNER_OUTAGE_WINDOW_SECS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(600),
+    );
+    let probe = if standby_role { ProbeDeposit::from_env(release_gateway.clone(), beldexd_rpc) } else { None };
+    let mut last_probe: Option<std::time::Instant> = None;
+    if standby_role {
+        println!(
+            "serve: STANDBY role: signs only takeover begin/complete for this share set's key, after \
+             this node sees a deposit final for {}s and unminted; probe deposits {}",
+            outage_window.as_secs(),
+            if probe.is_some() { "on" } else { "off (BRIDGE_SIGNER_PROBE_*)" }
+        );
+    }
 
     let mut ticks = 0u64;
     loop {
@@ -2708,7 +3020,7 @@ where
         // replacement — only a signer / owner that reads back and differs counts. The wBDX
         // signer is read at the watcher's confirmation depth, not the tip: stopping is not
         // undone, so it must not act on an activation a reorg can still take back.
-        if ticks % 12 == 0 {
+        if !standby_role && ticks % 12 == 0 {
             use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
             use sha3::{Digest, Keccak256};
             let ours = format!("0x{}", hex(&ls.pevm_address));
@@ -2864,24 +3176,41 @@ where
                 orch.observe(d);
             }
         };
-        // The guard: a standby takeover begun against this node's key is cancelled while the
-        // key can still sign. Read at the tip about every 15s. A cancel handed off that has
-        // not landed two minutes later is signed and sent again (Orchestrator::reopen).
+        // Takeover steps, about every 15s from the chain tip. Live role: a standby takeover
+        // begun against this node's key is cancelled while the key can still sign. Standby
+        // role: first refresh whether this node sees the live key failing, then begin or
+        // complete. A step handed off that is still wanted two minutes later is signed and
+        // sent again (Orchestrator::reopen).
         if ticks % guard_ticks == 0 {
-            for c in takeover.running() {
-                let d = Duty::Cancel(c);
+            if standby_role {
+                update_outage(&takeover, &mut evidence, &mut evidence_reconciler, outage_window);
+                if let Some(p) = &probe {
+                    p.maybe_probe(evidence.is_empty(), &mut last_probe);
+                }
+            }
+            for (c, _) in takeover.wanted() {
+                use beldex_bridge_signer::watch::TakeoverStepKind;
+                let d = Duty::Takeover(c);
                 let key = d.key();
+                let what = if c.on_gateway() {
+                    format!("the gateway (takeover {})", c.takeover_id)
+                } else {
+                    format!("chain {} (takeover {}, key epoch {})", c.chain_id, c.takeover_id, c.key_epoch)
+                };
                 match orch.status(&key) {
                     None => {
-                        let what = if c.on_gateway() {
-                            format!("the gateway (takeover begun at height {})", c.takeover_id)
-                        } else {
-                            format!("chain {} (takeover {}, key epoch {})", c.chain_id, c.takeover_id, c.key_epoch)
-                        };
-                        eprintln!(
-                            "!! STANDBY TAKEOVER BEGUN against this committee's live key on {what}: \
-                             this key can sign, so the committee cancels it"
-                        );
+                        match c.step {
+                            TakeoverStepKind::Cancel => eprintln!(
+                                "!! STANDBY TAKEOVER BEGUN against this committee's live key on {what}: \
+                                 cancelling it (it lands only if this committee can still reach its threshold)"
+                            ),
+                            TakeoverStepKind::Begin => eprintln!(
+                                "!! LIVE KEY FAILING: beginning the standby takeover on {what}"
+                            ),
+                            TakeoverStepKind::Complete => eprintln!(
+                                "!! standby takeover ready on every chain: completing it on {what}"
+                            ),
+                        }
                         ingest(orch, d);
                     }
                     Some(beldex_bridge_signer::orchestrator::DutyStatus::Done) => {
@@ -2889,9 +3218,8 @@ where
                         if since.elapsed() >= CANCEL_LAND_GRACE && orch.reopen(&key) {
                             cancel_done_since.remove(&key);
                             eprintln!(
-                                "!! takeover on chain {} is still running {}s after its cancel was handed \
-                                 off: signing and sending it again",
-                                c.chain_id,
+                                "!! takeover step on {what} still wanted {}s after it was handed off: signing \
+                                 and sending it again",
                                 since.elapsed().as_secs()
                             );
                         }
@@ -2902,7 +3230,15 @@ where
         }
         // Keep draining the watchers so their cursors advance, but do not turn events into
         // duties for a key that has been replaced — they belong to the successor committee.
-        held_mints.extend(src.poll_mints());
+        if standby_role {
+            // A standby signs no mint or release; it watches deposits only to see whether the
+            // live key is minting them (update_outage).
+            for m in src.poll_mints() {
+                evidence.entry((m.beldex_txid, m.output_index)).or_insert((m.dst_chain.0, std::time::Instant::now()));
+            }
+            let _ = src.poll_releases();
+        }
+        held_mints.extend(if standby_role { Vec::new() } else { src.poll_mints() });
         for m in std::mem::take(&mut held_mints) {
             if mint_key_incoming.contains(&m.dst_chain.0) {
                 held_mints.push(m);
@@ -2910,13 +3246,13 @@ where
                 ingest(orch, Duty::Mint(m));
             }
         }
-        for r in src.poll_releases() {
+        for r in if standby_role { Vec::new() } else { src.poll_releases() } {
             if !release_key_replaced {
                 ingest(orch, Duty::Release(r));
             }
         }
         // Observe: a settled key change on any watched chain. Sign it and tell the mesh.
-        if bus_genesis != [0u8; 32] {
+        if !standby_role && bus_genesis != [0u8; 32] {
             for r in src.poll_rotations() {
                 let seen = rotation_seen.entry(r.chain.0).or_insert(0);
                 *seen = (*seen).max(r.key_epoch);
@@ -3052,7 +3388,7 @@ where
         // Re-deliver any signed mint the contract has not minted yet. Safe for ever — the
         // contract refuses a deposit it already minted — so the only reasons to stop are
         // that it landed, or that a week of re-delivery has not made it land.
-        if ticks % mint_retry_ticks == 0 {
+        if !standby_role && ticks % mint_retry_ticks == 0 {
             use beldex_bridge_signer::mint_outbox as outbox;
             let now = beldex_bridge_signer::release_outbox::now_secs();
             for (_, mut rec) in outbox::load_all(&mint_outbox_for_sweep) {
@@ -3135,7 +3471,7 @@ where
         // Re-send any release that has not been seen in a block yet. The SAME signed
         // bytes, never a fresh signature: a duplicate carries the same transaction id and
         // the chain ignores it, so paying twice is impossible by construction.
-        if ticks % release_retry_ticks == 0 {
+        if !standby_role && ticks % release_retry_ticks == 0 {
             use beldex_bridge_signer::release_outbox as outbox;
             let now = outbox::now_secs();
             for (_, mut rec) in outbox::load_all(&outbox_dir_for_sweep) {
@@ -3230,7 +3566,7 @@ where
             }
         }
 
-        if ticks > 0 && ticks % solvency_ticks == 0 {
+        if !standby_role && ticks > 0 && ticks % solvency_ticks == 0 {
             use beldex_bridge_signer::solvency::Change;
             match solvency_check() {
                 Ok((problems, summary)) => match solvency_guard.observe(&problems) {

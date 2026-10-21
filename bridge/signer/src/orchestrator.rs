@@ -27,16 +27,16 @@
 //! coordination. This module is pure and std-only; the actual I/O is the outer loop's job.
 
 use crate::transport::Leg;
-use crate::watch::{MintEvent, ReleaseEvent, TakeoverCancel};
+use crate::watch::{MintEvent, ReleaseEvent, TakeoverStep};
 use std::collections::BTreeMap;
 
 /// Which kind of duty — part of the dedup key so a mint `beldex_txid` and a release `evm_txid`
 /// can never collide even if the 32-byte ids happened to coincide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DutyKind {
-    /// Declared first, so a ready cancel sorts (and opens) ahead of mints and releases: it
-    /// has a deadline, they do not.
-    Cancel,
+    /// Declared first, so a ready takeover step sorts (and opens) ahead of mints and
+    /// releases: it has a deadline, they do not.
+    Takeover,
     Mint,
     Release,
 }
@@ -59,8 +59,8 @@ pub enum Duty {
     Mint(MintEvent),
     /// A confirmed wBDX burn to release native BDX for (`Pgw`).
     Release(ReleaseEvent),
-    /// A standby takeover to cancel: `Pevm` on an EVM chain, `Pgw` on the gateway.
-    Cancel(TakeoverCancel),
+    /// A standby takeover step: `Pevm` on an EVM chain, `Pgw` on the gateway.
+    Takeover(TakeoverStep),
 }
 
 impl Duty {
@@ -73,7 +73,7 @@ impl Duty {
             Duty::Release(e) => {
                 DutyKey { kind: DutyKind::Release, id: e.evm_txid, sub: e.log_index }
             }
-            Duty::Cancel(c) => DutyKey { kind: DutyKind::Cancel, id: c.id(), sub: 0 },
+            Duty::Takeover(c) => DutyKey { kind: DutyKind::Takeover, id: c.id(), sub: 0 },
         }
     }
 
@@ -82,8 +82,8 @@ impl Duty {
         match self {
             Duty::Mint(_) => Leg::Pevm,
             Duty::Release(_) => Leg::Pgw,
-            Duty::Cancel(c) if c.on_gateway() => Leg::Pgw,
-            Duty::Cancel(_) => Leg::Pevm,
+            Duty::Takeover(c) if c.on_gateway() => Leg::Pgw,
+            Duty::Takeover(_) => Leg::Pevm,
         }
     }
 }
@@ -202,10 +202,7 @@ impl Orchestrator {
                         amount: 0,
                         beldex_recipient: Vec::new(),
                     }),
-                    DutyKind::Cancel => {
-                        let word = |i: usize| u64::from_le_bytes(key.id[i..i + 8].try_into().unwrap());
-                        Duty::Cancel(TakeoverCancel { chain_id: word(0), takeover_id: word(8), key_epoch: word(16) })
-                    }
+                    DutyKind::Takeover => Duty::Takeover(TakeoverStep::from_id(&key.id)),
                 },
                 status: DutyStatus::Done,
             });
@@ -435,7 +432,7 @@ mod tests {
     #[test]
     fn only_a_done_duty_reopens() {
         let mut o = Orchestrator::new();
-        let d = Duty::Cancel(crate::watch::TakeoverCancel { chain_id: 1, takeover_id: 2, key_epoch: 3 });
+        let d = Duty::Takeover(crate::watch::TakeoverStep { chain_id: 1, takeover_id: 2, key_epoch: 3, step: crate::watch::TakeoverStepKind::Cancel });
         let k = d.key();
         assert!(!o.reopen(&k), "unknown");
         o.observe(d);
@@ -455,8 +452,8 @@ mod tests {
         o.observe(Duty::Mint(MintEvent {
             beldex_txid: [0; 32], output_index: 0, dst_chain: crate::chain_registry::ChainId(1), to: [0; 20], amount: 1,
         }));
-        o.observe(Duty::Cancel(crate::watch::TakeoverCancel { chain_id: 9, takeover_id: 9, key_epoch: 9 }));
-        assert!(matches!(o.ready()[0], Duty::Cancel(_)));
+        o.observe(Duty::Takeover(crate::watch::TakeoverStep { chain_id: 9, takeover_id: 9, key_epoch: 9, step: crate::watch::TakeoverStepKind::Cancel }));
+        assert!(matches!(o.ready()[0], Duty::Takeover(_)));
     }
 
     #[test]

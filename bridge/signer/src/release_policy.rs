@@ -412,28 +412,28 @@ impl<M: ProposalPolicy, R: ProposalPolicy, C: ProposalPolicy> ProposalPolicy for
         match duty {
             Duty::Mint(_) => self.mint.actionable(duty),
             Duty::Release(_) => self.release.actionable(duty),
-            Duty::Cancel(_) => self.cancel.actionable(duty),
+            Duty::Takeover(_) => self.cancel.actionable(duty),
         }
     }
     fn build(&mut self, duty: &Duty) -> Result<Vec<u8>, BuildError> {
         match duty {
             Duty::Mint(_) => self.mint.build(duty),
             Duty::Release(_) => self.release.build(duty),
-            Duty::Cancel(_) => self.cancel.build(duty),
+            Duty::Takeover(_) => self.cancel.build(duty),
         }
     }
     fn verify(&mut self, duty: &Duty, proposal: &[u8]) -> ProposalVerdict {
         match duty {
             Duty::Mint(_) => self.mint.verify(duty, proposal),
             Duty::Release(_) => self.release.verify(duty, proposal),
-            Duty::Cancel(_) => self.cancel.verify(duty, proposal),
+            Duty::Takeover(_) => self.cancel.verify(duty, proposal),
         }
     }
     fn signing_message(&self, duty: &Duty, proposal: &[u8]) -> Vec<u8> {
         match duty {
             Duty::Mint(_) => self.mint.signing_message(duty, proposal),
             Duty::Release(_) => self.release.signing_message(duty, proposal),
-            Duty::Cancel(_) => self.cancel.signing_message(duty, proposal),
+            Duty::Takeover(_) => self.cancel.signing_message(duty, proposal),
         }
     }
 }
@@ -751,8 +751,8 @@ mod tests {
         let mut dual = DualPolicy {
             mint: MintPolicy { contracts: BTreeMap::new() },
             release: policy(),
-            cancel: crate::takeover_guard::CancelPolicy {
-                read: |_: &crate::watch::TakeoverCancel| Ok(crate::takeover_guard::CancelView::Ended),
+            cancel: crate::takeover_guard::TakeoverPolicy {
+                read: |_: &crate::watch::TakeoverStep| Ok(crate::takeover_guard::TakeoverView::Ended),
             },
         };
         let release = Duty::Release(burn(1000));

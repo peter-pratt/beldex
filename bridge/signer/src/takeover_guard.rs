@@ -1,28 +1,30 @@
-//! The live committee's guard against a standby takeover.
+//! Standby takeover steps as committee duties.
 //!
-//! A standby key, named by the live key, may take the bridge over after a delay. That is
-//! for a live key that has gone silent. A key that can still sign proves it is not, by
-//! cancelling: on each wBDX chain with `cancelStandbyTakeover(sig)`, and on the Beldex
-//! gateway with a standalone cancel signed over the daemon's `takeover_cancel_message`.
-//! Every live signer watches for a begin and opens a cancel duty; the committee signs it
-//! like a mint or a release. This is the defence against a standby that is compromised or
-//! mistaken, so it never waits on a person or a script.
+//! A standby key, named by the live key, may take the bridge over after a delay: that is for
+//! a live key that has gone silent. Both committees act through their signers, never a
+//! script or a person:
+//!  - the live committee cancels any takeover begun against its key while it can sign (on
+//!    each wBDX chain `cancelStandbyTakeover(sig)`, on the gateway a standalone cancel over
+//!    the daemon's `takeover_cancel_message`). That is the defence against a standby that is
+//!    compromised or mistaken.
+//!  - the standby committee begins a takeover on every chain once its members each see the
+//!    live key failing (a deposit final for the outage window and still unminted), and once
+//!    every half is ready completes it on every chain, never one alone.
 //!
-//! What is signed is fixed by the chain: on an EVM chain the contract's cancel preimage
-//! (`TAKEOVER_CANCEL_TAG`, chain id, contract, key epoch, takeover nonce), on the gateway the
-//! 32-byte message the daemon reports. So each member rebuilds it from its own view and
-//! accepts only an identical proposal (C.5), as for mints. A member reading a different
-//! takeover, or none, does not sign.
+//! What is signed is fixed by the chain: the contract's preimages on an EVM chain, the
+//! daemon's messages on the gateway. So each member rebuilds it from its own view and
+//! accepts only an identical proposal (C.5), as for mints. A member whose view does not show
+//! that step as due does not sign it.
 
 use crate::coordinator::{BuildError, ProposalPolicy, ProposalVerdict};
 use crate::orchestrator::Duty;
 use crate::reconcile::DutyReconciler;
 use crate::session::NackReason;
-use crate::watch::TakeoverCancel;
+use crate::watch::TakeoverStep;
 
 /// What this node reads from its own chain view for a cancel duty.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CancelView {
+pub enum TakeoverView {
     /// The takeover is running against this committee's live key: the exact bytes to sign.
     Running(Vec<u8>),
     /// That takeover is not running any more (cancelled, completed, or never seen here),
@@ -32,37 +34,37 @@ pub enum CancelView {
 
 /// Signs cancels. `read` asks this node's own RPCs about one cancel duty; an `Err` is a
 /// transport failure, which decides nothing.
-pub struct CancelPolicy<R: FnMut(&TakeoverCancel) -> Result<CancelView, String>> {
+pub struct TakeoverPolicy<R: FnMut(&TakeoverStep) -> Result<TakeoverView, String>> {
     pub read: R,
 }
 
-impl<R: FnMut(&TakeoverCancel) -> Result<CancelView, String>> ProposalPolicy for CancelPolicy<R> {
+impl<R: FnMut(&TakeoverStep) -> Result<TakeoverView, String>> ProposalPolicy for TakeoverPolicy<R> {
     fn actionable(&self, duty: &Duty) -> Result<(), BuildError> {
         match duty {
-            Duty::Cancel(_) => Ok(()),
+            Duty::Takeover(_) => Ok(()),
             _ => Err(BuildError::Unactionable("not a takeover cancel".into())),
         }
     }
 
     fn build(&mut self, duty: &Duty) -> Result<Vec<u8>, BuildError> {
-        let Duty::Cancel(c) = duty else {
+        let Duty::Takeover(c) = duty else {
             return Err(BuildError::Unactionable("not a takeover cancel".into()));
         };
         match (self.read)(c) {
-            Ok(CancelView::Running(bytes)) => Ok(bytes),
-            Ok(CancelView::Ended) => Err(BuildError::Unactionable("the takeover is no longer running".into())),
+            Ok(TakeoverView::Running(bytes)) => Ok(bytes),
+            Ok(TakeoverView::Ended) => Err(BuildError::Unactionable("the takeover is no longer running".into())),
             Err(e) => Err(BuildError::Transient(e)),
         }
     }
 
     fn verify(&mut self, duty: &Duty, proposal: &[u8]) -> ProposalVerdict {
-        let Duty::Cancel(c) = duty else {
+        let Duty::Takeover(c) = duty else {
             return ProposalVerdict::Reject(NackReason::PayloadMismatch);
         };
         match (self.read)(c) {
-            Ok(CancelView::Running(bytes)) if bytes == proposal => ProposalVerdict::Accept,
-            Ok(CancelView::Running(_)) => ProposalVerdict::Reject(NackReason::PayloadMismatch),
-            Ok(CancelView::Ended) => ProposalVerdict::Reject(NackReason::EventNotObserved),
+            Ok(TakeoverView::Running(bytes)) if bytes == proposal => ProposalVerdict::Accept,
+            Ok(TakeoverView::Running(_)) => ProposalVerdict::Reject(NackReason::PayloadMismatch),
+            Ok(TakeoverView::Ended) => ProposalVerdict::Reject(NackReason::EventNotObserved),
             // This node cannot tell right now: stay silent, the leader re-proposes.
             Err(_) => ProposalVerdict::Abstain,
         }
@@ -76,16 +78,16 @@ impl<R: FnMut(&TakeoverCancel) -> Result<CancelView, String>> ProposalPolicy for
 }
 
 /// Settles a cancel duty against the chain: done once that takeover is no longer running.
-pub struct CancelReconciler<R: FnMut(&TakeoverCancel) -> Result<CancelView, String>> {
+pub struct TakeoverReconciler<R: FnMut(&TakeoverStep) -> Result<TakeoverView, String>> {
     pub read: R,
 }
 
-impl<R: FnMut(&TakeoverCancel) -> Result<CancelView, String>> DutyReconciler for CancelReconciler<R> {
+impl<R: FnMut(&TakeoverStep) -> Result<TakeoverView, String>> DutyReconciler for TakeoverReconciler<R> {
     fn is_settled(&mut self, duty: &Duty) -> Option<bool> {
-        let Duty::Cancel(c) = duty else { return Some(false) };
+        let Duty::Takeover(c) = duty else { return Some(false) };
         match (self.read)(c) {
-            Ok(CancelView::Ended) => Some(true),
-            Ok(CancelView::Running(_)) => Some(false),
+            Ok(TakeoverView::Ended) => Some(true),
+            Ok(TakeoverView::Running(_)) => Some(false),
             Err(_) => None,
         }
     }
@@ -111,22 +113,59 @@ pub fn evm_cancel_preimage(tag: [u8; 32], chain_id: u64, contract: [u8; 20], key
     out
 }
 
+/// The contract's begin preimage: `abi.encode(TAKEOVER_BEGIN_TAG, block.chainid,
+/// address(this), keyEpoch, standbySigner, takeoverNonce + 1)`. The standby key signs it.
+pub fn evm_begin_preimage(tag: [u8; 32], chain_id: u64, contract: [u8; 20], key_epoch: u64, standby: [u8; 20], next_nonce: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(192);
+    out.extend_from_slice(&tag);
+    out.extend_from_slice(&word_u64(chain_id));
+    out.extend_from_slice(&word_address(contract));
+    out.extend_from_slice(&word_u64(key_epoch));
+    out.extend_from_slice(&word_address(standby));
+    out.extend_from_slice(&word_u64(next_nonce));
+    out
+}
+
+/// The contract's complete preimage: `abi.encode(TAKEOVER_COMPLETE_TAG, block.chainid,
+/// address(this), keyEpoch + 1, standbySigner)`. The standby key signs it.
+pub fn evm_complete_preimage(tag: [u8; 32], chain_id: u64, contract: [u8; 20], next_key_epoch: u64, standby: [u8; 20]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(160);
+    out.extend_from_slice(&tag);
+    out.extend_from_slice(&word_u64(chain_id));
+    out.extend_from_slice(&word_address(contract));
+    out.extend_from_slice(&word_u64(next_key_epoch));
+    out.extend_from_slice(&word_address(standby));
+    out
+}
+
+fn word_u64(x: u64) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[24..].copy_from_slice(&x.to_be_bytes());
+    w
+}
+
+fn word_address(a: [u8; 20]) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[12..].copy_from_slice(&a);
+    w
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    fn evm() -> TakeoverCancel {
-        TakeoverCancel { chain_id: 31337, takeover_id: 3, key_epoch: 2 }
+    fn evm() -> TakeoverStep {
+        TakeoverStep { chain_id: 31337, takeover_id: 3, key_epoch: 2, step: crate::watch::TakeoverStepKind::Cancel }
     }
 
     #[test]
     fn a_member_signs_only_what_its_own_chain_view_shows() {
-        let view = Rc::new(RefCell::new(Ok(CancelView::Running(vec![1, 2, 3]))));
+        let view = Rc::new(RefCell::new(Ok(TakeoverView::Running(vec![1, 2, 3]))));
         let v = view.clone();
-        let mut p = CancelPolicy { read: move |_: &TakeoverCancel| v.borrow().clone() };
-        let d = Duty::Cancel(evm());
+        let mut p = TakeoverPolicy { read: move |_: &TakeoverStep| v.borrow().clone() };
+        let d = Duty::Takeover(evm());
 
         assert!(p.actionable(&d).is_ok());
         assert_eq!(p.build(&d).unwrap(), vec![1, 2, 3]);
@@ -135,7 +174,7 @@ mod tests {
         assert_eq!(p.signing_message(&d, &[1, 2, 3]), vec![1, 2, 3]);
 
         // The takeover ended (or this node never saw it): not signed, not built.
-        *view.borrow_mut() = Ok(CancelView::Ended);
+        *view.borrow_mut() = Ok(TakeoverView::Ended);
         assert_eq!(p.verify(&d, &[1, 2, 3]), ProposalVerdict::Reject(NackReason::EventNotObserved));
         assert!(matches!(p.build(&d), Err(BuildError::Unactionable(_))));
 
@@ -147,12 +186,12 @@ mod tests {
 
     #[test]
     fn a_cancel_is_settled_once_its_takeover_is_not_running() {
-        let state = Rc::new(RefCell::new(Ok(CancelView::Running(vec![7]))));
+        let state = Rc::new(RefCell::new(Ok(TakeoverView::Running(vec![7]))));
         let s = state.clone();
-        let mut r = CancelReconciler { read: move |_: &TakeoverCancel| s.borrow().clone() };
-        let d = Duty::Cancel(evm());
+        let mut r = TakeoverReconciler { read: move |_: &TakeoverStep| s.borrow().clone() };
+        let d = Duty::Takeover(evm());
         assert_eq!(r.is_settled(&d), Some(false));
-        *state.borrow_mut() = Ok(CancelView::Ended);
+        *state.borrow_mut() = Ok(TakeoverView::Ended);
         assert_eq!(r.is_settled(&d), Some(true));
         *state.borrow_mut() = Err("rpc down".into());
         assert_eq!(r.is_settled(&d), None, "an unreadable chain decides nothing");
@@ -192,7 +231,7 @@ mod tests {
 
         let (n, t) = (6, 4);
         let bus = Bus::new(n);
-        let cancel = TakeoverCancel { chain_id: TakeoverCancel::GATEWAY, takeover_id: 5, key_epoch: 0 };
+        let cancel = TakeoverStep { chain_id: TakeoverStep::GATEWAY, takeover_id: 5, key_epoch: 0, step: crate::watch::TakeoverStepKind::Cancel };
         let mint = MintEvent { beldex_txid: [7; 32], output_index: 0, dst_chain: ChainId(1), to: [3; 20], amount: 10 };
         let mut nodes = Vec::new();
         for i in 0..n {
@@ -201,7 +240,7 @@ mod tests {
             let policy = DualPolicy {
                 mint: MintPolicy { contracts: BTreeMap::from([(1u64, [0x22u8; 20])]) },
                 release: MintPolicy { contracts: BTreeMap::new() },
-                cancel: CancelPolicy { read: |_: &TakeoverCancel| Ok(CancelView::Running(vec![0x42; 32])) },
+                cancel: TakeoverPolicy { read: |_: &TakeoverStep| Ok(TakeoverView::Running(vec![0x42; 32])) },
             };
             let mut coord = Coordinator::new(
                 committee(n, t),
@@ -218,7 +257,7 @@ mod tests {
             coord.hold = Some("wBDX total supply exceeds the gateway's balance".into());
             let mut orch = Orchestrator::new();
             orch.observe(Duty::Mint(mint.clone()));
-            orch.observe(Duty::Cancel(cancel));
+            orch.observe(Duty::Takeover(cancel));
             nodes.push((coord, orch, bus.node(i), done));
         }
         for _ in 0..30 {
@@ -227,24 +266,64 @@ mod tests {
             }
         }
         for (_, orch, _, done) in &nodes {
-            assert_eq!(*done.borrow(), vec![Duty::Cancel(cancel).key()], "the cancel completes, the mint does not");
+            assert_eq!(*done.borrow(), vec![Duty::Takeover(cancel).key()], "the cancel completes, the mint does not");
             assert_eq!(orch.counts(), (1, 0, 1), "the mint still waits");
         }
+    }
+
+    /// Byte for byte cast abi-encode's 'f(bytes32,uint256,address,uint64,address,uint64)' and
+    /// 'f(bytes32,uint256,address,uint64,address)' of the same values.
+    #[test]
+    fn the_begin_and_complete_preimages_are_the_contracts_abi_encoding() {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let begin = evm_begin_preimage([0x11; 32], 31337, [0x22; 20], 2, [0x33; 20], 4);
+        assert_eq!(
+            hex(&begin),
+            concat!(
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                "0000000000000000000000000000000000000000000000000000000000007a69",
+                "0000000000000000000000002222222222222222222222222222222222222222",
+                "0000000000000000000000000000000000000000000000000000000000000002",
+                "0000000000000000000000003333333333333333333333333333333333333333",
+                "0000000000000000000000000000000000000000000000000000000000000004",
+            )
+        );
+        let complete = evm_complete_preimage([0x11; 32], 31337, [0x22; 20], 3, [0x33; 20]);
+        assert_eq!(
+            hex(&complete),
+            concat!(
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                "0000000000000000000000000000000000000000000000000000000000007a69",
+                "0000000000000000000000002222222222222222222222222222222222222222",
+                "0000000000000000000000000000000000000000000000000000000000000003",
+                "0000000000000000000000003333333333333333333333333333333333333333",
+            )
+        );
     }
 
     #[test]
     fn each_takeover_and_key_epoch_is_its_own_duty() {
         let a = evm();
-        let b = TakeoverCancel { takeover_id: 4, ..a };
-        let c = TakeoverCancel { key_epoch: 3, ..a };
-        let g = TakeoverCancel { chain_id: TakeoverCancel::GATEWAY, takeover_id: 3, key_epoch: 0 };
-        let keys = [a, b, c, g].map(|x| Duty::Cancel(x).key());
+        let b = TakeoverStep { takeover_id: 4, ..a };
+        let c = TakeoverStep { key_epoch: 3, ..a };
+        let g = TakeoverStep { chain_id: TakeoverStep::GATEWAY, takeover_id: 3, key_epoch: 0, step: crate::watch::TakeoverStepKind::Cancel };
+        let keys = [a, b, c, g].map(|x| Duty::Takeover(x).key());
         for i in 0..keys.len() {
             for j in i + 1..keys.len() {
                 assert_ne!(keys[i], keys[j]);
             }
         }
-        assert_eq!(Duty::Cancel(g).leg(), crate::transport::Leg::Pgw);
-        assert_eq!(Duty::Cancel(a).leg(), crate::transport::Leg::Pevm);
+        assert_eq!(Duty::Takeover(g).leg(), crate::transport::Leg::Pgw);
+
+        // Begin, complete and cancel of one takeover are three duties, and each survives the
+        // round trip through its duty id (how a Done duty is restored after a restart).
+        use crate::watch::TakeoverStepKind::{Begin, Cancel, Complete};
+        let steps = [Cancel, Begin, Complete].map(|step| TakeoverStep { step, ..a });
+        assert_ne!(Duty::Takeover(steps[0]).key(), Duty::Takeover(steps[1]).key());
+        assert_ne!(Duty::Takeover(steps[1]).key(), Duty::Takeover(steps[2]).key());
+        for st in steps {
+            assert_eq!(TakeoverStep::from_id(&st.id()), st);
+        }
+        assert_eq!(Duty::Takeover(a).leg(), crate::transport::Leg::Pevm);
     }
 }

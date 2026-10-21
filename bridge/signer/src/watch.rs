@@ -61,21 +61,35 @@ fn addr32(a: [u8; 20]) -> [u8; 32] {
     out
 }
 
-/// A standby takeover begun against this committee's live key on one chain: the committee
-/// can still sign, so it cancels it. Read from the chain tip, not finality: a cancel aimed at
-/// a begin a reorg removes simply fails, while waiting for finality spends the window.
+/// Which step of a standby takeover a [`TakeoverStep`] duty signs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TakeoverStepKind {
+    /// The live committee, still able to sign, stops a takeover begun against it.
+    Cancel,
+    /// The standby committee starts the clock: the live key has stopped working.
+    Begin,
+    /// After the delay, the standby committee takes over.
+    Complete,
+}
+
+/// One step of a standby takeover on one chain, as a committee duty. The live committee signs
+/// cancels for takeovers begun against its key; the standby committee signs begins and
+/// completes for takeovers by its own. Read from the chain tip, not finality: a step aimed at
+/// a state a reorg removes simply fails, while waiting for finality spends the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TakeoverCancel {
+pub struct TakeoverStep {
     /// The EVM chain whose wBDX contract runs the takeover, or 0 for the Beldex gateway.
     pub chain_id: u64,
-    /// Which takeover: the contract's `takeoverNonce`, or the gateway's takeover start height.
+    pub step: TakeoverStepKind,
+    /// Which takeover. EVM: the contract's `takeoverNonce` (a begin names the next one).
+    /// Gateway: the takeover's start height, or for a begin the gateway's step count.
     pub takeover_id: u64,
     /// The key epoch the EVM takeover runs against (0 on the gateway). Bound into the
-    /// contract's cancel digest, so a rotation in between makes this cancel a new duty.
+    /// contract's digests, so a rotation in between makes this a new duty.
     pub key_epoch: u64,
 }
 
-impl TakeoverCancel {
+impl TakeoverStep {
     /// The Beldex gateway's pseudo chain id.
     pub const GATEWAY: u64 = 0;
 
@@ -83,13 +97,34 @@ impl TakeoverCancel {
         self.chain_id == Self::GATEWAY
     }
 
-    /// A stable 32-byte id for the duty key: chain, takeover and key epoch, little-endian.
+    /// A stable 32-byte id for the duty key: chain, takeover and key epoch little-endian,
+    /// then the step.
     pub fn id(&self) -> [u8; 32] {
         let mut id = [0u8; 32];
         id[..8].copy_from_slice(&self.chain_id.to_le_bytes());
         id[8..16].copy_from_slice(&self.takeover_id.to_le_bytes());
         id[16..24].copy_from_slice(&self.key_epoch.to_le_bytes());
+        id[24] = match self.step {
+            TakeoverStepKind::Cancel => 0,
+            TakeoverStepKind::Begin => 1,
+            TakeoverStepKind::Complete => 2,
+        };
         id
+    }
+
+    /// The step back from its [`id`](Self::id).
+    pub fn from_id(id: &[u8; 32]) -> TakeoverStep {
+        let word = |i: usize| u64::from_le_bytes(id[i..i + 8].try_into().expect("8 bytes"));
+        TakeoverStep {
+            chain_id: word(0),
+            takeover_id: word(8),
+            key_epoch: word(16),
+            step: match id[24] {
+                1 => TakeoverStepKind::Begin,
+                2 => TakeoverStepKind::Complete,
+                _ => TakeoverStepKind::Cancel,
+            },
+        }
     }
 }
 

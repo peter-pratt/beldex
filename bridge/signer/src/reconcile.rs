@@ -103,7 +103,7 @@ impl<M: DutyReconciler, R: DutyReconciler, C: DutyReconciler> DutyReconciler for
         match duty {
             Duty::Mint(_) => self.mint.is_settled(duty),
             Duty::Release(_) => self.release.is_settled(duty),
-            Duty::Cancel(_) => self.cancel.is_settled(duty),
+            Duty::Takeover(_) => self.cancel.is_settled(duty),
         }
     }
 }

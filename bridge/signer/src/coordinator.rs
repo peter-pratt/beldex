@@ -56,7 +56,7 @@ pub fn session_key(leg: Leg, epoch: u64, key: &DutyKey) -> [u8; 32] {
     buf.push(match key.kind {
         DutyKind::Mint => 0,
         DutyKind::Release => 1,
-        DutyKind::Cancel => 2,
+        DutyKind::Takeover => 2,
     });
     buf.extend_from_slice(&key.id);
     // One transaction can carry several duties; without `sub` they share a session key.
@@ -507,7 +507,7 @@ where
             // Held: mints and releases wait in the orchestrator. A takeover cancel never
             // does: it moves no value, and a hold is exactly when a takeover must not slip
             // through.
-            if self.hold.is_some() && !matches!(duty, Duty::Cancel(_)) {
+            if self.hold.is_some() && !matches!(duty, Duty::Takeover(_)) {
                 continue;
             }
             let key = duty.key();
@@ -643,7 +643,7 @@ where
                     // same duty first.
                     if live.signature.is_none()
                         && live.acked
-                        && (self.hold.is_none() || matches!(live.duty, Duty::Cancel(_)))
+                        && (self.hold.is_none() || matches!(live.duty, Duty::Takeover(_)))
                         && !signed_this_step
                         && live.ticks_in_stage >= self.sign_settle_steps
                     {
