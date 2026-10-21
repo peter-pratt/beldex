@@ -1955,6 +1955,14 @@ impl TakeoverReader {
         out
     }
 
+    /// Whether every chain answers to this node's key: each wBDX signer and the gateway owner.
+    /// An unreadable chain is not "ours".
+    fn all_ours(&self) -> bool {
+        self.evm.iter().all(|(_, client, contract)| {
+            Self::evm_state(client, contract).is_ok_and(|st| st.signer == self.pevm_address)
+        }) && self.gateway_state().is_ok_and(|g| g.owner == hex(&self.pgw_group_vk))
+    }
+
     /// What this node would sign for `s` now: its bytes while this node's role still wants
     /// that step, Ended once it does not (see takeover_guard::TakeoverView).
     fn view(&self, s: &beldex_bridge_signer::watch::TakeoverStep) -> Result<beldex_bridge_signer::takeover_guard::TakeoverView, String> {
@@ -2145,6 +2153,21 @@ where
     }
     enforce_network_policy(cfg, &settings)?;
 
+    // Run under a supervisor that restarts this process (share_watch): with no share set in
+    // its directory (a node not on the current committee, a standby with none named yet)
+    // it waits for one rather than exiting into a restart loop, and it remembers which set
+    // it loaded, to restart when that set is replaced on disk.
+    let share_dir = std::path::PathBuf::from(
+        std::env::var("BRIDGE_SIGNER_SHARE_DIR").map_err(|_| "set BRIDGE_SIGNER_SHARE_DIR".to_string())?,
+    );
+    if beldex_bridge_signer::share_watch::fingerprint(&share_dir).is_none() {
+        println!("serve: no share set in {} yet: waiting for one", share_dir.display());
+        while beldex_bridge_signer::share_watch::fingerprint(&share_dir).is_none() {
+            std::thread::sleep(std::time::Duration::from_secs(15));
+        }
+        println!("serve: a share set appeared in {}", share_dir.display());
+    }
+    let loaded_share_set = beldex_bridge_signer::share_watch::fingerprint(&share_dir);
     let ls = Rc::new(build_live_signers(cfg)?);
     let committee = ls.committee.clone();
     let self_index = ls.self_index;
@@ -2991,6 +3014,12 @@ where
     );
     let probe = if standby_role { ProbeDeposit::from_env(release_gateway.clone(), beldexd_rpc) } else { None };
     let mut last_probe: Option<std::time::Instant> = None;
+    let mut said_promote = false;
+    let supervised = std::env::var("BRIDGE_SIGNER_SUPERVISED").is_ok_and(|v| v.trim() == "1");
+    let retire_after = std::time::Duration::from_secs(
+        std::env::var("BRIDGE_SIGNER_RETIRE_AFTER_SECS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(600),
+    );
+    let mut retired_since: Option<std::time::Instant> = None;
     if standby_role {
         println!(
             "serve: STANDBY role: signs only takeover begin/complete for this share set's key, after \
@@ -3002,6 +3031,15 @@ where
 
     let mut ticks = 0u64;
     loop {
+        // The share set this process loaded was replaced on disk (a promotion after a
+        // rotation or a takeover): exit, so the supervisor restarts it on the new set.
+        if ticks % 12 == 0 && beldex_bridge_signer::share_watch::fingerprint(&share_dir) != loaded_share_set {
+            println!(
+                "serve: the share set in {} changed: exiting so the supervisor restarts on the new one",
+                share_dir.display()
+            );
+            std::process::exit(beldex_bridge_signer::share_watch::RESTART_EXIT_CODE);
+        }
         // Re-read the committee about once a minute. A transport error is not a change —
         // only a view that parses and differs counts, or a blip would stall the node.
         if !committee_changed && ticks % 12 == 0 {
@@ -3073,7 +3111,21 @@ where
                             }
                         }
                     }
-                } else if !mint_key_live.contains(chain_id) {
+                } else if !mint_key_live.contains(chain_id) && {
+                    // Never seen live by this process, but the contract may already have
+                    // retired it (this signer restarted after its key was replaced). That is
+                    // replaced, not incoming: its mints belong to the successor.
+                    let sel = format!("0x{}", hex(&Keccak256::digest(b"retiredKey(address)")[..4]));
+                    let q = serde_json::json!([{
+                        "to": format!("0x{}", hex(contract)),
+                        "data": format!("{sel}{:0>64}", hex(&ls.pevm_address)),
+                    }, at]);
+                    !client
+                        .call("eth_call", q)
+                        .ok()
+                        .and_then(|w| w.as_str().map(|w| w.ends_with('1')))
+                        .unwrap_or(false)
+                } {
                     let now = std::time::Instant::now();
                     if mint_key_incoming.insert(*chain_id) {
                         incoming_since.insert(*chain_id, (now, now));
@@ -3133,6 +3185,35 @@ where
             }
         }
 
+        // Supervised (BRIDGE_SIGNER_SUPERVISED=1): a live share set replaced on every chain and
+        // the gateway, for long enough that a reorg will not bring it back, serves nothing
+        // more. Archive it, as promote-shares.sh does for a leaving node, and exit: the
+        // supervisor restarts this signer, which then waits for the node's next share set
+        // instead of holding a retired key, its mesh ports and its RPC load.
+        if supervised && !standby_role && ticks % 12 == 0 {
+            let everywhere = release_key_replaced && configs.iter().all(|c| mint_key_replaced.contains(&c.chain_id));
+            match (everywhere, retired_since) {
+                (false, _) => retired_since = None,
+                (true, None) => retired_since = Some(std::time::Instant::now()),
+                (true, Some(t)) if t.elapsed() >= retire_after && orch.outstanding().is_empty() => {
+                    let mut to = share_dir.as_os_str().to_owned();
+                    to.push(format!(".retired-{}", beldex_bridge_signer::release_outbox::now_secs()));
+                    match std::fs::rename(&share_dir, &to) {
+                        Ok(()) => {
+                            println!(
+                                "serve: this share set's key was replaced on every chain {}s ago: archived it to \
+                                 {} and exiting; this signer waits for the node's next share set",
+                                t.elapsed().as_secs(),
+                                std::path::Path::new(&to).display()
+                            );
+                            std::process::exit(beldex_bridge_signer::share_watch::RESTART_EXIT_CODE);
+                        }
+                        Err(e) => eprintln!("!! could not archive the replaced share set: {e}"),
+                    }
+                }
+                _ => {}
+            }
+        }
         // Re-ask the chain about every duty not yet done — in flight as well as queued, since
         // a session that keeps timing out and reopening is almost never in the queued state.
         // Reconciliation on first sighting is
@@ -3182,6 +3263,36 @@ where
         // complete. A step handed off that is still wanted two minutes later is signed and
         // sent again (Orchestrator::reopen).
         if ticks % guard_ticks == 0 {
+            if standby_role && takeover.all_ours() {
+                // Every chain answers to this standby key now: it is the live key. Move this
+                // share set into the live directory (archiving the old one) and exit; the live
+                // signer on this node restarts on it, and this one waits for the next standby.
+                match std::env::var("BRIDGE_SIGNER_PROMOTE_TO").ok().filter(|v| !v.trim().is_empty()) {
+                    Some(live_dir) => {
+                        let now = beldex_bridge_signer::release_outbox::now_secs();
+                        match beldex_bridge_signer::share_watch::promote(&share_dir, std::path::Path::new(live_dir.trim()), now) {
+                            Ok(archived) => {
+                                println!(
+                                    "PROMOTED: every chain answers to this standby key; its shares are now the \
+                                     live set in {}{}. Exiting for the restart.",
+                                    live_dir.trim(),
+                                    archived.map(|a| format!(" (the old set kept in {})", a.display())).unwrap_or_default()
+                                );
+                                std::process::exit(beldex_bridge_signer::share_watch::RESTART_EXIT_CODE);
+                            }
+                            Err(e) => eprintln!("!! could not promote the standby shares: {e}"),
+                        }
+                    }
+                    None if !said_promote => {
+                        said_promote = true;
+                        eprintln!(
+                            "!! every chain answers to this standby key: promote its shares to the live \
+                             directory and restart (or set BRIDGE_SIGNER_PROMOTE_TO to have it done)"
+                        );
+                    }
+                    None => {}
+                }
+            }
             if standby_role {
                 update_outage(&takeover, &mut evidence, &mut evidence_reconciler, outage_window);
                 if let Some(p) = &probe {
