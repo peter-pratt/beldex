@@ -26,6 +26,13 @@
 # restarting them never touches the live signers. PROBE_* passes the optional probe deposit
 # through (BRIDGE_SIGNER_PROBE_*).
 #
+# SUPERVISE=1 runs each signer the way a production supervisor (systemd Restart=always) would:
+# restarted whenever it exits with 75. With it, the signers follow a hand-over themselves: a
+# node with no share set waits for one (every node gets a live signer), a standby signer whose
+# key every chain answers to promotes its shares into the node's live directory, and a live
+# signer whose key was replaced everywhere for RETIRE_AFTER_SECS (default 60 here) archives
+# its set and waits. No promote-shares.sh, no restart by hand.
+#
 # Stop with:  pkill -f 'beldex-bridge-signer serve'
 # Logs:       testdata/serve-<node>.log   (watch the `tick N: opened/acked/...` lines)
 
@@ -175,8 +182,11 @@ SIGNER="${SIGNER:-$(git rev-parse --show-toplevel)/bridge/signer/target/debug/be
 ANY32=$(printf '11%.0s' {1..32})
 
 if [ "$ROLE" = standby ]; then
-  # Only this script's earlier standby signers: the live ones keep running.
-  [ -s serve-standby.pids ] && xargs -r kill < serve-standby.pids 2>/dev/null || true
+  # Only this script's earlier standby signers (each a restart loop and its signer): the
+  # live ones keep running.
+  if [ -s serve-standby.pids ]; then
+    for p in $(cat serve-standby.pids); do pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; done
+  fi
   sleep 1
   rm -f serve-standby-*.log serve-standby.pids
 else
@@ -208,8 +218,11 @@ for d in beldex-127.0.0.1-*/; do
   # (A standby signer reads it from its own standby tree: the node may hold no live share.)
   own="$SOCKBASE/${d}devnet/shares"; [ "$ROLE" = standby ] && own="$share"
   idx=$(ls "$own"/pgw-*.keypackage 2>/dev/null | sed -E 's/.*pgw-([0-9]+)\.keypackage/\1/' | head -1) || true
+  if [ -z "$idx" ] && [ "${SUPERVISE:-0}" = 1 ] && [ "$ROLE" = live ]; then
+    idx=waiting # supervised: it waits for this node's first share set
+  fi
   [ -n "$idx" ] || { echo "skip ${d%/}: no pgw share (did dkg run here?)"; continue; }
-  if [ "$NODES" != "all" ]; then
+  if [ "$NODES" != "all" ] && [ "$idx" != waiting ]; then
     case ",$NODES," in
       *",$idx,"*) ;;
       *) echo "skip ${d%/}: committee index $idx not in NODES={$NODES}"; continue ;;
@@ -226,7 +239,14 @@ for d in beldex-127.0.0.1-*/; do
   fi
 
   echo "start ${d%/}: committee index $idx${node_relay:+  (relays mints)}"
+  # (A waiting node still needs its own share key: it seals whatever set arrives later.)
   share_key_ready "$SOCKBASE/${d}devnet" "$share" || exit 1
+  : > "$TAG-${d%/}.log"
+  (
+  # The script runs under errexit; the loop must not, or a signer's exit would end it
+  # before the status could be looked at.
+  set +e
+  while :; do
   BRIDGE_SIGNER_SHARE_KEY_FILE="$SHARE_KEY_FILE" \
   BRIDGE_SIGNER_GENESIS_HASH="$BRIDGE_SIGNER_GENESIS_HASH" \
   BRIDGE_SIGNER_MINT_BUS_ENDPOINT="ipc://$SOCKBASE/beldex-127.0.0.1-19191/devnet/beldexd.sock" \
@@ -251,6 +271,8 @@ for d in beldex-127.0.0.1-*/; do
   BRIDGE_SIGNER_EVM_FINALITY_DIR="$SOCKBASE/${d}devnet/evm-finality${SUFFIX}" \
   BRIDGE_SIGNER_WATCH_CURSOR_DIR="$SOCKBASE/${d}devnet/watch-cursors${SUFFIX}" \
   BRIDGE_SIGNER_ROLE="$ROLE" \
+  BRIDGE_SIGNER_SUPERVISED="${SUPERVISE:-0}" BRIDGE_SIGNER_RETIRE_AFTER_SECS="${RETIRE_AFTER_SECS:-60}" \
+  BRIDGE_SIGNER_PROMOTE_TO="$( [ "$ROLE" = standby ] && [ "${SUPERVISE:-0}" = 1 ] && echo "$SOCKBASE/${d}devnet/shares" )" \
   BRIDGE_SIGNER_OUTAGE_WINDOW_SECS="${OUTAGE_WINDOW_SECS:-60}" \
   BRIDGE_SIGNER_PROBE_WALLET_RPC="${PROBE_WALLET_RPC:-}" BRIDGE_SIGNER_PROBE_EVERY_SECS="${PROBE_EVERY_SECS:-}" \
   BRIDGE_SIGNER_PROBE_CHAIN_ID="${PROBE_CHAIN_ID:-}" BRIDGE_SIGNER_PROBE_EVM_ADDRESS="${PROBE_EVM_ADDRESS:-}" \
@@ -258,7 +280,16 @@ for d in beldex-127.0.0.1-*/; do
   BRIDGE_SIGNER_WATCH_POLL_SECS="$POLL_SECS" \
   BRIDGE_SIGNER_RELEASE_GATEWAY="$RELEASE_GATEWAY" \
   BRIDGE_SIGNER_RELEASE_FEE="$RELEASE_FEE" \
-    "$SIGNER" serve > "$TAG-${d%/}.log" 2>&1 &
+    "$SIGNER" serve >> "$TAG-${d%/}.log" 2>&1
+  rc=$?
+  # Supervised like systemd's Restart=always: 75 (the signer's share set moved) restarts at
+  # once, any other failure after a pause (on this one host a port can still be held by the
+  # signer it replaces). Killed by a signal (>= 128) means stopped on purpose: end the loop.
+  [ "${SUPERVISE:-0}" = 1 ] && [ "$rc" -lt 128 ] || exit "$rc"
+  echo "-- supervisor: restarting after exit $rc" >> "$TAG-${d%/}.log"
+  [ "$rc" -eq 75 ] && sleep 2 || sleep 10
+  done
+  ) </dev/null >/dev/null 2>&1 &
   PIDS+=("$!:${d%/}")
   [ "$ROLE" = standby ] && echo "$!" >> serve-standby.pids
   started=$((started + 1))
