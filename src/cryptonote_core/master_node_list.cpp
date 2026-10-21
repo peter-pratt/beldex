@@ -2782,6 +2782,20 @@ namespace master_nodes
     cryptonote::tx_extra_gateway_repoint repoint{};
     while (cryptonote::get_field_from_tx_extra(tx.extra, repoint, skip++))
       note(repoint.gateway_id, repoint.new_owner_descriptor);
+    // A standby's standalone takeover complete hands the gateway to the standby with no
+    // descriptor op; the step names the new owner (consensus checked it is the standby).
+    // A second copy of the same complete sees the owner already moved and counts nothing.
+    skip = 0;
+    cryptonote::tx_extra_gateway_takeover takeover{};
+    while (cryptonote::get_field_from_tx_extra(tx.extra, takeover, skip++))
+      if (takeover.version >= 1 && takeover.action == cryptonote::gateway_takeover_action::complete)
+      {
+        cryptonote::gateway_descriptor_base desc{};
+        desc.version   = 2;
+        desc.flags     = cryptonote::GATEWAY_FLAG_BRIDGE_RESERVE; // sticky on the bridge gateway
+        desc.owner_key = takeover.new_owner;
+        note(takeover.gateway_id, desc);
+      }
     return handed_over;
   }
 

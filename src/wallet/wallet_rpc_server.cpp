@@ -3245,7 +3245,7 @@ namespace {
     cancel.sig = parse_gateway_owner_sig(req.signature_type, req.signature);
 
     tools::wallet2::bridge_rotation_ack_result built =
-        m_wallet->create_gateway_takeover_cancel_tx(cancel, req.priority);
+        m_wallet->create_gateway_takeover_step_tx(cancel, req.priority);
     if (!built.success)
       throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, built.msg};
     try
@@ -3530,6 +3530,44 @@ namespace {
     }
 
     res.tx_hash = tools::type_to_hex(cryptonote::get_transaction_hash(ptx.tx));
+    return res;
+  }
+
+  GATEWAY_TAKEOVER_STEP::response wallet_rpc_server::invoke(GATEWAY_TAKEOVER_STEP::request&& req)
+  {
+    require_open();
+    GATEWAY_TAKEOVER_STEP::response res{};
+
+    cryptonote::tx_extra_gateway_takeover step{};
+    step.version = 1;
+    if (req.action == "begin")
+      step.action = cryptonote::gateway_takeover_action::begin;
+    else if (req.action == "complete")
+      step.action = cryptonote::gateway_takeover_action::complete;
+    else if (req.action == "cancel")
+      step.action = cryptonote::gateway_takeover_action::cancel;
+    else
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "action must be one of: begin, complete, cancel"};
+    if (!tools::hex_to_type(req.gateway_id, step.gateway_id))
+      throw wallet_rpc_error{error_code::WRONG_ADDRESS, "invalid gateway_id (expected 64-char hex)"};
+    step.started_height = req.started_height;
+    step.sig = parse_gateway_owner_sig(req.signature_type, req.signature);
+    if (step.action == cryptonote::gateway_takeover_action::complete)
+      step.new_owner = parse_gateway_owner_key(req.new_owner_key_type, req.new_owner_key);
+
+    tools::wallet2::bridge_rotation_ack_result built = m_wallet->create_gateway_takeover_step_tx(step, req.priority);
+    if (!built.success)
+      throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, built.msg};
+    try
+    {
+      m_wallet->commit_tx(built.ptx, false /*flash*/);
+    }
+    catch (const std::exception& e)
+    {
+      throw wallet_rpc_error{error_code::GENERIC_TRANSFER_ERROR,
+                             std::string("Failed to commit the takeover ") + req.action + ": " + e.what()};
+    }
+    res.tx_hash = tools::type_to_hex(cryptonote::get_transaction_hash(built.ptx.tx));
     return res;
   }
 

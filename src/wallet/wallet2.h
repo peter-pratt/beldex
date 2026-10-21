@@ -1451,10 +1451,10 @@ private:
     };
     bridge_rotation_ack_result create_bridge_rotation_ack_tx(const std::string& rotation_hex, uint32_t priority = 0, std::set<uint32_t> subaddr_indices = {});
 
-    // HF23 standby takeover: carry a gateway owner's standalone cancel (a version-1
-    // tx_extra_gateway_takeover) on chain. As with the ack, the authority is the owner's
-    // signature inside it, not this wallet, which only pays the fee.
-    bridge_rotation_ack_result create_gateway_takeover_cancel_tx(const cryptonote::tx_extra_gateway_takeover& cancel, uint32_t priority = 0, std::set<uint32_t> subaddr_indices = {});
+    // HF23 standby takeover: carry a standalone step (a version-1 tx_extra_gateway_takeover:
+    // the standby's begin or complete, or the owner's cancel) on chain. As with the ack, the
+    // authority is the signature inside it, not this wallet, which only pays the fee.
+    bridge_rotation_ack_result create_gateway_takeover_step_tx(const cryptonote::tx_extra_gateway_takeover& step, uint32_t priority = 0, std::set<uint32_t> subaddr_indices = {});
 
     struct request_stake_unlock_result
     {

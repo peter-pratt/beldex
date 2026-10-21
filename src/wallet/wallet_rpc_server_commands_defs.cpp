@@ -1138,6 +1138,21 @@ KV_SERIALIZE_MAP_CODE_BEGIN(GATEWAY_TAKEOVER_CANCEL::response)
   KV_SERIALIZE(tx_hash);
 KV_SERIALIZE_MAP_CODE_END()
 
+KV_SERIALIZE_MAP_CODE_BEGIN(GATEWAY_TAKEOVER_STEP::request)
+  KV_SERIALIZE(gateway_id);
+  KV_SERIALIZE(action);
+  KV_SERIALIZE(started_height);
+  KV_SERIALIZE(signature);
+  KV_SERIALIZE_OPT(signature_type,     std::string{"eddsa"})
+  KV_SERIALIZE_OPT(new_owner_key,      std::string{})
+  KV_SERIALIZE_OPT(new_owner_key_type, std::string{"eddsa"})
+  KV_SERIALIZE_OPT(priority,           (uint32_t)0)
+KV_SERIALIZE_MAP_CODE_END()
+
+KV_SERIALIZE_MAP_CODE_BEGIN(GATEWAY_TAKEOVER_STEP::response)
+  KV_SERIALIZE(tx_hash);
+KV_SERIALIZE_MAP_CODE_END()
+
 
 KV_SERIALIZE_MAP_CODE_BEGIN(REQUEST_STAKE_UNLOCK::request)
   KV_SERIALIZE(master_node_key);

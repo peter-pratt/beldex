@@ -214,6 +214,9 @@ namespace hashkey {
   inline constexpr std::string_view GW_REPOINT      = "gateway_repoint"sv;      // supermajority owner re-point attestation message
   // Standby takeover (HF23): the owner's standalone cancel of a running takeover.
   inline constexpr std::string_view GW_TAKEOVER_CANCEL = "gateway_takeover_cancel"sv;
+  // ...and the standby's standalone begin and complete.
+  inline constexpr std::string_view GW_TAKEOVER_BEGIN    = "gateway_takeover_begin"sv;
+  inline constexpr std::string_view GW_TAKEOVER_COMPLETE = "gateway_takeover_complete"sv;
   // Phase F accountability: the bridge-committee slash-report domain. MUST match the
   // off-chain signer's `slash::SLASH_REPORT_DOMAIN` byte-for-byte.
   inline constexpr std::string_view BRIDGE_SLASH    = "bridge_slash_report_v1"sv; // bridge accountability slash report

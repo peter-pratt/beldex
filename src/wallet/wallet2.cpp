@@ -8568,17 +8568,17 @@ wallet2::bridge_slash_result wallet2::create_bridge_slash_tx(const std::string& 
   return result;
 }
 
-wallet2::bridge_rotation_ack_result wallet2::create_gateway_takeover_cancel_tx(const cryptonote::tx_extra_gateway_takeover& cancel, uint32_t priority, std::set<uint32_t> subaddr_indices)
+wallet2::bridge_rotation_ack_result wallet2::create_gateway_takeover_step_tx(const cryptonote::tx_extra_gateway_takeover& step, uint32_t priority, std::set<uint32_t> subaddr_indices)
 {
   bridge_rotation_ack_result result{};
-  if (cancel.version != 1 || cancel.action != cryptonote::gateway_takeover_action::cancel || cancel.started_height == 0)
+  if (step.version != 1 || (step.action != cryptonote::gateway_takeover_action::begin && step.started_height == 0))
   {
-    result.msg = tr("A takeover cancel names the takeover's start height and is signed by the gateway owner");
+    result.msg = tr("A standalone takeover step is version 1; a complete or cancel names the takeover's start height");
     return result;
   }
   if (priority == tx_priority_flash)
   {
-    result.msg = tr("Gateway takeover cancels cannot use flash priority");
+    result.msg = tr("Gateway takeover steps cannot use flash priority");
     return result;
   }
   auto hf_version = get_hard_fork_version();
@@ -8589,13 +8589,13 @@ wallet2::bridge_rotation_ack_result wallet2::create_gateway_takeover_cancel_tx(c
   }
   if (*hf_version < cryptonote::hf::hf23_bridge)
   {
-    result.msg = tr("Gateway takeover cancels require the bridge hard fork (HF23)");
+    result.msg = tr("Gateway takeover steps require the bridge hard fork (HF23)");
     return result;
   }
   std::vector<uint8_t> extra;
-  if (!cryptonote::add_gateway_takeover_to_tx_extra(extra, cancel))
+  if (!cryptonote::add_gateway_takeover_to_tx_extra(extra, step))
   {
-    result.msg = tr("Failed to serialize the takeover cancel into the transaction");
+    result.msg = tr("Failed to serialize the takeover step into the transaction");
     return result;
   }
   try
@@ -8615,7 +8615,7 @@ wallet2::bridge_rotation_ack_result wallet2::create_gateway_takeover_cancel_tx(c
   }
   catch (const std::exception& e)
   {
-    result.msg = std::string(tr("Failed to create the takeover cancel transaction: ")) + e.what();
+    result.msg = std::string(tr("Failed to create the takeover step transaction: ")) + e.what();
   }
   return result;
 }

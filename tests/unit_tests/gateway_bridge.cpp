@@ -2559,3 +2559,122 @@ TEST(GatewayStandbyTakeover, a_cancel_is_never_a_descriptor_update_marker)
   EXPECT_FALSE(tx_valid(db, marker, reason));
   EXPECT_NE(reason.find("standalone"), std::string::npos) << reason;
 }
+
+// The standby's standalone begin and complete: signed over messages fixed by the chain, so
+// the standby committee signs them from chain state alone and any wallet carries them.
+namespace
+{
+  transaction standalone_step(const crypto::public_key& gw, gateway_takeover_action action, uint64_t started,
+                              const crypto::hash& msg, const OwnerKeys& signer,
+                              std::optional<crypto::public_key> new_owner = std::nullopt)
+  {
+    transaction tx{};
+    tx.version = txversion::v4_tx_types;
+    tx.type    = txtype::bridge_registration;
+    tx.vin.push_back(txin_gen{0});
+    tx_extra_gateway_takeover t{};
+    t.version = 1;
+    t.gateway_id = gw;
+    t.action = action;
+    t.started_height = started;
+    crypto::signature sig;
+    crypto::generate_signature(msg, signer.pub, signer.sec, sig);
+    t.sig = sig;
+    if (new_owner)
+      t.new_owner = *new_owner;
+    EXPECT_TRUE(add_gateway_takeover_to_tx_extra(tx.extra, t));
+    return tx;
+  }
+}
+
+TEST(GatewayStandbyTakeover, the_standby_begins_and_completes_with_standalone_steps)
+{
+  MemGatewayDB db;
+  const OwnerKeys owner = new_owner_keys(), standby = new_owner_keys(), stranger = new_owner_keys();
+  const crypto::public_key gw = seed_with_standby(db, owner, standby);
+  const std::string before = blob_of(gw, db);
+  const uint64_t wait = gateway_standby_takeover_blocks(NET_TO);
+  std::string reason;
+  db.chain_height = 900;
+
+  // Begin: the standby signs over the current descriptor and the gateway's step count.
+  const auto begin_msg = gateway_takeover_begin_message(NET_TO, gw, current(db, gw), 0);
+  EXPECT_FALSE(tx_valid(db, standalone_step(gw, gateway_takeover_action::begin, 0, begin_msg, owner), reason));
+  EXPECT_NE(reason.find("standby owner"), std::string::npos) << reason;
+  EXPECT_FALSE(tx_valid(db, standalone_step(gw, gateway_takeover_action::begin, 1, begin_msg, standby), reason));
+  EXPECT_NE(reason.find("step"), std::string::npos) << reason;
+  const auto begin = standalone_step(gw, gateway_takeover_action::begin, 0, begin_msg, standby);
+  ASSERT_TRUE(tx_valid(db, begin, reason)) << reason;
+  ASSERT_TRUE(append_gateways_from_transactions(db, {begin}, 900, true, &reason)) << reason;
+  EXPECT_EQ(started(db, gw), 900u);
+  db.chain_height = 901;
+  EXPECT_FALSE(tx_valid(db, begin, reason));
+  EXPECT_NE(reason.find("already running"), std::string::npos) << reason;
+
+  // Complete: only after the delay, only naming the standby as the new owner.
+  const auto done_msg = gateway_takeover_complete_message(NET_TO, gw, 900);
+  db.chain_height = 900 + wait - 1;
+  EXPECT_FALSE(tx_valid(db, standalone_step(gw, gateway_takeover_action::complete, 900, done_msg, standby, standby.pub), reason));
+  EXPECT_NE(reason.find("not ready"), std::string::npos) << reason;
+  db.chain_height = 900 + wait;
+  EXPECT_FALSE(tx_valid(db, standalone_step(gw, gateway_takeover_action::complete, 900, done_msg, standby, stranger.pub), reason));
+  EXPECT_NE(reason.find("standby owner as the new owner"), std::string::npos) << reason;
+  EXPECT_FALSE(tx_valid(db, standalone_step(gw, gateway_takeover_action::complete, 900, done_msg, owner, standby.pub), reason));
+  const auto complete = standalone_step(gw, gateway_takeover_action::complete, 900, done_msg, standby, standby.pub);
+  ASSERT_TRUE(tx_valid(db, complete, reason)) << reason;
+  const std::string running = blob_of(gw, db);
+  ASSERT_TRUE(append_gateways_from_transactions(db, {complete}, 900 + wait, true, &reason)) << reason;
+
+  const auto after = current(db, gw);
+  EXPECT_TRUE(after.owner_key == gateway_owner_key_v{standby.pub});
+  EXPECT_EQ(after.has_standby, 0);
+  EXPECT_EQ(started(db, gw), 0u);
+
+  // A reorg undoes the complete, then the begin, byte for byte.
+  ASSERT_TRUE(rewind_gateways_from_transactions(db, {complete}, 900 + wait, true, &reason)) << reason;
+  EXPECT_EQ(blob_of(gw, db), running);
+  ASSERT_TRUE(rewind_gateways_from_transactions(db, {begin}, 900, true, &reason)) << reason;
+  EXPECT_EQ(blob_of(gw, db), before);
+}
+
+// A begin the owner cancelled can never be replayed: it was signed for the step count at the
+// time, and the cancel moved it on.
+TEST(GatewayStandbyTakeover, a_cancelled_begin_cannot_be_replayed)
+{
+  MemGatewayDB db;
+  const OwnerKeys owner = new_owner_keys(), standby = new_owner_keys();
+  const crypto::public_key gw = seed_with_standby(db, owner, standby);
+  const uint64_t wait = gateway_standby_takeover_blocks(NET_TO);
+  std::string reason;
+  db.chain_height = 1000;
+  const auto begin = standalone_step(gw, gateway_takeover_action::begin, 0,
+                                     gateway_takeover_begin_message(NET_TO, gw, current(db, gw), 0), standby);
+  ASSERT_TRUE(append_gateways_from_transactions(db, {begin}, 1000, true, &reason)) << reason;
+  ASSERT_TRUE(append_gateways_from_transactions(db, {standalone_cancel(gw, 1000, owner)}, 1001, true, &reason)) << reason;
+  db.chain_height = 1001 + wait; // past the cooldown
+  EXPECT_FALSE(tx_valid(db, begin, reason));
+  EXPECT_NE(reason.find("gateway is at step 2"), std::string::npos) << reason;
+}
+
+// The bond gate counts a standalone complete as the gateway's hand-over, once.
+TEST(GatewayBridgeRotation, a_standalone_takeover_complete_counts_as_a_hand_over)
+{
+  master_node_list::state_t cur(nullptr);
+  const crypto::public_key gw = rand_pubkey();
+  tx_extra_gateway_descriptor_operation op{};
+  op.op_type = gateway_descriptor_op_type::register_address;
+  op.address_id = gw;
+  op.descriptor.version = 2;
+  op.descriptor.owner_key = rand_pubkey();
+  op.descriptor.flags = GATEWAY_FLAG_BRIDGE_RESERVE;
+  transaction reg{};
+  add_gateway_descriptor_operation_to_tx_extra(reg.extra, op);
+  EXPECT_FALSE(cur.process_bridge_gateway_owner_tx(NET_FC, reg));
+
+  const OwnerKeys standby = new_owner_keys();
+  const auto complete = standalone_step(gw, gateway_takeover_action::complete, 5, crypto::hash{}, standby, standby.pub);
+  EXPECT_TRUE(cur.process_bridge_gateway_owner_tx(NET_FC, complete));
+  EXPECT_EQ(observed_epoch(cur, BRIDGE_GATEWAY_CHAIN_ID), 1u);
+  EXPECT_FALSE(cur.process_bridge_gateway_owner_tx(NET_FC, complete)) << "a second copy counts nothing";
+  EXPECT_EQ(observed_epoch(cur, BRIDGE_GATEWAY_CHAIN_ID), 1u);
+}

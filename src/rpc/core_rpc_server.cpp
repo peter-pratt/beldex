@@ -3783,6 +3783,15 @@ namespace cryptonote::rpc {
       if (started)
         cmd.response["takeover_cancel_message"] = tools::type_to_hex(
             cryptonote::gateway_takeover_cancel_message(m_core.get_nettype(), gw_id, started));
+      // The standby's standalone steps (version-1 takeover markers): how many takeover steps
+      // the gateway has recorded (a begin must name it), and the exact messages to sign.
+      cmd.response["takeover_steps"] = acct.takeover_log.size();
+      if (d.has_standby && !started)
+        cmd.response["takeover_begin_message"] = tools::type_to_hex(cryptonote::gateway_takeover_begin_message(
+            m_core.get_nettype(), gw_id, d, acct.takeover_log.size()));
+      if (d.has_standby && started)
+        cmd.response["takeover_complete_message"] = tools::type_to_hex(
+            cryptonote::gateway_takeover_complete_message(m_core.get_nettype(), gw_id, started));
       // No takeover may begin before this height (0 = none pending): one delay after the
       // last one ended.
       const uint64_t ended = acct.takeover_ended_height();

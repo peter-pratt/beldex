@@ -83,10 +83,23 @@ crypto::hash gateway_repoint_message(network_type nettype, const crypto::public_
 crypto::hash gateway_takeover_cancel_message(network_type nettype, const crypto::public_key& gateway_id,
                                              uint64_t started_height);
 
-// A version-1 takeover cancel against the stored state: a running takeover that began at
-// its started_height, and the gateway owner's signature over the cancel message.
-bool validate_gateway_takeover_cancel(BlockchainDB& db, network_type nettype,
-                                      const tx_extra_gateway_takeover& t, std::string& reason);
+// What the STANDBY signs to begin a takeover of a gateway whose descriptor is `current`,
+// when the gateway has recorded `step_count` takeover steps (its takeover_log size). Bound to
+// that descriptor and that count, so a begin cancelled once can never be replayed.
+crypto::hash gateway_takeover_begin_message(network_type nettype, const crypto::public_key& gateway_id,
+                                            const gateway_descriptor_base& current, uint64_t step_count);
+// What the STANDBY signs to complete the takeover that began at `started_height`.
+crypto::hash gateway_takeover_complete_message(network_type nettype, const crypto::public_key& gateway_id,
+                                               uint64_t started_height);
+
+// A version-1 (standalone) takeover step against the stored state at the chain tip:
+//  - begin:    a standby, no takeover running or cooling down, the right step count, and the
+//              standby's signature;
+//  - complete: the named takeover running and ready, new_owner the standby, and the
+//              standby's signature;
+//  - cancel:   the named takeover running, and the owner's signature.
+bool validate_gateway_takeover_step(BlockchainDB& db, network_type nettype,
+                                    const tx_extra_gateway_takeover& t, std::string& reason);
 
 // Verify a supermajority attestation set (`evidence`) over `msg` against the
 // checkpoint quorum resolved for `epoch_height`. Requires at least

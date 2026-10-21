@@ -2220,6 +2220,38 @@ BELDEX_RPC_DOC_INTROSPECT
   };
 
   BELDEX_RPC_DOC_INTROSPECT
+  // Submit a standalone gateway takeover step (HF23): the standby's `begin` or `complete`, or
+  // the owner's `cancel`. The signer signs the matching message from the daemon's
+  // get_gateway_info (takeover_begin_message with started_height = takeover_steps,
+  // takeover_complete_message, takeover_cancel_message); a complete also names the new
+  // owner, the standby. This wallet only pays the fee to carry it.
+  struct GATEWAY_TAKEOVER_STEP : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("gateway_takeover_step"); }
+
+    struct request
+    {
+      std::string gateway_id;          // The gateway, 64-char hex.
+      std::string action;              // "begin", "complete" or "cancel".
+      uint64_t    started_height;      // begin: takeover_steps; complete/cancel: the takeover's start height.
+      std::string signature;           // Signature over the step's message, hex.
+      std::string signature_type;      // "eddsa" (bridge committee), "schnorr" or "eth".
+      std::string new_owner_key;       // complete: the standby owner key, hex.
+      std::string new_owner_key_type;  // complete: its type ("eddsa", "schnorr" or "eth").
+      uint32_t    priority;            // (Optional) Transaction priority (flash not allowed).
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response
+    {
+      std::string tx_hash;
+
+      KV_MAP_SERIALIZABLE
+    };
+  };
+
+  BELDEX_RPC_DOC_INTROSPECT
   // Request to unlock stake by deregistering Master Node.
   struct REQUEST_STAKE_UNLOCK : RESTRICTED
   {
@@ -2893,6 +2925,7 @@ This command is only required if the open wallet is one of the owners of a BNS r
     BRIDGE_UNBOND,
     BRIDGE_ROTATION_ACK,
     GATEWAY_TAKEOVER_CANCEL,
+    GATEWAY_TAKEOVER_STEP,
     REQUEST_STAKE_UNLOCK,
     CAN_REQUEST_STAKE_UNLOCK,
     VALIDATE_ADDRESS,

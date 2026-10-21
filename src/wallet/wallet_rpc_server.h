@@ -160,6 +160,7 @@ namespace tools
     wallet_rpc::BRIDGE_UNBOND::response                   invoke(wallet_rpc::BRIDGE_UNBOND::request&& req);
     wallet_rpc::BRIDGE_ROTATION_ACK::response             invoke(wallet_rpc::BRIDGE_ROTATION_ACK::request&& req);
     wallet_rpc::GATEWAY_TAKEOVER_CANCEL::response         invoke(wallet_rpc::GATEWAY_TAKEOVER_CANCEL::request&& req);
+    wallet_rpc::GATEWAY_TAKEOVER_STEP::response           invoke(wallet_rpc::GATEWAY_TAKEOVER_STEP::request&& req);
     wallet_rpc::CAN_REQUEST_STAKE_UNLOCK::response        invoke(wallet_rpc::CAN_REQUEST_STAKE_UNLOCK::request&& req);
     wallet_rpc::REQUEST_STAKE_UNLOCK::response            invoke(wallet_rpc::REQUEST_STAKE_UNLOCK::request&& req);
     wallet_rpc::BNS_BUY_MAPPING::response                 invoke(wallet_rpc::BNS_BUY_MAPPING::request&& req);
