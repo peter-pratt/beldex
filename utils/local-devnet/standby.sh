@@ -8,7 +8,8 @@
 #   ./standby.sh register   the LIVE key names the standby (shares-standby) on the wBDX
 #                           contract and as the gateway's standby owner
 #   ./standby.sh guard      live side: cancel any running takeover the live key can still
-#                           sign against (loops; ONCE=1 for a single pass)
+#                           sign against (loops; ONCE=1 for a single pass). The live signers
+#                           (serve) now do this themselves; this stays as a devnet cross-check
 #   ./standby.sh watch      standby side: when the live key's holders are unreachable,
 #                           begin the takeover on both chains, complete it after the delay,
 #                           promote shares-standby and restart the signers (loops)
@@ -321,6 +322,8 @@ case "${1:-}" in
             say "live key holders reachable: $up < $T for $(( now - low_since ))s — beginning the takeover"
             evm_begin && say "wBDX: takeover begun" || say "!! wBDX begin failed"
             l1_update "$(gw owner_key)" "$SB_VK" begin "$STANDBY_SUBDIR" takeover-gw-begin && say "gateway: takeover begun" || say "!! gateway begin failed"
+            # A gateway begin sits in the mempool until mined; do not take it for a failure.
+            l1_begin_wait=$(( $(l1_height) + 3 ))
           fi
         fi
       elif { [ "$er" = 1 ] && [ "$lr" = 0 ] && [ "$go" = live ]; } || { [ "$er" = 0 ] && [ "$lr" = 1 ] && [ "$eo" = live ]; }; then
@@ -329,8 +332,9 @@ case "${1:-}" in
         # happen. Retry the missing begin only while the outage lasts.
         if [ "$low_since" -ne 0 ]; then
           if [ "$er" = 0 ] && ! evm_cooling; then evm_begin && say "wBDX: takeover begun (second try)"; fi
-          if [ "$lr" = 0 ] && ! l1_cooling; then
+          if [ "$lr" = 0 ] && ! l1_cooling && [ "$(l1_height)" -ge "${l1_begin_wait:-0}" ]; then
             l1_update "$(gw owner_key)" "$SB_VK" begin "$STANDBY_SUBDIR" takeover-gw-begin && say "gateway: takeover begun (second try)"
+            l1_begin_wait=$(( $(l1_height) + 3 ))
           fi
         elif [ "${said_lone:-0}" = 0 ]; then
           said_lone=1; say "one chain's takeover was cancelled and the live key is reachable: not completing the other"
