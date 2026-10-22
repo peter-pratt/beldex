@@ -93,6 +93,95 @@ pub fn holder<'a>(records: &'a [Record], pgw_vk: &[u8; 32]) -> Option<&'a Record
         .min_by_key(|r| r.attested_height)
 }
 
+/// The key the live committee should name as its standby: attested, newer than the owner's
+/// (`owner_epoch`; an older key was generated before it and has served already, or never
+/// will), not the owner's own, and from a committee that shares at most `limit` members with
+/// the owner's. The newest such; consensus applies the same overlap rule, and every live
+/// member reads the same records, so they all pick the same one.
+pub fn pick_standby<'a>(records: &'a [Record], owner_vk: &[u8; 32], owner_epoch: u64, limit: u64) -> Option<&'a Record> {
+    records
+        .iter()
+        .filter(|r| r.attested_height != 0 && r.pgw_vk != *owner_vk && r.epoch > owner_epoch)
+        .filter(|r| r.overlap_with_owner.is_some_and(|o| o <= limit))
+        // The first committee to attest a key holds it; a later attestation of the same key by
+        // another committee says nothing new.
+        .filter(|r| holder(records, &r.pgw_vk).is_some_and(|h| h == *r))
+        .max_by_key(|r| (r.epoch, std::cmp::Reverse(r.attested_height)))
+}
+
+/// What the daemon's `bridge_get_standby` says about the bridge gateway and the current
+/// committee, beyond the attestation records.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StandbyView {
+    pub owner_key: Option<[u8; 32]>,
+    /// The epoch of the committee holding the owner key, once attested.
+    pub owner_epoch: Option<u64>,
+    pub standby_named: bool,
+    pub committee_epoch: u64,
+    /// How many members the current committee shares with the owner's, when known.
+    pub committee_overlap: Option<u64>,
+    pub overlap_limit: u64,
+}
+
+/// Whether the current committee should generate the next standby key now: Ok, or why not.
+/// It should when no standby is named and none is waiting to be, and it is a newer committee
+/// than the owner's that shares few enough members with it to be a standby consensus accepts.
+pub fn standby_dkg_due(view: &StandbyView, records: &[Record]) -> Result<(), String> {
+    if view.standby_named {
+        return Err("a standby is named".into());
+    }
+    let (Some(owner), Some(owner_epoch)) = (view.owner_key, view.owner_epoch) else {
+        return Err("the gateway owner's key is not attested yet".into());
+    };
+    if view.committee_epoch <= owner_epoch {
+        return Err(format!(
+            "the current committee (epoch {}) is not newer than the owner's ({owner_epoch})",
+            view.committee_epoch
+        ));
+    }
+    match view.committee_overlap {
+        Some(o) if o <= view.overlap_limit => {}
+        Some(o) => {
+            return Err(format!(
+                "the current committee shares {o} members with the owner's; at most {} may",
+                view.overlap_limit
+            ))
+        }
+        None => return Err("the current committee's overlap with the owner's is unknown".into()),
+    }
+    if pick_standby(records, &owner, owner_epoch, view.overlap_limit).is_some() {
+        return Err("an attested key is waiting to be named".into());
+    }
+    if records.iter().any(|r| r.epoch >= view.committee_epoch) {
+        return Err("a key of this committee is being attested".into());
+    }
+    Ok(())
+}
+
+/// The [`StandbyView`] of a `bridge_get_standby` JSON-RPC result.
+#[cfg(feature = "evm-watcher")]
+pub fn parse_view(result: &serde_json::Value) -> Option<StandbyView> {
+    let key = |k: &str| -> Option<[u8; 32]> {
+        let s = result.get(k)?.as_str()?;
+        if s.len() != 64 || !s.is_ascii() {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+        }
+        Some(out)
+    };
+    Some(StandbyView {
+        owner_key: key("owner_key"),
+        owner_epoch: result.get("owner_epoch").and_then(serde_json::Value::as_u64),
+        standby_named: result.get("standby_key").is_some(),
+        committee_epoch: result.get("committee_epoch")?.as_u64()?,
+        committee_overlap: result.get("committee_overlap").and_then(serde_json::Value::as_u64),
+        overlap_limit: result.get("overlap_limit")?.as_u64()?,
+    })
+}
+
 /// The records of a `bridge_get_standby` JSON-RPC result; None if it has no `attestations`.
 #[cfg(feature = "evm-watcher")]
 pub fn parse_records(result: &serde_json::Value) -> Option<Vec<Record>> {
@@ -194,5 +283,83 @@ mod tests {
         assert_eq!(r[1].overlap_with_owner, None);
         assert!(parse_records(&serde_json::json!({})).is_none());
         assert!(parse_records(&serde_json::json!({ "attestations": [{ "pgw_vk": "02" }] })).is_none());
+    }
+
+    #[test]
+    fn the_standby_is_the_newest_attested_key_within_the_overlap_limit() {
+        let rec = |vk: u8, epoch, h, overlap| Record {
+            pgw_vk: [vk; 32],
+            pevm_address: [vk; 20],
+            epoch,
+            voters: vec![],
+            attested_height: h,
+            overlap_with_owner: overlap,
+        };
+        let owner = [1; 32];
+        let records = vec![
+            rec(1, 4, 10, Some(20)), // the owner itself
+            rec(2, 3, 11, Some(0)),  // older than the owner
+            rec(3, 6, 30, Some(2)),
+            rec(4, 7, 40, Some(9)),  // too much in common
+            rec(5, 8, 0, Some(0)),   // still collecting
+            rec(6, 5, 20, None),     // committee unknown
+        ];
+        assert_eq!(pick_standby(&records, &owner, 4, 6).unwrap().pgw_vk, [3; 32]);
+        assert_eq!(pick_standby(&records, &owner, 4, 9).unwrap().pgw_vk, [4; 32]);
+        assert!(pick_standby(&records, &owner, 6, 6).is_none(), "nothing newer than the owner");
+
+        // A key a second committee attested later still belongs to the first.
+        let mut records = vec![rec(3, 6, 30, Some(2))];
+        records.push(Record { epoch: 7, attested_height: 25, ..rec(3, 7, 25, Some(1)) });
+        let pick = pick_standby(&records, &owner, 4, 6).unwrap();
+        assert_eq!((pick.epoch, pick.attested_height), (7, 25), "epoch 7 reached its threshold first");
+    }
+
+    #[test]
+    fn the_next_standby_is_generated_by_a_newer_committee_that_barely_overlaps_and_only_once() {
+        let view = StandbyView {
+            owner_key: Some([1; 32]),
+            owner_epoch: Some(4),
+            standby_named: false,
+            committee_epoch: 6,
+            committee_overlap: Some(2),
+            overlap_limit: 6,
+        };
+        assert_eq!(standby_dkg_due(&view, &[]), Ok(()));
+        let no = |v: &StandbyView, r: &[Record]| standby_dkg_due(v, r).unwrap_err();
+        assert!(no(&StandbyView { standby_named: true, ..view.clone() }, &[]).contains("named"));
+        assert!(no(&StandbyView { owner_epoch: None, ..view.clone() }, &[]).contains("not attested"));
+        assert!(no(&StandbyView { committee_epoch: 4, ..view.clone() }, &[]).contains("not newer"));
+        assert!(no(&StandbyView { committee_overlap: Some(7), ..view.clone() }, &[]).contains("at most 6"));
+        assert!(no(&StandbyView { committee_overlap: None, ..view.clone() }, &[]).contains("unknown"));
+
+        let rec = |epoch, h, overlap| Record {
+            pgw_vk: [9; 32],
+            pevm_address: [9; 20],
+            epoch,
+            voters: vec![],
+            attested_height: h,
+            overlap_with_owner: overlap,
+        };
+        assert!(no(&view, &[rec(5, 50, Some(1))]).contains("waiting to be named"));
+        assert!(no(&view, &[rec(6, 0, None)]).contains("being attested"));
+        // An older committee's key that cannot be a standby does not hold this one back.
+        assert_eq!(standby_dkg_due(&view, &[rec(5, 50, Some(9))]), Ok(()));
+    }
+
+    #[cfg(feature = "evm-watcher")]
+    #[test]
+    fn the_daemons_view_parses() {
+        let v = serde_json::json!({
+            "owner_key": "01".repeat(32), "owner_epoch": 4, "committee_epoch": 6,
+            "committee_overlap": 2, "overlap_limit": 6, "threshold": 14, "attestations": []
+        });
+        let view = parse_view(&v).unwrap();
+        assert_eq!(view.owner_key, Some([1; 32]));
+        assert!(!view.standby_named);
+        assert_eq!((view.committee_epoch, view.committee_overlap, view.overlap_limit), (6, Some(2), 6));
+        let mut named = v.clone();
+        named["standby_key"] = serde_json::json!("02".repeat(32));
+        assert!(parse_view(&named).unwrap().standby_named);
     }
 }

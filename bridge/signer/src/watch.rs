@@ -70,6 +70,9 @@ pub enum TakeoverStepKind {
     Begin,
     /// After the delay, the standby committee takes over.
     Complete,
+    /// The live committee names the next standby: a newer key, attested on L1 by a
+    /// committee that shares few enough members with its own.
+    NameStandby,
 }
 
 /// One step of a standby takeover on one chain, as a committee duty. The live committee signs
@@ -83,9 +86,11 @@ pub struct TakeoverStep {
     pub step: TakeoverStepKind,
     /// Which takeover. EVM: the contract's `takeoverNonce` (a begin names the next one).
     /// Gateway: the takeover's start height, or for a begin the gateway's step count.
+    /// Naming a standby: EVM the next `rotationNonce`, gateway its descriptor count.
     pub takeover_id: u64,
     /// The key epoch the EVM takeover runs against (0 on the gateway). Bound into the
-    /// contract's digests, so a rotation in between makes this a new duty.
+    /// contract's digests, so a rotation in between makes this a new duty. Naming a standby
+    /// on the gateway: the committee epoch of the key named.
     pub key_epoch: u64,
 }
 
@@ -108,6 +113,7 @@ impl TakeoverStep {
             TakeoverStepKind::Cancel => 0,
             TakeoverStepKind::Begin => 1,
             TakeoverStepKind::Complete => 2,
+            TakeoverStepKind::NameStandby => 3,
         };
         id
     }
@@ -122,6 +128,7 @@ impl TakeoverStep {
             step: match id[24] {
                 1 => TakeoverStepKind::Begin,
                 2 => TakeoverStepKind::Complete,
+                3 => TakeoverStepKind::NameStandby,
                 _ => TakeoverStepKind::Cancel,
             },
         }

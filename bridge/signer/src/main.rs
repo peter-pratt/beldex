@@ -125,6 +125,17 @@ fn enforce_network_policy(cfg: &Config, settings: &[String]) -> Result<(), Strin
 /// the authenticated mesh (C.2). Only built with `--features live-dkg`.
 #[cfg(feature = "live-dkg")]
 fn run_dkg(cfg: &Config) -> Result<(), String> {
+    let key_generation: u32 = std::env::var("BRIDGE_SIGNER_DKG_KEYGEN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    run_dkg_into(cfg, std::env::var("BRIDGE_SIGNER_SHARE_DIR").ok().as_deref(), key_generation)
+}
+
+/// The DKG itself: shares written to `share_dir` (none kept without one), execution ids
+/// derived from the committee and `key_generation`.
+#[cfg(feature = "live-dkg")]
+fn run_dkg_into(cfg: &Config, share_dir: Option<&str>, key_generation: u32) -> Result<(), String> {
     use beldex_bridge_signer::dkg_driver::live::{run_live_capture, MeshIdentity, PeerTransportAddr};
     use beldex_bridge_signer::ffi;
     use beldex_bridge_signer::omq_client::OmqCommitteeClient;
@@ -208,10 +219,6 @@ fn run_dkg(cfg: &Config) -> Result<(), String> {
         ed25519_secret,
     };
 
-    let key_generation: u32 = std::env::var("BRIDGE_SIGNER_DKG_KEYGEN")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
     let timeout = Duration::from_secs(
         std::env::var("BRIDGE_SIGNER_DKG_TIMEOUT_SECS")
             .ok()
@@ -249,19 +256,19 @@ fn run_dkg(cfg: &Config) -> Result<(), String> {
     {
         Some(d) => std::path::PathBuf::from(d),
         None => {
-            let share = std::env::var("BRIDGE_SIGNER_SHARE_DIR").map_err(|_| {
+            let share = share_dir.ok_or_else(|| {
                 "set BRIDGE_SIGNER_SHARE_DIR or BRIDGE_SIGNER_EXECUTION_LEDGER: a DKG must \
                  record its execution ids so a retry cannot reuse them"
                     .to_string()
             })?;
-            let share = std::path::Path::new(&share);
+            let share = std::path::Path::new(share);
             share.parent().unwrap_or(std::path::Path::new(".")).join("dkg-executions")
         }
     };
     // The shares this run produces must be sealable before the ceremony starts: finding
     // out at the end would mean a finished DKG whose output cannot be saved.
-    if let Ok(share) = std::env::var("BRIDGE_SIGNER_SHARE_DIR") {
-        beldex_bridge_signer::share_file::require_key(Some(std::path::Path::new(&share)))?;
+    if let Some(share) = share_dir {
+        beldex_bridge_signer::share_file::require_key(Some(std::path::Path::new(share)))?;
     }
     {
         use beldex_bridge_signer::execution_ledger::reserve;
@@ -367,8 +374,8 @@ fn run_dkg(cfg: &Config) -> Result<(), String> {
         println!("Pgw DKG complete — group ed25519 key (gateway owner_key): {}", hex(&group_vk));
         // Persist the share material so a later `sign` invocation can load it. This
         // is a dev file store; production custody (Vault/enclave) is D.1.
-        if let Ok(dir) = std::env::var("BRIDGE_SIGNER_SHARE_DIR") {
-            persist_pgw_material(&dir, self_index, &kp_blob, &pk_blob, &group_vk)?;
+        if let Some(dir) = share_dir {
+            persist_pgw_material(dir, self_index, &kp_blob, &pk_blob, &group_vk)?;
             println!("Pgw share material written to {dir}/pgw-{self_index}.{{keypackage,pubkeypackage,groupvk}}");
         }
     }
@@ -434,8 +441,8 @@ fn run_dkg(cfg: &Config) -> Result<(), String> {
                 .map_err(|e| format!("Pevm share completion failed: {e:?}"))?;
             println!("Pevm complete share ready (keygen + aux-info)");
 
-            if let Ok(dir) = std::env::var("BRIDGE_SIGNER_SHARE_DIR") {
-                persist_pevm_material(&dir, self_index, &complete_blob, &x33)?;
+            if let Some(dir) = share_dir {
+                persist_pevm_material(dir, self_index, &complete_blob, &x33)?;
                 println!("Pevm share material written to {dir}/pevm-{self_index}.{{keyshare,groupkey}}");
             }
         }
@@ -449,7 +456,7 @@ fn run_dkg(cfg: &Config) -> Result<(), String> {
     // The committee these shares belong to. A share's index is its position in THIS list,
     // and this list — not whichever committee consensus selects later — is who can sign
     // with the key until it is replaced on chain.
-    if let Ok(dir) = std::env::var("BRIDGE_SIGNER_SHARE_DIR") {
+    if let Some(dir) = share_dir {
         std::fs::write(format!("{dir}/{KEY_COMMITTEE_FILE}"), &committee_json)
             .map_err(|e| format!("write {dir}/{KEY_COMMITTEE_FILE}: {e}"))?;
         println!("key committee (epoch {}) written to {dir}/{KEY_COMMITTEE_FILE}", committee.epoch);
@@ -1864,11 +1871,29 @@ impl TakeoverReader {
         })
     }
 
+    /// Live role: the key to name as the next standby (key_attestation::pick_standby), from
+    /// this node's daemon. None if there is none, or the bridge gateway's owner is not this
+    /// node's key or not attested yet.
+    fn standby_candidate(&self) -> Option<beldex_bridge_signer::key_attestation::Record> {
+        use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
+        use beldex_bridge_signer::key_attestation as ka;
+        let v = self.gateway_rpc.call("bridge_get_standby", serde_json::json!({})).ok()?;
+        if v.get("owner_key")?.as_str()?.to_lowercase() != hex(&self.pgw_group_vk) {
+            return None;
+        }
+        let owner_epoch = v.get("owner_epoch")?.as_u64()?;
+        let limit = v.get("overlap_limit")?.as_u64()?;
+        let records = ka::parse_records(&v)?;
+        ka::pick_standby(&records, &self.pgw_group_vk, owner_epoch, limit).cloned()
+    }
+
     /// Every takeover step this node's role should sign now, with the exact bytes, from one
     /// read of every chain. A chain that cannot be read contributes nothing, and in the
     /// standby role blocks any complete: never finish one half without seeing the others.
     fn wanted(&self) -> Vec<(beldex_bridge_signer::watch::TakeoverStep, Vec<u8>)> {
-        use beldex_bridge_signer::takeover_guard::{evm_begin_preimage, evm_cancel_preimage, evm_complete_preimage};
+        use beldex_bridge_signer::takeover_guard::{
+            evm_begin_preimage, evm_cancel_preimage, evm_complete_preimage, evm_set_standby_preimage, standby_deadline,
+        };
         use beldex_bridge_signer::watch::{TakeoverStep, TakeoverStepKind};
         let ours_vk = hex(&self.pgw_group_vk);
         let evm: Vec<_> = self
@@ -1899,6 +1924,49 @@ impl TakeoverReader {
                             TakeoverStep { chain_id: TakeoverStep::GATEWAY, step: TakeoverStepKind::Cancel, takeover_id: g.started, key_epoch: 0 },
                             m.to_vec(),
                         ));
+                    }
+                }
+            }
+            // Name the next standby wherever none is named and no takeover runs: the same key
+            // on every chain, the one the attestations on L1 give. Without a standby, a lost
+            // live key would stop the bridge until governance stepped in.
+            let evm_unnamed = evm.iter().any(|(_, _, _, st)| {
+                st.as_ref().is_ok_and(|st| st.signer == self.pevm_address && st.standby == [0u8; 20] && !st.running())
+            });
+            let gw_unnamed = gw.as_ref().is_ok_and(|g| g.owner == ours_vk && g.standby.is_empty() && g.started == 0);
+            if evm_unnamed || gw_unnamed {
+                if let Some(cand) = self.standby_candidate() {
+                    for (chain_id, client, contract, st) in &evm {
+                        let Ok(st) = st else { continue };
+                        if st.signer != self.pevm_address || st.standby != [0u8; 20] || st.running() {
+                            continue;
+                        }
+                        if let (Ok(tag), Ok(nonce)) =
+                            (Self::word(client, contract, "STANDBY_TAG()"), Self::word(client, contract, "rotationNonce()"))
+                        {
+                            let next = Self::low_u64(&nonce) + 1;
+                            out.push((
+                                TakeoverStep { chain_id: *chain_id, step: TakeoverStepKind::NameStandby, takeover_id: next, key_epoch: st.key_epoch },
+                                evm_set_standby_preimage(tag, *chain_id, *contract, st.key_epoch, cand.pevm_address, next, standby_deadline(st.now)),
+                            ));
+                        }
+                    }
+                    if gw_unnamed {
+                        use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
+                        let info = self.gateway_rpc.call(
+                            "get_gateway_info",
+                            serde_json::json!({ "gateway_address": self.gateway, "standby_owner_key": hex(&cand.pgw_vk) }),
+                        );
+                        if let Ok(info) = info {
+                            let nonce = info.get("standby_name_nonce").and_then(|v| v.as_u64());
+                            let msg = info.get("standby_name_message").and_then(|v| v.as_str()).and_then(config::parse_hex32);
+                            if let (Some(n), Some(m)) = (nonce, msg) {
+                                out.push((
+                                    TakeoverStep { chain_id: TakeoverStep::GATEWAY, step: TakeoverStepKind::NameStandby, takeover_id: n, key_epoch: cand.epoch },
+                                    m.to_vec(),
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -2096,6 +2164,102 @@ impl ProbeDeposit {
     }
 }
 
+/// Standby role, waiting for shares: generate the next standby key with the current
+/// committee when that is due (key_attestation::standby_dkg_due). Each member decides from its
+/// own daemon, and all start at the same slot of the clock, whose number is the key
+/// generation: a failed attempt is retried at the next slot under fresh execution ids, which
+/// the execution ledger requires. The shares are written beside the share directory and moved
+/// in only once complete, so a failed ceremony never leaves half a set to serve.
+#[cfg(feature = "serve-live")]
+struct AutoStandbyDkg {
+    slot_secs: u64,
+    last_slot: u64,
+    last_reason: String,
+}
+
+#[cfg(feature = "serve-live")]
+impl AutoStandbyDkg {
+    /// How long into a slot a member may still start: members poll every 15 seconds.
+    const START_WINDOW_SECS: u64 = 30;
+
+    fn maybe_run(&mut self, cfg: &Config, share_dir: &std::path::Path, beldexd_rpc: &str) {
+        use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
+        use beldex_bridge_signer::key_attestation as ka;
+        let now = beldex_bridge_signer::release_outbox::now_secs();
+        let slot = now / self.slot_secs;
+        if slot == self.last_slot || now % self.slot_secs > Self::START_WINDOW_SECS {
+            return;
+        }
+        let daemon = beldex_bridge_signer::evm_watcher::HttpJsonRpc::new(format!(
+            "{}/json_rpc",
+            beldexd_rpc.trim_end_matches('/')
+        ));
+        let due = daemon
+            .call("bridge_get_standby", serde_json::json!({}))
+            .map_err(|e| format!("bridge_get_standby: {e:?}"))
+            .and_then(|v| match (ka::parse_view(&v), ka::parse_records(&v)) {
+                (Some(view), Some(records)) => ka::standby_dkg_due(&view, &records).map(|()| view.committee_epoch),
+                _ => Err("bridge_get_standby: unexpected reply".to_string()),
+            });
+        let epoch = match due {
+            Ok(epoch) => epoch,
+            Err(why) => {
+                if why != self.last_reason {
+                    println!("  standby key generation not due: {why}");
+                    self.last_reason = why;
+                }
+                return;
+            }
+        };
+        self.last_slot = slot;
+        self.last_reason.clear();
+        match beldex_bridge_signer::omq_client::OmqCommitteeClient::new(cfg.oxenmq_endpoint.clone()).fetch_committee(None) {
+            Ok(c) if c.daemon_self_index.is_some() || c.self_index(&cfg.self_mn_pubkey).is_some() => {}
+            Ok(c) => {
+                println!("  standby key generation due, but this node is not on committee epoch {}", c.epoch);
+                return;
+            }
+            Err(e) => {
+                eprintln!("  standby key generation: no committee ({e}); next slot");
+                return;
+            }
+        }
+        let Ok(keygen) = u32::try_from(slot) else { return };
+        let staging = std::path::PathBuf::from(format!("{}.dkg-{keygen}", share_dir.display()));
+        let _ = std::fs::remove_dir_all(&staging);
+        println!("NO STANDBY: generating the next standby key with committee epoch {epoch} (key generation {keygen})");
+        let result = match staging.to_str() {
+            Some(dir) => run_dkg_into(cfg, Some(dir), keygen),
+            None => Err("the share directory's path is not UTF-8".into()),
+        };
+        match result {
+            Ok(()) if beldex_bridge_signer::share_watch::fingerprint(&staging).is_some() => {
+                // An empty or half-written directory in the way is set aside, never deleted.
+                let in_place = std::fs::remove_dir(share_dir).is_ok() || !share_dir.exists() || {
+                    let aside = format!("{}.incomplete-{now}", share_dir.display());
+                    std::fs::rename(share_dir, &aside).is_ok()
+                };
+                match in_place.then(|| std::fs::rename(&staging, share_dir)) {
+                    Some(Ok(())) => println!("standby key generated: shares in {}", share_dir.display()),
+                    _ => eprintln!(
+                        "!! standby key generated in {} but could not be moved to {}: move it by hand",
+                        staging.display(),
+                        share_dir.display()
+                    ),
+                }
+            }
+            Ok(()) => {
+                eprintln!("  standby key generation left no complete share set; next slot");
+                let _ = std::fs::remove_dir_all(&staging);
+            }
+            Err(e) => {
+                eprintln!("  standby key generation failed ({e}); next slot");
+                let _ = std::fs::remove_dir_all(&staging);
+            }
+        }
+    }
+}
+
 // The live backend: coordinated signing over the mesh. Only built with `serve-live`, the
 // feature that brings the mesh, the live signers and the release builder it uses; without
 // it `serve` runs the dry-run backend and this is never called.
@@ -2162,7 +2326,23 @@ where
     );
     if beldex_bridge_signer::share_watch::fingerprint(&share_dir).is_none() {
         println!("serve: no share set in {} yet: waiting for one", share_dir.display());
+        // A standby signer with no key generates the next standby itself, with the rest of
+        // its committee, when that is due (BRIDGE_SIGNER_AUTO_DKG=0 turns this off).
+        let auto_dkg = std::env::var("BRIDGE_SIGNER_ROLE").is_ok_and(|r| r.trim() == "standby")
+            && !std::env::var("BRIDGE_SIGNER_AUTO_DKG").is_ok_and(|v| v.trim() == "0");
+        let slot_secs: u64 = std::env::var("BRIDGE_SIGNER_AUTO_DKG_SLOT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|s| *s >= 60)
+            .unwrap_or(600);
+        if auto_dkg {
+            println!("  standby key generation: automatic, at {slot_secs}s slots, when due");
+        }
+        let mut auto = AutoStandbyDkg { slot_secs, last_slot: 0, last_reason: String::new() };
         while beldex_bridge_signer::share_watch::fingerprint(&share_dir).is_none() {
+            if auto_dkg {
+                auto.maybe_run(cfg, &share_dir, beldexd_rpc);
+            }
             std::thread::sleep(std::time::Duration::from_secs(15));
         }
         println!("serve: a share set appeared in {}", share_dir.display());
@@ -2557,6 +2737,20 @@ where
                     TakeoverStepKind::Cancel => "cancel",
                     TakeoverStepKind::Begin => "begin",
                     TakeoverStepKind::Complete => "complete",
+                    TakeoverStepKind::NameStandby => "name_standby",
+                };
+                // The key named: the candidate of the epoch this duty was for. If the daemon now
+                // gives another, the signature is for a key no longer wanted.
+                let named = if c.step == TakeoverStepKind::NameStandby {
+                    match done_view.standby_candidate() {
+                        Some(cand) if cand.epoch == c.key_epoch => Some(cand.pgw_vk),
+                        _ => {
+                            eprintln!("  standby naming on the gateway: the candidate changed; not submitted");
+                            return ExecOutcome::Retry;
+                        }
+                    }
+                } else {
+                    None
                 };
                 println!(
                     "TAKEOVER-{} gateway={cancel_gateway} started_height={} signature={}",
@@ -2581,6 +2775,10 @@ where
                 });
                 if c.step == TakeoverStepKind::Complete {
                     params["new_owner_key"] = serde_json::json!(hex(&done_pgw_vk));
+                    params["new_owner_key_type"] = serde_json::json!("eddsa");
+                }
+                if let Some(vk) = named {
+                    params["new_owner_key"] = serde_json::json!(hex(&vk));
                     params["new_owner_key_type"] = serde_json::json!("eddsa");
                 }
                 match wallet.call("gateway_takeover_step", params) {
@@ -2613,13 +2811,30 @@ where
                     TakeoverStepKind::Cancel => "takeover_cancel",
                     TakeoverStepKind::Begin => "takeover_begin",
                     TakeoverStepKind::Complete => "takeover_complete",
+                    TakeoverStepKind::NameStandby => "set_standby",
                 };
-                let payload = format!(
-                    r#"{{"kind":"{kind}","contract":"{}","chain_id":{},"sig":"{}"}}"#,
-                    hex(&contract),
-                    c.chain_id,
-                    hex(sig)
-                );
+                let payload = if c.step == TakeoverStepKind::NameStandby {
+                    // The standby, nonce and deadline are in what was signed.
+                    let Some((standby, nonce, deadline)) =
+                        beldex_bridge_signer::takeover_guard::evm_set_standby_fields(proposal)
+                    else {
+                        return ExecOutcome::Abandon;
+                    };
+                    format!(
+                        r#"{{"kind":"set_standby","contract":"{}","chain_id":{},"standby":"{}","nonce":{nonce},"deadline":"{deadline}","sig":"{}"}}"#,
+                        hex(&contract),
+                        c.chain_id,
+                        hex(&standby),
+                        hex(sig)
+                    )
+                } else {
+                    format!(
+                        r#"{{"kind":"{kind}","contract":"{}","chain_id":{},"sig":"{}"}}"#,
+                        hex(&contract),
+                        c.chain_id,
+                        hex(sig)
+                    )
+                };
                 println!("TAKEOVER-STEP-PAYLOAD {payload}");
                 match &cancel_relay_cmd {
                     Some(cmd) => match pipe_to_relay(cmd, &payload) {
@@ -3329,6 +3544,9 @@ where
                             ),
                             TakeoverStepKind::Complete => eprintln!(
                                 "!! standby takeover ready on every chain: completing it on {what}"
+                            ),
+                            TakeoverStepKind::NameStandby => println!(
+                                "no standby named on {what}: naming the newest attested key within the overlap limit"
                             ),
                         }
                         ingest(orch, d);

@@ -33,6 +33,13 @@
 # signer whose key was replaced everywhere for RETIRE_AFTER_SECS (default 60 here) archives
 # its set and waits. No promote-shares.sh, no restart by hand.
 #
+# Every signer attests on L1 that its committee generated the key it serves, and a live
+# signer names the newest attested key whose committee shares at most 2 members with its own
+# as the standby, on both chains. A standby signer with no share set generates that key with
+# the rest of the current committee when no standby is named and the committee qualifies, at
+# AUTO_DKG_SLOT_SECS slots (default 120 here, 600 by default). AUTO_DKG=0 turns that off.
+# Attestations and namings are paid for by ACK_WALLET_RPC.
+#
 # Stop with:  pkill -f 'beldex-bridge-signer serve'
 # Logs:       testdata/serve-<node>.log   (watch the `tick N: opened/acked/...` lines)
 
@@ -274,6 +281,7 @@ for d in beldex-127.0.0.1-*/; do
   BRIDGE_SIGNER_SUPERVISED="${SUPERVISE:-0}" BRIDGE_SIGNER_RETIRE_AFTER_SECS="${RETIRE_AFTER_SECS:-60}" \
   BRIDGE_SIGNER_PROMOTE_TO="$( [ "$ROLE" = standby ] && [ "${SUPERVISE:-0}" = 1 ] && echo "$SOCKBASE/${d}devnet/shares" )" \
   BRIDGE_SIGNER_OUTAGE_WINDOW_SECS="${OUTAGE_WINDOW_SECS:-60}" \
+  BRIDGE_SIGNER_AUTO_DKG="${AUTO_DKG:-1}" BRIDGE_SIGNER_AUTO_DKG_SLOT_SECS="${AUTO_DKG_SLOT_SECS:-120}" \
   BRIDGE_SIGNER_PROBE_WALLET_RPC="${PROBE_WALLET_RPC:-}" BRIDGE_SIGNER_PROBE_EVERY_SECS="${PROBE_EVERY_SECS:-}" \
   BRIDGE_SIGNER_PROBE_CHAIN_ID="${PROBE_CHAIN_ID:-}" BRIDGE_SIGNER_PROBE_EVM_ADDRESS="${PROBE_EVM_ADDRESS:-}" \
   BRIDGE_SIGNER_ACK_WALLET_RPC="${ACK_WALLET_RPC:-}" \

@@ -24,6 +24,10 @@
 # Generate the standby key first, into its own tree, at an epoch whose committee differs
 # from the live key's as much as possible:
 #   SHARE_SUBDIR=shares-standby MESH_PORT_BASE=7000 ./dkg-next.sh <unused-keygen>
+# (The signers now do all of this themselves: serve-live.sh.) Consensus accepts the gateway's
+# standby only once both keys are attested by their committees (the running signers attest
+# theirs) and those committees share at most 2 members; `bridge_get_standby` on the daemon
+# shows where that stands, and `register` is refused until then.
 #
 # Env:
 #   STANDBY_SUBDIR   standby share tree (default shares-standby)

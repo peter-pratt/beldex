@@ -138,6 +138,47 @@ pub fn evm_complete_preimage(tag: [u8; 32], chain_id: u64, contract: [u8; 20], n
     out
 }
 
+/// The contract's standby-naming preimage: `abi.encode(STANDBY_TAG, block.chainid,
+/// address(this), keyEpoch, newStandby, nonce, deadline)`, nonce `rotationNonce + 1`. The live
+/// key signs it.
+pub fn evm_set_standby_preimage(
+    tag: [u8; 32],
+    chain_id: u64,
+    contract: [u8; 20],
+    key_epoch: u64,
+    standby: [u8; 20],
+    nonce: u64,
+    deadline: u64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(224);
+    out.extend_from_slice(&tag);
+    out.extend_from_slice(&word_u64(chain_id));
+    out.extend_from_slice(&word_address(contract));
+    out.extend_from_slice(&word_u64(key_epoch));
+    out.extend_from_slice(&word_address(standby));
+    out.extend_from_slice(&word_u64(nonce));
+    out.extend_from_slice(&word_u64(deadline));
+    out
+}
+
+/// The standby, nonce and deadline back from an [`evm_set_standby_preimage`]: what the relayer
+/// needs beside the signature.
+pub fn evm_set_standby_fields(preimage: &[u8]) -> Option<([u8; 20], u64, u64)> {
+    if preimage.len() != 224 {
+        return None;
+    }
+    let u64_at = |w: usize| u64::from_be_bytes(preimage[w * 32 + 24..w * 32 + 32].try_into().expect("8 bytes"));
+    let standby: [u8; 20] = preimage[4 * 32 + 12..5 * 32].try_into().ok()?;
+    Some((standby, u64_at(5), u64_at(6)))
+}
+
+/// The deadline every live member puts in a standby naming: the end of the next whole hour of
+/// the chain's clock. Members reading a few seconds apart agree on it (except across an hour
+/// boundary, where the next round agrees), and it leaves at least an hour to relay.
+pub fn standby_deadline(chain_now: u64) -> u64 {
+    (chain_now / 3600 + 2) * 3600
+}
+
 fn word_u64(x: u64) -> [u8; 32] {
     let mut w = [0u8; 32];
     w[24..].copy_from_slice(&x.to_be_bytes());
@@ -317,13 +358,34 @@ mod tests {
 
         // Begin, complete and cancel of one takeover are three duties, and each survives the
         // round trip through its duty id (how a Done duty is restored after a restart).
-        use crate::watch::TakeoverStepKind::{Begin, Cancel, Complete};
-        let steps = [Cancel, Begin, Complete].map(|step| TakeoverStep { step, ..a });
-        assert_ne!(Duty::Takeover(steps[0]).key(), Duty::Takeover(steps[1]).key());
-        assert_ne!(Duty::Takeover(steps[1]).key(), Duty::Takeover(steps[2]).key());
+        use crate::watch::TakeoverStepKind::{Begin, Cancel, Complete, NameStandby};
+        let steps = [Cancel, Begin, Complete, NameStandby].map(|step| TakeoverStep { step, ..a });
+        for i in 0..steps.len() {
+            for j in i + 1..steps.len() {
+                assert_ne!(Duty::Takeover(steps[i]).key(), Duty::Takeover(steps[j]).key());
+            }
+        }
         for st in steps {
             assert_eq!(TakeoverStep::from_id(&st.id()), st);
         }
         assert_eq!(Duty::Takeover(a).leg(), crate::transport::Leg::Pevm);
+    }
+
+    #[test]
+    fn a_standby_naming_preimage_is_the_contracts_encoding_and_gives_its_fields_back() {
+        let p = evm_set_standby_preimage([0x11; 32], 31337, [0x22; 20], 3, [0x33; 20], 8, 7200);
+        assert_eq!(p.len(), 7 * 32);
+        assert_eq!(&p[..32], &[0x11; 32]);
+        assert_eq!(&p[4 * 32..4 * 32 + 12], &[0u8; 12], "an address is left-padded");
+        assert_eq!(evm_set_standby_fields(&p), Some(([0x33; 20], 8, 7200)));
+        assert_eq!(evm_set_standby_fields(&p[..200]), None);
+    }
+
+    #[test]
+    fn members_reading_within_the_hour_agree_on_the_deadline() {
+        assert_eq!(standby_deadline(3600 * 10), 3600 * 12);
+        assert_eq!(standby_deadline(3600 * 10 + 3599), 3600 * 12);
+        assert_eq!(standby_deadline(3600 * 11), 3600 * 13);
+        assert!(standby_deadline(3600 * 10 + 3599) - (3600 * 10 + 3599) > 3600);
     }
 }

@@ -25,12 +25,16 @@ pub const BEGIN_TAKEOVER_SELECTOR: [u8; 4] = [0xca, 0xbc, 0xec, 0xea];
 /// `completeStandbyTakeover(bytes)` selector: after the delay, the standby becomes the signer.
 pub const COMPLETE_TAKEOVER_SELECTOR: [u8; 4] = [0x42, 0x9d, 0x05, 0xe2];
 
+/// `setStandby(address,uint64,uint256,bytes)` selector: the live committee names its standby.
+pub const SET_STANDBY_SELECTOR: [u8; 4] = [0xbe, 0x88, 0x7a, 0x32];
+
 /// The canonical function signatures (used only by the drift-guard tests).
 pub const MINT_SIG: &[u8] = b"mint(address,uint256,bytes32,uint32,bytes)";
 pub const ROTATE_SIG: &[u8] = b"rotateSigner(address,uint64,uint64,uint256,bytes)";
 pub const CANCEL_TAKEOVER_SIG: &[u8] = b"cancelStandbyTakeover(bytes)";
 pub const BEGIN_TAKEOVER_SIG: &[u8] = b"beginStandbyTakeover(bytes)";
 pub const COMPLETE_TAKEOVER_SIG: &[u8] = b"completeStandbyTakeover(bytes)";
+pub const SET_STANDBY_SIG: &[u8] = b"setStandby(address,uint64,uint256,bytes)";
 
 /// `keccak256(fn_sig)[..4]` — the 4-byte selector for a function signature.
 pub fn selector_of(fn_sig: &[u8]) -> [u8; 4] {
@@ -131,6 +135,20 @@ pub fn build_rotate_calldata(
     out
 }
 
+/// Build the calldata for `setStandby(address newStandby, uint64 nonce, uint256 deadline,
+/// bytes currentSig)`: head `word(newStandby) ‖ word(nonce) ‖ word(deadline) ‖ offset(=0x80)`,
+/// tail the encoded `sig`.
+pub fn build_set_standby_calldata(standby: [u8; 20], nonce: u64, deadline: u128, sig: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 32 * 5 + sig.len() + 32);
+    out.extend_from_slice(&SET_STANDBY_SELECTOR);
+    out.extend_from_slice(&word_address(standby));
+    out.extend_from_slice(&word_u64(nonce));
+    out.extend_from_slice(&word_u256(deadline));
+    out.extend_from_slice(&word_u256(0x80)); // offset to `sig`: 4 head words = 128 bytes
+    push_dynamic_bytes(&mut out, sig);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +160,7 @@ mod tests {
         assert_eq!(CANCEL_TAKEOVER_SELECTOR, selector_of(CANCEL_TAKEOVER_SIG));
         assert_eq!(BEGIN_TAKEOVER_SELECTOR, selector_of(BEGIN_TAKEOVER_SIG));
         assert_eq!(COMPLETE_TAKEOVER_SELECTOR, selector_of(COMPLETE_TAKEOVER_SIG));
+        assert_eq!(SET_STANDBY_SELECTOR, selector_of(SET_STANDBY_SIG));
         // Pin the exact bytes so a drift is caught even if the signature string changed.
         assert_eq!(MINT_SELECTOR, [0x7f, 0x00, 0x00, 0x0a]);
         assert_eq!(ROTATE_SELECTOR, [0x95, 0x0c, 0x57, 0xf3]);
@@ -214,5 +233,14 @@ mod tests {
         let mut b = Vec::new();
         push_dynamic_bytes(&mut b, &vec![1u8; 64]);
         assert_eq!(b.len(), 32 + 64);
+    }
+
+    /// Byte-for-byte what `cast calldata "setStandby(address,uint64,uint256,bytes)"
+    /// 0x3333… 5 1700003600 0xabab…` (65 bytes) produces.
+    #[test]
+    fn set_standby_calldata_matches_cast() {
+        let cd = build_set_standby_calldata([0x33; 20], 5, 1_700_003_600, &[0xAB; 65]);
+        let hex: String = cd.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "be887a3200000000000000000000000033333333333333333333333333333333333333330000000000000000000000000000000000000000000000000000000000000005000000000000000000000000000000000000000000000000000000006553ff1000000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000041ababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab00000000000000000000000000000000000000000000000000000000000000");
     }
 }
