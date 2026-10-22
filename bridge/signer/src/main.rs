@@ -1763,6 +1763,12 @@ struct GatewayTakeoverState {
     cancel_message: Option<[u8; 32]>,
     begin_message: Option<[u8; 32]>,
     complete_message: Option<[u8; 32]>,
+    /// The block the standby proves it can sign over now, and the exact message.
+    alive_height: u64,
+    alive_message: Option<[u8; 32]>,
+    /// When the standby was last named or proved itself, and whether that is too long ago.
+    last_seen: Option<u64>,
+    stale: bool,
 }
 
 #[cfg(feature = "serve-live")]
@@ -1868,23 +1874,32 @@ impl TakeoverReader {
             cancel_message: m("takeover_cancel_message"),
             begin_message: m("takeover_begin_message"),
             complete_message: m("takeover_complete_message"),
+            alive_height: n("standby_alive_height"),
+            alive_message: m("standby_alive_message"),
+            last_seen: info.get("standby_last_seen_height").and_then(|v| v.as_u64()),
+            stale: info.get("standby_stale").and_then(|v| v.as_bool()).unwrap_or(false),
         })
     }
 
-    /// Live role: the key to name as the next standby (key_attestation::pick_standby), from
-    /// this node's daemon. None if there is none, or the bridge gateway's owner is not this
-    /// node's key or not attested yet.
-    fn standby_candidate(&self) -> Option<beldex_bridge_signer::key_attestation::Record> {
+    /// The daemon's view of the bridge gateway's standby, and the key attestations.
+    fn standby_view(
+        &self,
+    ) -> Option<(beldex_bridge_signer::key_attestation::StandbyView, Vec<beldex_bridge_signer::key_attestation::Record>)> {
         use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
         use beldex_bridge_signer::key_attestation as ka;
         let v = self.gateway_rpc.call("bridge_get_standby", serde_json::json!({})).ok()?;
-        if v.get("owner_key")?.as_str()?.to_lowercase() != hex(&self.pgw_group_vk) {
+        Some((ka::parse_view(&v)?, ka::parse_records(&v)?))
+    }
+
+    /// Live role: the standby every chain should name (key_attestation::standby_target): the
+    /// named one while it works, else the one to name in its place. None if there is none, or
+    /// the bridge gateway's owner is not this node's key or not attested yet.
+    fn standby_target(&self) -> Option<beldex_bridge_signer::key_attestation::Record> {
+        let (view, records) = self.standby_view()?;
+        if view.owner_key != Some(self.pgw_group_vk) {
             return None;
         }
-        let owner_epoch = v.get("owner_epoch")?.as_u64()?;
-        let limit = v.get("overlap_limit")?.as_u64()?;
-        let records = ka::parse_records(&v)?;
-        ka::pick_standby(&records, &self.pgw_group_vk, owner_epoch, limit).cloned()
+        beldex_bridge_signer::key_attestation::standby_target(&view, &records).cloned()
     }
 
     /// Every takeover step this node's role should sign now, with the exact bytes, from one
@@ -1927,18 +1942,18 @@ impl TakeoverReader {
                     }
                 }
             }
-            // Name the next standby wherever none is named and no takeover runs: the same key
-            // on every chain, the one the attestations on L1 give. Without a standby, a lost
-            // live key would stop the bridge until governance stepped in.
-            let evm_unnamed = evm.iter().any(|(_, _, _, st)| {
-                st.as_ref().is_ok_and(|st| st.signer == self.pevm_address && st.standby == [0u8; 20] && !st.running())
-            });
-            let gw_unnamed = gw.as_ref().is_ok_and(|g| g.owner == ours_vk && g.standby.is_empty() && g.started == 0);
-            if evm_unnamed || gw_unnamed {
-                if let Some(cand) = self.standby_candidate() {
+            // Name the standby wherever it is missing and no takeover runs: the same key on
+            // every chain, the one the attestations on L1 give. A standby that stopped proving
+            // it can sign (stale) counts as missing. Without a working standby, a lost live key
+            // would stop the bridge until governance stepped in.
+            let gw_unnamed =
+                gw.as_ref().is_ok_and(|g| g.owner == ours_vk && g.started == 0 && (g.standby.is_empty() || g.stale));
+            let evm_ours = evm.iter().any(|(_, _, _, st)| st.as_ref().is_ok_and(|st| st.signer == self.pevm_address && !st.running()));
+            if evm_ours || gw_unnamed {
+                if let Some(cand) = self.standby_target() {
                     for (chain_id, client, contract, st) in &evm {
                         let Ok(st) = st else { continue };
-                        if st.signer != self.pevm_address || st.standby != [0u8; 20] || st.running() {
+                        if st.signer != self.pevm_address || st.standby == cand.pevm_address || st.running() {
                             continue;
                         }
                         if let (Ok(tag), Ok(nonce)) =
@@ -1951,7 +1966,7 @@ impl TakeoverReader {
                             ));
                         }
                     }
-                    if gw_unnamed {
+                    if gw_unnamed && gw.as_ref().is_ok_and(|g| g.standby != hex(&cand.pgw_vk)) {
                         use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
                         let info = self.gateway_rpc.call(
                             "get_gateway_info",
@@ -2014,6 +2029,15 @@ impl TakeoverReader {
                     if let Some(m) = g.complete_message {
                         out.push((
                             TakeoverStep { chain_id: TakeoverStep::GATEWAY, step: TakeoverStepKind::Complete, takeover_id: g.started, key_epoch: 0 },
+                            m.to_vec(),
+                        ));
+                    }
+                }
+                // Prove this standby can still sign, once per slot: one that stops is replaced.
+                if g.started == 0 && g.alive_height != 0 && g.last_seen.is_none_or(|seen| seen < g.alive_height) {
+                    if let Some(m) = g.alive_message {
+                        out.push((
+                            TakeoverStep { chain_id: TakeoverStep::GATEWAY, step: TakeoverStepKind::StandbyAlive, takeover_id: g.alive_height, key_epoch: 0 },
                             m.to_vec(),
                         ));
                     }
@@ -2738,11 +2762,12 @@ where
                     TakeoverStepKind::Begin => "begin",
                     TakeoverStepKind::Complete => "complete",
                     TakeoverStepKind::NameStandby => "name_standby",
+                    TakeoverStepKind::StandbyAlive => "standby_alive",
                 };
                 // The key named: the candidate of the epoch this duty was for. If the daemon now
                 // gives another, the signature is for a key no longer wanted.
                 let named = if c.step == TakeoverStepKind::NameStandby {
-                    match done_view.standby_candidate() {
+                    match done_view.standby_target() {
                         Some(cand) if cand.epoch == c.key_epoch => Some(cand.pgw_vk),
                         _ => {
                             eprintln!("  standby naming on the gateway: the candidate changed; not submitted");
@@ -2773,7 +2798,7 @@ where
                     "signature": hex(sig),
                     "signature_type": "eddsa",
                 });
-                if c.step == TakeoverStepKind::Complete {
+                if c.step == TakeoverStepKind::Complete || c.step == TakeoverStepKind::StandbyAlive {
                     params["new_owner_key"] = serde_json::json!(hex(&done_pgw_vk));
                     params["new_owner_key_type"] = serde_json::json!("eddsa");
                 }
@@ -2812,6 +2837,7 @@ where
                     TakeoverStepKind::Begin => "takeover_begin",
                     TakeoverStepKind::Complete => "takeover_complete",
                     TakeoverStepKind::NameStandby => "set_standby",
+                    TakeoverStepKind::StandbyAlive => return ExecOutcome::Abandon, // gateway only
                 };
                 let payload = if c.step == TakeoverStepKind::NameStandby {
                     // The standby, nonce and deadline are in what was signed.
@@ -3244,6 +3270,7 @@ where
         std::env::var("BRIDGE_SIGNER_RETIRE_AFTER_SECS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(600),
     );
     let mut retired_since: Option<std::time::Instant> = None;
+    let mut standby_retire_since: Option<std::time::Instant> = None;
     if standby_role {
         println!(
             "serve: STANDBY role: signs only takeover begin/complete for this share set's key, after \
@@ -3517,6 +3544,37 @@ where
                     None => {}
                 }
             }
+            // A standby set whose key went stale (its holders cannot sign together), or that a
+            // newer standby replaced, serves nothing: archive it and wait in the pool, where the
+            // node can help generate the next standby.
+            if standby_role && supervised {
+                let why = takeover.standby_view().and_then(|(view, records)| {
+                    beldex_bridge_signer::key_attestation::standby_set_retired(&view, &records, &ls.pgw_group_vk, ls.committee.epoch)
+                });
+                match (why, standby_retire_since) {
+                    (None, _) => standby_retire_since = None,
+                    (Some(why), None) => {
+                        eprintln!("!! this standby set should step aside: {why}");
+                        standby_retire_since = Some(std::time::Instant::now());
+                    }
+                    (Some(why), Some(t)) if t.elapsed() >= retire_after && orch.outstanding().is_empty() => {
+                        let mut to = share_dir.as_os_str().to_owned();
+                        to.push(format!(".retired-{}", beldex_bridge_signer::release_outbox::now_secs()));
+                        match std::fs::rename(&share_dir, &to) {
+                            Ok(()) => {
+                                println!(
+                                    "serve: {why}. Archived this standby set to {} and exiting; this signer \
+                                     waits for the node's next standby set",
+                                    std::path::Path::new(&to).display()
+                                );
+                                std::process::exit(beldex_bridge_signer::share_watch::RESTART_EXIT_CODE);
+                            }
+                            Err(e) => eprintln!("!! could not archive the standby set: {e}"),
+                        }
+                    }
+                    _ => {}
+                }
+            }
             if standby_role {
                 update_outage(&takeover, &mut evidence, &mut evidence_reconciler, outage_window);
                 if let Some(p) = &probe {
@@ -3546,7 +3604,11 @@ where
                                 "!! standby takeover ready on every chain: completing it on {what}"
                             ),
                             TakeoverStepKind::NameStandby => println!(
-                                "no standby named on {what}: naming the newest attested key within the overlap limit"
+                                "no working standby named on {what}: naming the newest attested key within the overlap limit"
+                            ),
+                            TakeoverStepKind::StandbyAlive => println!(
+                                "proving this standby key can still sign (over block {})",
+                                c.takeover_id
                             ),
                         }
                         ingest(orch, d);

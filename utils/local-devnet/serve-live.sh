@@ -38,7 +38,10 @@
 # as the standby, on both chains. A standby signer with no share set generates that key with
 # the rest of the current committee when no standby is named and the committee qualifies, at
 # AUTO_DKG_SLOT_SECS slots (default 120 here, 600 by default). AUTO_DKG=0 turns that off.
-# Attestations and namings are paid for by ACK_WALLET_RPC.
+# Attestations and namings are paid for by ACK_WALLET_RPC. Standby signers prove on L1, every
+# 10 blocks here (120 on mainnet), that their key can still sign; a standby that has not for
+# 120 blocks here (a day on mainnet) is stale. The live signers then name another, and with
+# SUPERVISE=1 the stale set's signers archive it and rejoin the pool to help generate it.
 #
 # Stop with:  pkill -f 'beldex-bridge-signer serve'
 # Logs:       testdata/serve-<node>.log   (watch the `tick N: opened/acked/...` lines)

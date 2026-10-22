@@ -358,8 +358,8 @@ mod tests {
 
         // Begin, complete and cancel of one takeover are three duties, and each survives the
         // round trip through its duty id (how a Done duty is restored after a restart).
-        use crate::watch::TakeoverStepKind::{Begin, Cancel, Complete, NameStandby};
-        let steps = [Cancel, Begin, Complete, NameStandby].map(|step| TakeoverStep { step, ..a });
+        use crate::watch::TakeoverStepKind::{Begin, Cancel, Complete, NameStandby, StandbyAlive};
+        let steps = [Cancel, Begin, Complete, NameStandby, StandbyAlive].map(|step| TakeoverStep { step, ..a });
         for i in 0..steps.len() {
             for j in i + 1..steps.len() {
                 assert_ne!(Duty::Takeover(steps[i]).key(), Duty::Takeover(steps[j]).key());

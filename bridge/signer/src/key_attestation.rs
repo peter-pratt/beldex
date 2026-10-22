@@ -95,13 +95,21 @@ pub fn holder<'a>(records: &'a [Record], pgw_vk: &[u8; 32]) -> Option<&'a Record
 
 /// The key the live committee should name as its standby: attested, newer than the owner's
 /// (`owner_epoch`; an older key was generated before it and has served already, or never
-/// will), not the owner's own, and from a committee that shares at most `limit` members with
-/// the owner's. The newest such; consensus applies the same overlap rule, and every live
-/// member reads the same records, so they all pick the same one.
-pub fn pick_standby<'a>(records: &'a [Record], owner_vk: &[u8; 32], owner_epoch: u64, limit: u64) -> Option<&'a Record> {
+/// will), not the owner's own nor `exclude` (a standby gone stale), and from a committee that
+/// shares at most `limit` members with the owner's. The newest such; consensus applies the
+/// same overlap rule, and every live member reads the same records, so they all pick the same
+/// one.
+pub fn pick_standby<'a>(
+    records: &'a [Record],
+    owner_vk: &[u8; 32],
+    owner_epoch: u64,
+    limit: u64,
+    exclude: Option<&[u8; 32]>,
+) -> Option<&'a Record> {
     records
         .iter()
         .filter(|r| r.attested_height != 0 && r.pgw_vk != *owner_vk && r.epoch > owner_epoch)
+        .filter(|r| exclude != Some(&r.pgw_vk))
         .filter(|r| r.overlap_with_owner.is_some_and(|o| o <= limit))
         // The first committee to attest a key holds it; a later attestation of the same key by
         // another committee says nothing new.
@@ -116,7 +124,10 @@ pub struct StandbyView {
     pub owner_key: Option<[u8; 32]>,
     /// The epoch of the committee holding the owner key, once attested.
     pub owner_epoch: Option<u64>,
-    pub standby_named: bool,
+    /// The standby the gateway names, if any.
+    pub standby_key: Option<[u8; 32]>,
+    /// It has neither been named nor proved it can sign for a day: treated as gone.
+    pub standby_stale: bool,
     pub committee_epoch: u64,
     /// How many members the current committee shares with the owner's, when known.
     pub committee_overlap: Option<u64>,
@@ -124,10 +135,11 @@ pub struct StandbyView {
 }
 
 /// Whether the current committee should generate the next standby key now: Ok, or why not.
-/// It should when no standby is named and none is waiting to be, and it is a newer committee
-/// than the owner's that shares few enough members with it to be a standby consensus accepts.
+/// It should when no working standby is named (none, or one gone stale) and none is waiting
+/// to be, and it is a newer committee than the owner's that shares few enough members with it
+/// to be a standby consensus accepts.
 pub fn standby_dkg_due(view: &StandbyView, records: &[Record]) -> Result<(), String> {
-    if view.standby_named {
+    if view.standby_key.is_some() && !view.standby_stale {
         return Err("a standby is named".into());
     }
     let (Some(owner), Some(owner_epoch)) = (view.owner_key, view.owner_epoch) else {
@@ -149,13 +161,43 @@ pub fn standby_dkg_due(view: &StandbyView, records: &[Record]) -> Result<(), Str
         }
         None => return Err("the current committee's overlap with the owner's is unknown".into()),
     }
-    if pick_standby(records, &owner, owner_epoch, view.overlap_limit).is_some() {
+    if pick_standby(records, &owner, owner_epoch, view.overlap_limit, view.standby_key.as_ref()).is_some() {
         return Err("an attested key is waiting to be named".into());
     }
     if records.iter().any(|r| r.epoch >= view.committee_epoch) {
         return Err("a key of this committee is being attested".into());
     }
     Ok(())
+}
+
+/// The standby the live committee should have now: the named one while it works, else the
+/// one to name in its place (see [`pick_standby`]). None if there is nothing to name.
+pub fn standby_target<'a>(view: &StandbyView, records: &'a [Record]) -> Option<&'a Record> {
+    let (owner, owner_epoch) = (view.owner_key?, view.owner_epoch?);
+    match view.standby_key {
+        Some(k) if !view.standby_stale => holder(records, &k),
+        named => pick_standby(records, &owner, owner_epoch, view.overlap_limit, named.as_ref()),
+    }
+}
+
+/// Whether a standby share set should step aside, and why: its key (held by committee
+/// `ours_epoch`) is the named standby but has gone stale (its holders can no longer sign
+/// together), or a newer committee's key is named in its place. Its members then archive it and
+/// rejoin the pool, so they can help generate the next one. Never for the owner's key: that
+/// set is promoted, not retired.
+pub fn standby_set_retired(view: &StandbyView, records: &[Record], ours: &[u8; 32], ours_epoch: u64) -> Option<String> {
+    if view.owner_key.as_ref() == Some(ours) {
+        return None;
+    }
+    match view.standby_key {
+        Some(k) if k == *ours && view.standby_stale => {
+            Some("this standby key has not proved it can sign for a day: its holders cannot sign together".into())
+        }
+        Some(k) if k != *ours => holder(records, &k)
+            .filter(|r| r.epoch > ours_epoch)
+            .map(|r| format!("a newer standby (committee epoch {}) is named in its place", r.epoch)),
+        _ => None,
+    }
 }
 
 /// The [`StandbyView`] of a `bridge_get_standby` JSON-RPC result.
@@ -175,7 +217,8 @@ pub fn parse_view(result: &serde_json::Value) -> Option<StandbyView> {
     Some(StandbyView {
         owner_key: key("owner_key"),
         owner_epoch: result.get("owner_epoch").and_then(serde_json::Value::as_u64),
-        standby_named: result.get("standby_key").is_some(),
+        standby_key: key("standby_key"),
+        standby_stale: result.get("standby_stale").and_then(serde_json::Value::as_bool).unwrap_or(false),
         committee_epoch: result.get("committee_epoch")?.as_u64()?,
         committee_overlap: result.get("committee_overlap").and_then(serde_json::Value::as_u64),
         overlap_limit: result.get("overlap_limit")?.as_u64()?,
@@ -304,14 +347,15 @@ mod tests {
             rec(5, 8, 0, Some(0)),   // still collecting
             rec(6, 5, 20, None),     // committee unknown
         ];
-        assert_eq!(pick_standby(&records, &owner, 4, 6).unwrap().pgw_vk, [3; 32]);
-        assert_eq!(pick_standby(&records, &owner, 4, 9).unwrap().pgw_vk, [4; 32]);
-        assert!(pick_standby(&records, &owner, 6, 6).is_none(), "nothing newer than the owner");
+        assert_eq!(pick_standby(&records, &owner, 4, 6, None).unwrap().pgw_vk, [3; 32]);
+        assert_eq!(pick_standby(&records, &owner, 4, 9, None).unwrap().pgw_vk, [4; 32]);
+        assert_eq!(pick_standby(&records, &owner, 4, 9, Some(&[4; 32])).unwrap().pgw_vk, [3; 32], "not the stale one");
+        assert!(pick_standby(&records, &owner, 6, 6, None).is_none(), "nothing newer than the owner");
 
         // A key a second committee attested later still belongs to the first.
         let mut records = vec![rec(3, 6, 30, Some(2))];
         records.push(Record { epoch: 7, attested_height: 25, ..rec(3, 7, 25, Some(1)) });
-        let pick = pick_standby(&records, &owner, 4, 6).unwrap();
+        let pick = pick_standby(&records, &owner, 4, 6, None).unwrap();
         assert_eq!((pick.epoch, pick.attested_height), (7, 25), "epoch 7 reached its threshold first");
     }
 
@@ -320,14 +364,20 @@ mod tests {
         let view = StandbyView {
             owner_key: Some([1; 32]),
             owner_epoch: Some(4),
-            standby_named: false,
+            standby_key: None,
+            standby_stale: false,
             committee_epoch: 6,
             committee_overlap: Some(2),
             overlap_limit: 6,
         };
         assert_eq!(standby_dkg_due(&view, &[]), Ok(()));
         let no = |v: &StandbyView, r: &[Record]| standby_dkg_due(v, r).unwrap_err();
-        assert!(no(&StandbyView { standby_named: true, ..view.clone() }, &[]).contains("named"));
+        assert!(no(&StandbyView { standby_key: Some([8; 32]), ..view.clone() }, &[]).contains("named"));
+        assert_eq!(
+            standby_dkg_due(&StandbyView { standby_key: Some([8; 32]), standby_stale: true, ..view.clone() }, &[]),
+            Ok(()),
+            "a stale standby is no standby"
+        );
         assert!(no(&StandbyView { owner_epoch: None, ..view.clone() }, &[]).contains("not attested"));
         assert!(no(&StandbyView { committee_epoch: 4, ..view.clone() }, &[]).contains("not newer"));
         assert!(no(&StandbyView { committee_overlap: Some(7), ..view.clone() }, &[]).contains("at most 6"));
@@ -356,10 +406,49 @@ mod tests {
         });
         let view = parse_view(&v).unwrap();
         assert_eq!(view.owner_key, Some([1; 32]));
-        assert!(!view.standby_named);
+        assert_eq!((view.standby_key, view.standby_stale), (None, false));
         assert_eq!((view.committee_epoch, view.committee_overlap, view.overlap_limit), (6, Some(2), 6));
         let mut named = v.clone();
         named["standby_key"] = serde_json::json!("02".repeat(32));
-        assert!(parse_view(&named).unwrap().standby_named);
+        named["standby_stale"] = serde_json::json!(true);
+        let named = parse_view(&named).unwrap();
+        assert_eq!((named.standby_key, named.standby_stale), (Some([2; 32]), true));
+    }
+
+    #[test]
+    fn a_stale_standby_is_replaced_and_its_holders_step_aside() {
+        let rec = |vk: u8, epoch, h, overlap| Record {
+            pgw_vk: [vk; 32],
+            pevm_address: [vk; 20],
+            epoch,
+            voters: vec![],
+            attested_height: h,
+            overlap_with_owner: overlap,
+        };
+        let records = vec![rec(1, 4, 10, Some(20)), rec(5, 5, 50, Some(2)), rec(6, 6, 60, Some(3))];
+        let view = StandbyView {
+            owner_key: Some([1; 32]),
+            owner_epoch: Some(4),
+            standby_key: Some([6; 32]),
+            standby_stale: false,
+            committee_epoch: 7,
+            committee_overlap: Some(1),
+            overlap_limit: 6,
+        };
+        // A working standby stays the target; a stale one is replaced, never by itself.
+        assert_eq!(standby_target(&view, &records).unwrap().pgw_vk, [6; 32]);
+        let stale = StandbyView { standby_stale: true, ..view.clone() };
+        assert_eq!(standby_target(&stale, &records).unwrap().pgw_vk, [5; 32]);
+        let none = StandbyView { standby_key: None, ..view.clone() };
+        assert_eq!(standby_target(&none, &records).unwrap().pgw_vk, [6; 32]);
+
+        // Its holders step aside once it is stale, or once a newer key replaces it.
+        assert!(standby_set_retired(&view, &records, &[6; 32], 6).is_none(), "working");
+        assert!(standby_set_retired(&stale, &records, &[6; 32], 6).unwrap().contains("not proved"));
+        assert!(standby_set_retired(&view, &records, &[5; 32], 5).unwrap().contains("newer standby"));
+        // A newer key waiting to be named does not step aside for an older named one.
+        assert!(standby_set_retired(&StandbyView { standby_key: Some([5; 32]), ..view.clone() }, &records, &[6; 32], 6).is_none());
+        // Nor does the owner's set.
+        assert!(standby_set_retired(&stale, &records, &[1; 32], 4).is_none());
     }
 }
