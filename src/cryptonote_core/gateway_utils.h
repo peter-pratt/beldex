@@ -93,6 +93,15 @@ crypto::hash gateway_takeover_begin_message(network_type nettype, const crypto::
 crypto::hash gateway_standby_name_message(network_type nettype, const crypto::public_key& gateway_id,
                                           uint64_t descriptor_count, const gateway_owner_key_v& standby);
 
+// What the STANDBY signs to prove it can still sign: bound to the standby key and to the
+// hash of block `proof_height`, so it cannot be signed before that block exists.
+crypto::hash gateway_standby_alive_message(network_type nettype, const crypto::public_key& gateway_id,
+                                           const gateway_owner_key_v& standby, uint64_t proof_height,
+                                           const crypto::hash& block_hash);
+// The block a standby proves itself over now: the latest slot boundary a few blocks behind
+// the tip (so members reading a block apart agree, and a tip reorg does not void it).
+uint64_t gateway_standby_alive_height(network_type nettype, uint64_t chain_height);
+
 // The bytes a committee member signs to attest that its committee generated a key, and the
 // check of one member's signature against that committee's signer keys.
 std::string bridge_key_attestation_message(network_type nettype, const tx_extra_bridge_key_attestation& att);

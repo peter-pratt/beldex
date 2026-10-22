@@ -3805,6 +3805,23 @@ namespace cryptonote::rpc {
         cmd.response["standby_name_message"] = tools::type_to_hex(cryptonote::gateway_standby_name_message(
             m_core.get_nettype(), gw_id, acct.descriptor_history.size(), cryptonote::gateway_owner_key_v{k}));
       }
+      // The standby's liveness (bridge gateway): the block it proves itself over now and the
+      // exact message, when it last did (or was named), and whether that is too long ago.
+      if (d.has_standby)
+      {
+        const auto nettype = m_core.get_nettype();
+        const uint64_t top = m_core.get_current_blockchain_height();
+        const uint64_t proof_h = cryptonote::gateway_standby_alive_height(nettype, top);
+        cmd.response["standby_alive_height"] = proof_h;
+        cmd.response["standby_alive_message"] = tools::type_to_hex(cryptonote::gateway_standby_alive_message(
+            nettype, gw_id, d.standby_owner, proof_h, m_core.get_blockchain_storage().get_db().get_block_hash_from_height(proof_h)));
+        for (const auto& r : m_core.get_master_node_list().get_bridge_standby_liveness())
+          if (r.gateway_id == gw_id && cryptonote::gateway_owner_key_v{r.standby} == d.standby_owner)
+          {
+            cmd.response["standby_last_seen_height"] = r.last_seen();
+            cmd.response["standby_stale"] = top > r.last_seen() + cryptonote::gateway_standby_stale_blocks(nettype);
+          }
+      }
       if (d.has_standby && !started)
         cmd.response["takeover_begin_message"] = tools::type_to_hex(cryptonote::gateway_takeover_begin_message(
             m_core.get_nettype(), gw_id, d, acct.takeover_log.size()));
@@ -4450,7 +4467,18 @@ namespace cryptonote::rpc {
       }
       if (d.has_standby)
         if (const auto* vk = std::get_if<crypto::eddsa_public_key>(&d.standby_owner))
+        {
           cmd.response["standby_key"] = tools::type_to_hex(*vk);
+          // Stale: it has neither been named nor proved itself for a day. The live committee
+          // then names another, as if none were named.
+          for (const auto& r : mnl.get_bridge_standby_liveness())
+            if (r.gateway_id == g.gateway_id && r.standby == *vk)
+            {
+              const uint64_t top = m_core.get_current_blockchain_height();
+              cmd.response["standby_last_seen_height"] = r.last_seen();
+              cmd.response["standby_stale"] = top > r.last_seen() + cryptonote::gateway_standby_stale_blocks(nettype);
+            }
+        }
     }
     const uint64_t epoch_blocks = cryptonote::bridge_epoch_blocks(nettype);
     const uint64_t top = m_core.get_current_blockchain_height();

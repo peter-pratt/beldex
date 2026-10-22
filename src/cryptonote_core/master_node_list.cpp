@@ -2958,6 +2958,81 @@ namespace master_nodes
     return handed_over;
   }
 
+  static bridge_standby_liveness_record bridge_standby_liveness_entry(const crypto::public_key &gw,
+                                                               const crypto::eddsa_public_key &standby,
+                                                               uint64_t named_height)
+  {
+    bridge_standby_liveness_record r{};
+    r.gateway_id   = gw;
+    r.standby      = standby;
+    r.named_height = named_height;
+    return r;
+  }
+
+  void master_node_list::state_t::process_bridge_standby_liveness_tx(const cryptonote::transaction &tx,
+                                                                     uint64_t block_height)
+  {
+    // Only THE bridge gateway, once tracked (process_bridge_gateway_owner_tx). Every op here
+    // was validated by consensus before the block was accepted.
+    if (bridge_gateway_owners.empty())
+      return;
+    const crypto::public_key &bridge_gw = bridge_gateway_owners.front().gateway_id;
+    const auto standby_named = [&](const cryptonote::gateway_owner_key_v &key) {
+      const auto *vk = std::get_if<crypto::eddsa_public_key>(&key);
+      if (!vk)
+      {
+        bridge_standby_liveness.clear();
+        return;
+      }
+      if (!bridge_standby_liveness.empty() && bridge_standby_liveness.front().standby == *vk)
+        return; // restated, not renamed: its clock runs on
+      bridge_standby_liveness.assign(1, bridge_standby_liveness_entry(bridge_gw, *vk, block_height));
+    };
+    const auto descriptor = [&](const crypto::public_key &gw, const cryptonote::gateway_descriptor_base &d) {
+      if (gw != bridge_gw)
+        return;
+      if (d.has_standby)
+        standby_named(d.standby_owner);
+      else
+        bridge_standby_liveness.clear();
+    };
+
+    size_t skip = 0;
+    cryptonote::tx_extra_gateway_descriptor_operation op{};
+    while (cryptonote::get_field_from_tx_extra(tx.extra, op, skip++))
+      descriptor(op.address_id, op.descriptor);
+    skip = 0;
+    cryptonote::tx_extra_gateway_repoint repoint{};
+    while (cryptonote::get_field_from_tx_extra(tx.extra, repoint, skip++))
+      descriptor(repoint.gateway_id, repoint.new_owner_descriptor);
+    skip = 0;
+    cryptonote::tx_extra_gateway_takeover t{};
+    while (cryptonote::get_field_from_tx_extra(tx.extra, t, skip++))
+    {
+      if (t.version < 1 || t.gateway_id != bridge_gw)
+        continue;
+      switch (t.action)
+      {
+        case cryptonote::gateway_takeover_action::name_standby: standby_named(t.new_owner); break;
+        case cryptonote::gateway_takeover_action::complete: bridge_standby_liveness.clear(); break;
+        case cryptonote::gateway_takeover_action::standby_alive:
+        {
+          const auto *vk = std::get_if<crypto::eddsa_public_key>(&t.new_owner);
+          if (!vk)
+            break;
+          // A proof names its standby, so a record that is missing (named before this was
+          // tracked) or behind is put right by the next proof.
+          if (bridge_standby_liveness.empty() || bridge_standby_liveness.front().standby != *vk)
+            bridge_standby_liveness.assign(1, bridge_standby_liveness_entry(bridge_gw, *vk, block_height));
+          auto &rec = bridge_standby_liveness.front();
+          rec.alive_height = std::max(rec.alive_height, t.started_height);
+          break;
+        }
+        default: break;
+      }
+    }
+  }
+
   void master_node_list::state_t::finalize_bridge_unbonds(uint64_t block_height)
   {
     // Release any seat whose unbonding period has elapsed: clear the bridge_seat
@@ -3258,7 +3333,10 @@ namespace master_nodes
       // HF23: a bridge-reserve gateway handed to a new owner key — the gateway's side of a
       // committee rotation (register / update ride their own tx types; a re-point any).
       if (hf_version >= cryptonote::hf::hf23_bridge)
+      {
         process_bridge_gateway_owner_tx(nettype, tx);
+        process_bridge_standby_liveness_tx(tx, block_height);
+      }
     }
 
     // HF23: release any elapsed unbonds, then (re)assign bridge seats
@@ -3870,6 +3948,7 @@ namespace master_nodes
     result.bridge_chain_contracts = state.bridge_chain_contracts;
     result.bridge_departed_bonds = state.bridge_departed_bonds;
     result.bridge_key_attestations = state.bridge_key_attestations;
+    result.bridge_standby_liveness = state.bridge_standby_liveness;
     return result;
   }
 
@@ -4517,6 +4596,7 @@ namespace master_nodes
   , bridge_chain_contracts{std::move(state.bridge_chain_contracts)}
   , bridge_departed_bonds{std::move(state.bridge_departed_bonds)}
   , bridge_key_attestations{std::move(state.bridge_key_attestations)}
+  , bridge_standby_liveness{std::move(state.bridge_standby_liveness)}
   , mn_list{mnl}
   {
     if (!mn_list)

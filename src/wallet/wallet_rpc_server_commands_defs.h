@@ -2260,7 +2260,7 @@ BELDEX_RPC_DOC_INTROSPECT
     struct request
     {
       std::string gateway_id;          // The gateway, 64-char hex.
-      std::string action;              // "begin", "complete", "cancel" or "name_standby".
+      std::string action;              // "begin", "complete", "cancel", "name_standby" or "standby_alive".
       uint64_t    started_height;      // begin: takeover_steps; complete/cancel: the takeover's start height.
       std::string signature;           // Signature over the step's message, hex.
       std::string signature_type;      // "eddsa" (bridge committee), "schnorr" or "eth".

@@ -220,6 +220,7 @@ namespace hashkey {
   inline constexpr std::string_view GW_STANDBY_NAME      = "gateway_standby_name"sv;
   // A committee member's word that its committee generated a key (tx_extra_bridge_key_attestation).
   inline constexpr std::string_view BRIDGE_KEY_ATTESTATION = "bridge_key_attestation_v1"sv;
+  inline constexpr std::string_view GW_STANDBY_ALIVE     = "gateway_standby_alive"sv;
   // Phase F accountability: the bridge-committee slash-report domain. MUST match the
   // off-chain signer's `slash::SLASH_REPORT_DOMAIN` byte-for-byte.
   inline constexpr std::string_view BRIDGE_SLASH    = "bridge_slash_report_v1"sv; // bridge accountability slash report
@@ -402,6 +403,21 @@ constexpr uint64_t bridge_epoch_blocks(network_type n)
 constexpr uint64_t gateway_standby_takeover_blocks(network_type n)
 {
   return is_local_bridge_net(n) ? 10 : 120;
+}
+// Standby liveness (HF23): the standby proves it can still sign once per slot, over a block
+// at a slot boundary no older than the window; one that has not for `stale` blocks since it
+// was named or last proved itself is treated as gone, and replaced.
+constexpr uint64_t gateway_standby_alive_slot_blocks(network_type n)
+{
+  return is_local_bridge_net(n) ? 10 : 120; // ~1 hour
+}
+constexpr uint64_t gateway_standby_alive_window_blocks(network_type n)
+{
+  return is_local_bridge_net(n) ? 40 : 360; // three slots
+}
+constexpr uint64_t gateway_standby_stale_blocks(network_type n)
+{
+  return is_local_bridge_net(n) ? 120 : 2880; // ~1 day
 }
 constexpr uint64_t bridge_bond_unlock_blocks(network_type n)
 {

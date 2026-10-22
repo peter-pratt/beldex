@@ -3576,14 +3576,17 @@ namespace {
       step.action = cryptonote::gateway_takeover_action::cancel;
     else if (req.action == "name_standby")
       step.action = cryptonote::gateway_takeover_action::name_standby;
+    else if (req.action == "standby_alive")
+      step.action = cryptonote::gateway_takeover_action::standby_alive;
     else
-      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "action must be one of: begin, complete, cancel, name_standby"};
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "action must be one of: begin, complete, cancel, name_standby, standby_alive"};
     if (!tools::hex_to_type(req.gateway_id, step.gateway_id))
       throw wallet_rpc_error{error_code::WRONG_ADDRESS, "invalid gateway_id (expected 64-char hex)"};
     step.started_height = req.started_height;
     step.sig = parse_gateway_owner_sig(req.signature_type, req.signature);
     if (step.action == cryptonote::gateway_takeover_action::complete
-        || step.action == cryptonote::gateway_takeover_action::name_standby)
+        || step.action == cryptonote::gateway_takeover_action::name_standby
+        || step.action == cryptonote::gateway_takeover_action::standby_alive)
       step.new_owner = parse_gateway_owner_key(req.new_owner_key_type, req.new_owner_key);
 
     tools::wallet2::bridge_rotation_ack_result built = m_wallet->create_gateway_takeover_step_tx(step, req.priority);

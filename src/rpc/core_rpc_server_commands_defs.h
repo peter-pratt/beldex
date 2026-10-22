@@ -2692,7 +2692,9 @@ namespace cryptonote::rpc {
     {
       std::string gateway_address;
       // Optional: an eddsa key (hex). The reply then carries `standby_name_message`, what the
-      // owner signs to name it the standby (a standalone name_standby step).
+      // owner signs to name it the standby (a standalone name_standby step). With a standby
+      // named: standby_alive_height / standby_alive_message (what the standby signs to prove
+      // it can still sign), standby_last_seen_height and standby_stale.
       std::string standby_owner_key;
     } request;
   };

@@ -303,6 +303,26 @@ namespace master_nodes
     END_SERIALIZE()
   };
 
+  // HF23: when the bridge gateway's standby last showed it could sign: named (named_height)
+  // or proved itself (a standby_alive step over block alive_height). One that has done
+  // neither for gateway_standby_stale_blocks is treated as gone, and replaced.
+  struct bridge_standby_liveness_record
+  {
+    crypto::public_key       gateway_id{};
+    crypto::eddsa_public_key standby{};
+    uint64_t                 named_height = 0;
+    uint64_t                 alive_height = 0;
+
+    uint64_t last_seen() const { return std::max(named_height, alive_height); }
+
+    BEGIN_SERIALIZE_OBJECT()
+      FIELD(gateway_id)
+      FIELD(standby)
+      VARINT_FIELD(named_height)
+      VARINT_FIELD(alive_height)
+    END_SERIALIZE()
+  };
+
   // The record of the committee that holds gateway key `pgw_vk`: the first to have attested it.
   std::optional<bridge_key_attestation_record> find_attested_bridge_key(const std::vector<bridge_key_attestation_record>& records,
                                                                         const crypto::eddsa_public_key& pgw_vk);
@@ -657,6 +677,12 @@ namespace master_nodes
       std::lock_guard lock{m_mn_mutex};
       return m_state.bridge_key_attestations;
     }
+    /// HF23: when the bridge gateway's standby last showed it could sign (at most one entry).
+    std::vector<bridge_standby_liveness_record> get_bridge_standby_liveness() const
+    {
+      std::lock_guard lock{m_mn_mutex};
+      return m_state.bridge_standby_liveness;
+    }
     /// HF23: whether this member's attestation of this key is already recorded.
     bool has_bridge_key_attestation_vote(const cryptonote::tx_extra_bridge_key_attestation& att) const;
     /// HF23: the attested record of a gateway (Pgw) key, if a committee has attested it.
@@ -862,8 +888,8 @@ namespace master_nodes
 
     struct state_serialized
     {
-      enum struct version_t : uint8_t { version_0, version_1_serialize_hash, version_2_bridge_rotation, version_3_bridge_gateway_owner, version_4_bridge_chain_contract, version_5_bridge_departed_bond, version_6_bridge_key_attestation, count, };
-      static version_t get_version(cryptonote::hf /*hf_version*/) { return version_t::version_6_bridge_key_attestation; }
+      enum struct version_t : uint8_t { version_0, version_1_serialize_hash, version_2_bridge_rotation, version_3_bridge_gateway_owner, version_4_bridge_chain_contract, version_5_bridge_departed_bond, version_6_bridge_key_attestation, version_7_bridge_standby_liveness, count, };
+      static version_t get_version(cryptonote::hf /*hf_version*/) { return version_t::version_7_bridge_standby_liveness; }
 
       version_t                              version;
       uint64_t                               height;
@@ -877,6 +903,7 @@ namespace master_nodes
       std::vector<bridge_chain_contract>     bridge_chain_contracts; // HF23: rotation-ack binding
       std::vector<bridge_departed_bond>      bridge_departed_bonds; // HF23: deregistered key holders' bonds
       std::vector<bridge_key_attestation_record> bridge_key_attestations; // HF23: who generated which key
+      std::vector<bridge_standby_liveness_record> bridge_standby_liveness;      // HF23: the standby's last sign of life
 
       BEGIN_SERIALIZE()
         ENUM_FIELD(version, version < version_t::count)
@@ -898,6 +925,8 @@ namespace master_nodes
           FIELD(bridge_departed_bonds);
         if (version >= version_t::version_6_bridge_key_attestation)
           FIELD(bridge_key_attestations);
+        if (version >= version_t::version_7_bridge_standby_liveness)
+          FIELD(bridge_standby_liveness);
       END_SERIALIZE()
     };
 
@@ -945,6 +974,8 @@ namespace master_nodes
       std::vector<bridge_departed_bond>      bridge_departed_bonds;
       // Keys committees have attested to generating (tx_extra_bridge_key_attestation).
       std::vector<bridge_key_attestation_record> bridge_key_attestations;
+      // When the bridge gateway's standby last showed it could sign (at most one entry).
+      std::vector<bridge_standby_liveness_record>   bridge_standby_liveness;
       master_node_list*                     mn_list;
 
       state_t(master_node_list* mnl) : mn_list{mnl} {}
@@ -1002,12 +1033,14 @@ namespace master_nodes
       // epoch once the chain has one. False with `reason` otherwise.
       bool check_bridge_rotation_ack(const cryptonote::tx_extra_bridge_rotation_ack& ack,
                                      cryptonote::network_type nettype, std::string& reason) const;
-      // Returns true if the bridge gateway's owner key changed (the gateway was handed to a
-      // new key), which advances observed_key_epoch for BRIDGE_GATEWAY_CHAIN_ID (HF23).
       bool process_bridge_key_attestation_tx(cryptonote::network_type nettype, const cryptonote::block& block,
                                              const cryptonote::transaction& tx,
                                              const bridge_committee_resolver& resolve_committee);
+      // Returns true if the bridge gateway's owner key changed (the gateway was handed to a
+      // new key), which advances observed_key_epoch for BRIDGE_GATEWAY_CHAIN_ID (HF23).
       bool process_bridge_gateway_owner_tx(cryptonote::network_type nettype, const cryptonote::transaction& tx);
+      // HF23: track the bridge gateway's standby, and when it last showed it could sign.
+      void process_bridge_standby_liveness_tx(const cryptonote::transaction& tx, uint64_t block_height);
       // Release (clear) any bridge seat whose bond unlock height has been reached.
       void finalize_bridge_unbonds(uint64_t block_height);
       // The per-chain baseline a departing SEATED member's bond waits on: two hand-overs past

@@ -349,6 +349,28 @@ crypto::hash gateway_standby_name_message(network_type nettype, const crypto::pu
   return gateway_governance_message(hashkey::GW_STANDBY_NAME, nettype, fields);
 }
 
+crypto::hash gateway_standby_alive_message(network_type nettype, const crypto::public_key& gateway_id,
+                                           const gateway_owner_key_v& standby, uint64_t proof_height,
+                                           const crypto::hash& block_hash)
+{
+  std::string fields;
+  fields.append(reinterpret_cast<const char*>(&gateway_id), sizeof(gateway_id));
+  fields.push_back(static_cast<char>(standby.index()));
+  std::visit([&fields](const auto& k) { fields.append(reinterpret_cast<const char*>(&k), sizeof(k)); }, standby);
+  append_u64_le(fields, proof_height);
+  fields.append(reinterpret_cast<const char*>(&block_hash), sizeof(block_hash));
+  return gateway_governance_message(hashkey::GW_STANDBY_ALIVE, nettype, fields);
+}
+
+uint64_t gateway_standby_alive_height(network_type nettype, uint64_t chain_height)
+{
+  constexpr uint64_t LAG = 3;
+  const uint64_t slot = gateway_standby_alive_slot_blocks(nettype);
+  if (chain_height < LAG + 1)
+    return 0;
+  return (chain_height - 1 - LAG) / slot * slot;
+}
+
 std::string bridge_key_attestation_message(network_type nettype, const tx_extra_bridge_key_attestation& att)
 {
   // DOMAIN || genesis(32) || version(u8) || epoch(u64 LE) || pgw_vk(32) || pevm_address(20).
@@ -1814,6 +1836,31 @@ bool validate_gateway_takeover_step(BlockchainDB& db, network_type nettype,
       }
       return true;
     }
+    case gateway_takeover_action::standby_alive:
+    {
+      if (!current.has_standby || t.new_owner != current.standby_owner)
+      {
+        reason = "a standby liveness proof must name the gateway's current standby";
+        return false;
+      }
+      const uint64_t slot = gateway_standby_alive_slot_blocks(nettype);
+      const uint64_t window = gateway_standby_alive_window_blocks(nettype);
+      if (t.started_height % slot != 0 || t.started_height >= height || t.started_height + window < height)
+      {
+        reason = "standby liveness proof over block " + std::to_string(t.started_height)
+                 + " is not a recent slot boundary (every " + std::to_string(slot) + " blocks, within the last "
+                 + std::to_string(window) + ")";
+        return false;
+      }
+      if (!verify_gateway_owner_signature(current.standby_owner, t.sig,
+            gateway_standby_alive_message(nettype, t.gateway_id, current.standby_owner, t.started_height,
+                                          db.get_block_hash_from_height(t.started_height))))
+      {
+        reason = "standby liveness proof is not signed by the gateway's standby";
+        return false;
+      }
+      return true;
+    }
   }
   reason = "unknown takeover step";
   return false;
@@ -2005,10 +2052,13 @@ bool validate_tx_gateway_operations_against_db(BlockchainDB& db, network_type ne
       reason = "gateway takeover marker without a descriptor update";
       return false;
     }
-    else if (std::any_of(takeovers.begin(), takeovers.end(),
-                         [](const auto& t) { return t.action == gateway_takeover_action::cancel; }))
+    else if (std::any_of(takeovers.begin(), takeovers.end(), [](const auto& t) {
+               return t.action != gateway_takeover_action::begin && t.action != gateway_takeover_action::complete;
+             }))
     {
-      reason = "a takeover cancel is standalone (version 1), not a descriptor update";
+      // Only a begin or a complete rides a descriptor update; a cancel, a standby naming and
+      // a liveness proof are standalone (version 1).
+      reason = "a takeover cancel, standby naming or liveness proof is standalone (version 1), not a descriptor update";
       return false;
     }
   }
@@ -2378,6 +2428,8 @@ namespace
             acct.descriptor_history.push_back(next);
             continue; // no takeover-log entry, and the account version is unchanged
           }
+          case gateway_takeover_action::standby_alive:
+            continue; // recorded by the master-node state, not the gateway
         }
         if (acct.version < 3) acct.version = 3;
       }

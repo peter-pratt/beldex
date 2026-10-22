@@ -53,6 +53,11 @@ namespace
     std::map<crypto::public_key, std::string> store;
     uint64_t chain_height = 1;
     uint64_t height() const override { return chain_height; }
+    // Each block its own hash, so a message bound to one block cannot pass for another.
+    crypto::hash get_block_hash_from_height(const uint64_t& h) const override
+    {
+      return crypto::cn_fast_hash(&h, sizeof(h));
+    }
 
     void set_gateway_account(const crypto::public_key& id, const std::string& data) override { store[id] = data; }
     bool get_gateway_account(const crypto::public_key& id, std::string& data) const override
@@ -2920,4 +2925,143 @@ TEST(GatewayBridgeKeyAttestation, the_message_layout_is_pinned)
   want.append(std::string(32, '\x02'));
   want.append(std::string(20, '\x03'));
   EXPECT_EQ(bridge_key_attestation_message(NET_FC, att), want);
+}
+
+// The standby proves it can still sign: over a recent slot-boundary block, whose hash the
+// message binds, signed by the standby and naming it. It changes no gateway state.
+TEST(GatewayStandbyTakeover, the_standby_proves_it_can_still_sign)
+{
+  MemGatewayDB db;
+  const OwnerKeys owner = new_owner_keys(), standby = new_owner_keys();
+  const crypto::public_key gw = seed_with_standby(db, owner, standby);
+  const std::string before = blob_of(gw, db);
+  const uint64_t slot = gateway_standby_alive_slot_blocks(NET_TO), window = gateway_standby_alive_window_blocks(NET_TO);
+  std::string reason;
+  db.chain_height = 100 * slot;
+  const uint64_t h = gateway_standby_alive_height(NET_TO, db.chain_height);
+  ASSERT_EQ(h % slot, 0u);
+  ASSERT_LT(h, db.chain_height);
+  auto proof = [&](uint64_t at, const OwnerKeys& signer, const crypto::public_key& named, const crypto::hash& block) {
+    return standalone_step(gw, gateway_takeover_action::standby_alive, at,
+                           gateway_standby_alive_message(NET_TO, gw, gateway_owner_key_v{named}, at, block), signer, named);
+  };
+  const auto hash_at = [&](uint64_t at) { return db.get_block_hash_from_height(at); };
+
+  const auto ok = proof(h, standby, standby.pub, hash_at(h));
+  ASSERT_TRUE(tx_valid(db, ok, reason)) << reason;
+
+  // Only the standby, naming itself, over that very block.
+  EXPECT_FALSE(tx_valid(db, proof(h, owner, standby.pub, hash_at(h)), reason));
+  EXPECT_NE(reason.find("not signed by the gateway's standby"), std::string::npos) << reason;
+  EXPECT_FALSE(tx_valid(db, proof(h, owner, owner.pub, hash_at(h)), reason));
+  EXPECT_NE(reason.find("current standby"), std::string::npos) << reason;
+  EXPECT_FALSE(tx_valid(db, proof(h, standby, standby.pub, hash_at(h + 1)), reason)) << "signed for another block";
+
+  // A recent slot boundary only: not in between, not the future, not older than the window.
+  EXPECT_FALSE(tx_valid(db, proof(h + 1, standby, standby.pub, hash_at(h + 1)), reason));
+  EXPECT_NE(reason.find("recent slot boundary"), std::string::npos) << reason;
+  EXPECT_FALSE(tx_valid(db, proof(db.chain_height, standby, standby.pub, hash_at(db.chain_height)), reason));
+  const uint64_t old = (db.chain_height - window - 1) / slot * slot;
+  EXPECT_FALSE(tx_valid(db, proof(old, standby, standby.pub, hash_at(old)), reason));
+
+  // It records nothing in the gateway, and rewinds to nothing.
+  ASSERT_TRUE(append_gateways_from_transactions(db, {ok}, db.chain_height, true, &reason)) << reason;
+  EXPECT_EQ(blob_of(gw, db), before);
+  ASSERT_TRUE(rewind_gateways_from_transactions(db, {ok}, db.chain_height, true, &reason)) << reason;
+  EXPECT_EQ(blob_of(gw, db), before);
+
+  // No standby, no proof.
+  const crypto::public_key plain = seed_gateway(db, 10, true);
+  EXPECT_FALSE(tx_valid(db, standalone_step(plain, gateway_takeover_action::standby_alive, h,
+      gateway_standby_alive_message(NET_TO, plain, gateway_owner_key_v{standby.pub}, h, hash_at(h)), standby, standby.pub), reason));
+}
+
+// Only a begin or a complete may ride a descriptor update as a marker.
+TEST(GatewayStandbyTakeover, only_begin_and_complete_are_descriptor_update_markers)
+{
+  MemGatewayDB db;
+  const OwnerKeys owner = new_owner_keys(), standby = new_owner_keys();
+  const crypto::public_key gw = seed_with_standby(db, owner, standby);
+  std::string reason;
+  for (auto action : {gateway_takeover_action::name_standby, gateway_takeover_action::standby_alive})
+  {
+    EXPECT_FALSE(tx_valid(db, takeover_update(gw, current(db, gw), action, owner), reason));
+    EXPECT_NE(reason.find("standalone"), std::string::npos) << reason;
+  }
+}
+
+// The master-node state follows the bridge gateway's standby and when it last showed it could
+// sign: named, restated, proved, renamed, taken over.
+TEST(GatewayBridgeRotation, the_standbys_last_sign_of_life_is_tracked)
+{
+  master_node_list::state_t cur(nullptr);
+  const crypto::public_key gw = rand_pubkey();
+  crypto::eddsa_public_key a, b; crypto::eddsa_secret_key sk;
+  crypto::generate_eddsa_keypair(a, sk);
+  crypto::generate_eddsa_keypair(b, sk);
+  auto descriptor_tx = [&](const crypto::public_key& id, gateway_descriptor_op_type type, std::optional<crypto::eddsa_public_key> sb) {
+    tx_extra_gateway_descriptor_operation op{};
+    op.op_type = type;
+    op.address_id = id;
+    op.descriptor.version = 2;
+    op.descriptor.owner_key = crypto::eddsa_public_key{};
+    op.descriptor.flags = GATEWAY_FLAG_BRIDGE_RESERVE;
+    if (sb) { op.descriptor.has_standby = 1; op.descriptor.standby_owner = *sb; }
+    transaction tx{};
+    add_gateway_descriptor_operation_to_tx_extra(tx.extra, op);
+    return tx;
+  };
+  auto step_tx = [&](gateway_takeover_action action, uint64_t at, const crypto::eddsa_public_key& key) {
+    tx_extra_gateway_takeover t{};
+    t.version = 1; t.gateway_id = gw; t.action = action; t.started_height = at; t.new_owner = key;
+    t.sig = crypto::signature{};
+    transaction tx{};
+    EXPECT_TRUE(add_gateway_takeover_to_tx_extra(tx.extra, t));
+    return tx;
+  };
+  auto rec = [&]() { return cur.bridge_standby_liveness; };
+
+  const auto reg = descriptor_tx(gw, gateway_descriptor_op_type::register_address, a);
+  cur.process_bridge_gateway_owner_tx(NET_FC, reg);
+  cur.process_bridge_standby_liveness_tx(reg, 100);
+  ASSERT_EQ(rec().size(), 1u);
+  EXPECT_EQ(rec()[0].standby, a);
+  EXPECT_EQ(rec()[0].last_seen(), 100u);
+
+  cur.process_bridge_standby_liveness_tx(step_tx(gateway_takeover_action::standby_alive, 190, a), 200);
+  EXPECT_EQ(rec()[0].alive_height, 190u);
+  cur.process_bridge_standby_liveness_tx(step_tx(gateway_takeover_action::standby_alive, 180, a), 201);
+  EXPECT_EQ(rec()[0].alive_height, 190u) << "never moves back";
+
+  // Restating the same standby keeps its clock; another gateway's changes are ignored.
+  cur.process_bridge_standby_liveness_tx(descriptor_tx(gw, gateway_descriptor_op_type::update_address, a), 300);
+  EXPECT_EQ(rec()[0].named_height, 100u);
+  cur.process_bridge_standby_liveness_tx(descriptor_tx(rand_pubkey(), gateway_descriptor_op_type::update_address, b), 310);
+  EXPECT_EQ(rec()[0].standby, a);
+
+  // A new standby starts its own clock; a takeover leaves none.
+  cur.process_bridge_standby_liveness_tx(step_tx(gateway_takeover_action::name_standby, 2, b), 400);
+  EXPECT_EQ(rec()[0].standby, b);
+  EXPECT_EQ(rec()[0].last_seen(), 400u);
+  cur.process_bridge_standby_liveness_tx(step_tx(gateway_takeover_action::complete, 450, b), 500);
+  EXPECT_TRUE(rec().empty());
+
+  // A proof for a standby the state lost track of puts it right.
+  cur.process_bridge_standby_liveness_tx(step_tx(gateway_takeover_action::standby_alive, 590, a), 600);
+  ASSERT_EQ(rec().size(), 1u);
+  EXPECT_EQ(rec()[0].standby, a);
+  EXPECT_EQ(rec()[0].last_seen(), 600u);
+
+  // It survives the state's serialization; older states load with none.
+  master_node_list::state_serialized s{};
+  s.version = master_node_list::state_serialized::get_version(hf::hf23_bridge);
+  s.bridge_standby_liveness = rec();
+  master_node_list::state_serialized got{};
+  ASSERT_NO_THROW(serialization::parse_binary(serialization::dump_binary(s), got));
+  ASSERT_EQ(got.bridge_standby_liveness.size(), 1u);
+  EXPECT_EQ(got.bridge_standby_liveness[0].alive_height, 590u);
+  s.version = master_node_list::state_serialized::version_t::version_6_bridge_key_attestation;
+  master_node_list::state_serialized older{};
+  ASSERT_NO_THROW(serialization::parse_binary(serialization::dump_binary(s), older));
+  EXPECT_TRUE(older.bridge_standby_liveness.empty());
 }

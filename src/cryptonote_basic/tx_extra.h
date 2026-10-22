@@ -684,7 +684,12 @@ namespace cryptonote
   //             gateway's standby; started_height carries the gateway's descriptor count, so
   //             it applies to exactly the descriptor it was signed for. On the bridge gateway
   //             the standby must be an attested key (tx_extra_bridge_key_attestation).
-  enum class gateway_takeover_action : uint8_t { begin = 1, complete = 2, cancel = 3, name_standby = 4 };
+  //  - standby_alive (STANDBY signs gateway_standby_alive_message): the standby proves it can
+  //             still sign. started_height is a recent block whose hash the message binds, so
+  //             no proof can be signed in advance; new_owner names the standby proven. Changes
+  //             no gateway state: consensus records when the standby last proved itself, and
+  //             one that stops is replaced (master_node_list's standby liveness).
+  enum class gateway_takeover_action : uint8_t { begin = 1, complete = 2, cancel = 3, name_standby = 4, standby_alive = 5 };
 
   struct tx_extra_gateway_takeover
   {
@@ -694,18 +699,20 @@ namespace cryptonote
     // version >= 1 (standalone):
     uint64_t                started_height = 0;
     gateway_owner_sig_v     sig;
-    gateway_owner_key_v     new_owner; // complete and name_standby only
+    gateway_owner_key_v     new_owner; // complete, name_standby and standby_alive only
 
     BEGIN_SERIALIZE()
       FIELD(version)
       FIELD(gateway_id)
       ENUM_FIELD(action, action == gateway_takeover_action::begin || action == gateway_takeover_action::complete
-                         || action == gateway_takeover_action::cancel || action == gateway_takeover_action::name_standby)
+                         || action == gateway_takeover_action::cancel || action == gateway_takeover_action::name_standby
+                         || action == gateway_takeover_action::standby_alive)
       if (version >= 1)
       {
         VARINT_FIELD(started_height)
         FIELD(sig)
-        if (action == gateway_takeover_action::complete || action == gateway_takeover_action::name_standby)
+        if (action == gateway_takeover_action::complete || action == gateway_takeover_action::name_standby
+            || action == gateway_takeover_action::standby_alive)
           FIELD(new_owner)
       }
     END_SERIALIZE()
