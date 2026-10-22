@@ -3231,6 +3231,34 @@ namespace {
     return res;
   }
 
+  BRIDGE_KEY_ATTESTATION::response wallet_rpc_server::invoke(BRIDGE_KEY_ATTESTATION::request&& req)
+  {
+    require_open();
+    BRIDGE_KEY_ATTESTATION::response res{};
+    cryptonote::tx_extra_bridge_key_attestation att{};
+    att.epoch = req.epoch;
+    att.voter_index = req.voter_index;
+    if (!tools::hex_to_type(req.pgw_vk, att.pgw_vk))
+      throw wallet_rpc_error{error_code::WRONG_KEY, "pgw_vk must be 64-char hex"};
+    if (!tools::hex_to_type(req.pevm_address, att.pevm_address))
+      throw wallet_rpc_error{error_code::WRONG_KEY, "pevm_address must be 40-char hex"};
+    if (!tools::hex_to_type(req.signature, att.signature))
+      throw wallet_rpc_error{error_code::WRONG_SIGNATURE, "signature must be 128-char hex"};
+    tools::wallet2::bridge_rotation_ack_result built = m_wallet->create_bridge_key_attestation_tx(att, req.priority);
+    if (!built.success)
+      throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, built.msg};
+    try
+    {
+      m_wallet->commit_tx(built.ptx, false /*flash*/);
+    }
+    catch (const std::exception& e)
+    {
+      throw wallet_rpc_error{error_code::GENERIC_TRANSFER_ERROR, std::string("Failed to commit the key attestation: ") + e.what()};
+    }
+    res.tx_hash = tools::type_to_hex(cryptonote::get_transaction_hash(built.ptx.tx));
+    return res;
+  }
+
   GATEWAY_TAKEOVER_CANCEL::response wallet_rpc_server::invoke(GATEWAY_TAKEOVER_CANCEL::request&& req)
   {
     require_open();
@@ -3546,13 +3574,16 @@ namespace {
       step.action = cryptonote::gateway_takeover_action::complete;
     else if (req.action == "cancel")
       step.action = cryptonote::gateway_takeover_action::cancel;
+    else if (req.action == "name_standby")
+      step.action = cryptonote::gateway_takeover_action::name_standby;
     else
-      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "action must be one of: begin, complete, cancel"};
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "action must be one of: begin, complete, cancel, name_standby"};
     if (!tools::hex_to_type(req.gateway_id, step.gateway_id))
       throw wallet_rpc_error{error_code::WRONG_ADDRESS, "invalid gateway_id (expected 64-char hex)"};
     step.started_height = req.started_height;
     step.sig = parse_gateway_owner_sig(req.signature_type, req.signature);
-    if (step.action == cryptonote::gateway_takeover_action::complete)
+    if (step.action == cryptonote::gateway_takeover_action::complete
+        || step.action == cryptonote::gateway_takeover_action::name_standby)
       step.new_owner = parse_gateway_owner_key(req.new_owner_key_type, req.new_owner_key);
 
     tools::wallet2::bridge_rotation_ack_result built = m_wallet->create_gateway_takeover_step_tx(step, req.priority);

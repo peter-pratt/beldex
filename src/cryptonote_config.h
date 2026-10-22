@@ -217,6 +217,9 @@ namespace hashkey {
   // ...and the standby's standalone begin and complete.
   inline constexpr std::string_view GW_TAKEOVER_BEGIN    = "gateway_takeover_begin"sv;
   inline constexpr std::string_view GW_TAKEOVER_COMPLETE = "gateway_takeover_complete"sv;
+  inline constexpr std::string_view GW_STANDBY_NAME      = "gateway_standby_name"sv;
+  // A committee member's word that its committee generated a key (tx_extra_bridge_key_attestation).
+  inline constexpr std::string_view BRIDGE_KEY_ATTESTATION = "bridge_key_attestation_v1"sv;
   // Phase F accountability: the bridge-committee slash-report domain. MUST match the
   // off-chain signer's `slash::SLASH_REPORT_DOMAIN` byte-for-byte.
   inline constexpr std::string_view BRIDGE_SLASH    = "bridge_slash_report_v1"sv; // bridge accountability slash report

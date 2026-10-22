@@ -2691,6 +2691,9 @@ namespace cryptonote::rpc {
     struct request_parameters
     {
       std::string gateway_address;
+      // Optional: an eddsa key (hex). The reply then carries `standby_name_message`, what the
+      // owner signs to name it the standby (a standalone name_standby step).
+      std::string standby_owner_key;
     } request;
   };
 
@@ -3080,6 +3083,22 @@ namespace cryptonote::rpc {
     struct request_parameters {} request;
   };
 
+  /// RPC: bridge/bridge_get_standby
+  ///
+  /// What the bridge needs to know about standby keys (HF23):
+  /// - `owner_key` / `owner_epoch` -- the bridge gateway's owner key and the committee epoch
+  ///   attested to have generated it (absent until attested).
+  /// - `committee_epoch` / `committee_overlap` -- the current committee, and how many members
+  ///   it shares with the owner's (absent if the owner is not attested).
+  /// - `overlap_limit` -- the most members a standby's committee may share with the owner's.
+  /// - `attestations` -- every key committees have attested or are attesting:
+  ///   {pgw_vk, pevm_address, epoch, voters, threshold, attested_height, overlap_with_owner}.
+  struct BRIDGE_GET_STANDBY : PUBLIC
+  {
+    static constexpr auto names() { return NAMES("bridge_get_standby"); }
+    struct request_parameters {} request;
+  };
+
   /// RPC: bridge/get_bridge_registration_cmd
   ///
   /// Produce a signed bridge-seat registration blob for THIS masternode (HF23,
@@ -3150,6 +3169,7 @@ namespace cryptonote::rpc {
     GATEWAY_GET_HISTORY,
     BRIDGE_GET_COMMITTEE,
     BRIDGE_GET_SEATS,
+    BRIDGE_GET_STANDBY,
     GET_BRIDGE_REGISTRATION_CMD,
     GET_BRIDGE_UNBOND_CMD,
     BANNED,

@@ -2220,6 +2220,34 @@ BELDEX_RPC_DOC_INTROSPECT
   };
 
   BELDEX_RPC_DOC_INTROSPECT
+  // Submit one committee member's attestation that its committee (epoch) generated a key
+  // (HF23). Consensus records the key as attested once the epoch's threshold have. This
+  // wallet only pays the fee; bridge signers call it for keys they hold.
+  struct BRIDGE_KEY_ATTESTATION : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("bridge_key_attestation"); }
+
+    struct request
+    {
+      uint64_t    epoch;         // The committee epoch that generated the key.
+      std::string pgw_vk;        // Its gateway (Pgw) group key, hex.
+      std::string pevm_address;  // Its wBDX (Pevm) address, hex (no 0x).
+      uint16_t    voter_index;   // The member's index in that committee.
+      std::string signature;     // The member's ed25519 signature, hex.
+      uint32_t    priority;      // (Optional) Transaction priority (flash not allowed).
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response
+    {
+      std::string tx_hash;
+
+      KV_MAP_SERIALIZABLE
+    };
+  };
+
+  BELDEX_RPC_DOC_INTROSPECT
   // Submit a standalone gateway takeover step (HF23): the standby's `begin` or `complete`, or
   // the owner's `cancel`. The signer signs the matching message from the daemon's
   // get_gateway_info (takeover_begin_message with started_height = takeover_steps,
@@ -2232,7 +2260,7 @@ BELDEX_RPC_DOC_INTROSPECT
     struct request
     {
       std::string gateway_id;          // The gateway, 64-char hex.
-      std::string action;              // "begin", "complete" or "cancel".
+      std::string action;              // "begin", "complete", "cancel" or "name_standby".
       uint64_t    started_height;      // begin: takeover_steps; complete/cancel: the takeover's start height.
       std::string signature;           // Signature over the step's message, hex.
       std::string signature_type;      // "eddsa" (bridge committee), "schnorr" or "eth".
@@ -2926,6 +2954,7 @@ This command is only required if the open wallet is one of the owners of a BNS r
     BRIDGE_ROTATION_ACK,
     GATEWAY_TAKEOVER_CANCEL,
     GATEWAY_TAKEOVER_STEP,
+    BRIDGE_KEY_ATTESTATION,
     REQUEST_STAKE_UNLOCK,
     CAN_REQUEST_STAKE_UNLOCK,
     VALIDATE_ADDRESS,

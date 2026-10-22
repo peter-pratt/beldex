@@ -3501,6 +3501,67 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
     }
   }
 
+  // HF23: a key attestation is one committee member's signature; verify it against that
+  // epoch's committee now, and refuse a member's second one, so neither relays.
+  if (hf_version >= hf::hf23_bridge && tx.type == txtype::bridge_registration)
+  {
+    tx_extra_bridge_key_attestation att{};
+    if (cryptonote::get_field_from_tx_extra(tx.extra, att))
+    {
+      const uint64_t epoch_height = att.epoch * bridge_epoch_blocks(m_nettype);
+      std::vector<crypto::public_key> members;
+      std::vector<crypto::ed25519_public_key> signer_keys;
+      size_t threshold = 0;
+      std::string att_reason;
+      if (!m_master_node_list.get_bridge_committee(epoch_height, members, signer_keys, threshold))
+        att_reason = "no bridge committee for epoch " + std::to_string(att.epoch);
+      else if (!cryptonote::verify_bridge_key_attestation(att, signer_keys, m_nettype, att_reason))
+        { /* reason set by the verifier */ }
+      else if (m_master_node_list.has_bridge_key_attestation_vote(att))
+        att_reason = "this member's attestation of that key is already recorded";
+      if (!att_reason.empty())
+      {
+        MERROR_VER("Bridge key attestation failed for tx " << get_transaction_hash(tx) << ": " << att_reason);
+        tvc.m_verbose_error = std::move(att_reason);
+        tvc.m_verifivation_failed = true;
+        return false;
+      }
+    }
+  }
+
+  // HF23: the bridge gateway may name only a standby whose committee is known and shares at
+  // most size - threshold members with the owner's (master_node_list::check_standby_naming),
+  // however it names it: by a descriptor update or by a standalone owner-signed step.
+  if (hf_version >= hf::hf23_bridge)
+  {
+    std::optional<std::pair<crypto::public_key, gateway_owner_key_v>> named;
+    tx_extra_gateway_descriptor_operation op{};
+    if (cryptonote::get_field_from_tx_extra(tx.extra, op) && op.op_type == gateway_descriptor_op_type::update_address
+        && op.descriptor.has_standby)
+      named.emplace(op.address_id, op.descriptor.standby_owner);
+    tx_extra_gateway_takeover step{};
+    if (cryptonote::get_field_from_tx_extra(tx.extra, step) && step.version >= 1
+        && step.action == gateway_takeover_action::name_standby)
+      named.emplace(step.gateway_id, step.new_owner);
+    if (named && m_master_node_list.is_bridge_gateway(named->first))
+    {
+      gateway_account_data acct;
+      std::string name_reason;
+      if (load_gateway_account(*m_db, named->first, acct) && !acct.descriptor_history.empty())
+      {
+        const auto& cur = acct.latest_descriptor();
+        const bool already = cur.has_standby && cur.standby_owner == named->second;
+        if (!already && !m_master_node_list.check_standby_naming(cur.owner_key, named->second, name_reason))
+        {
+          MERROR_VER("Bridge gateway standby refused for tx " << get_transaction_hash(tx) << ": " << name_reason);
+          tvc.m_verbose_error = std::move(name_reason);
+          tvc.m_verifivation_failed = true;
+          return false;
+        }
+      }
+    }
+  }
+
   if (tx.is_transfer())
   {
     // A tx whose outputs are ALL gateway deposits (e.g. an exchange sweep) needs

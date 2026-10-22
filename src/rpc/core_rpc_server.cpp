@@ -826,6 +826,14 @@ namespace cryptonote::rpc {
         json_binary_proxy{ack["new_signer"], format} =
             std::string_view{reinterpret_cast<const char*>(x.new_signer.data()), x.new_signer.size()};
       }
+      void operator()(const tx_extra_bridge_key_attestation& x) {
+        set("bridge_key_attestation", json{
+            {"epoch", x.epoch},
+            {"pgw_vk", tools::type_to_hex(x.pgw_vk)},
+            {"pevm_address", tools::type_to_hex(x.pevm_address)},
+            {"voter_index", x.voter_index},
+        });
+      }
       void operator()(const tx_extra_gateway_takeover& x) {
         json j{
             {"version", x.version},
@@ -3786,6 +3794,17 @@ namespace cryptonote::rpc {
       // The standby's standalone steps (version-1 takeover markers): how many takeover steps
       // the gateway has recorded (a begin must name it), and the exact messages to sign.
       cmd.response["takeover_steps"] = acct.takeover_log.size();
+      // A standalone name_standby step names this descriptor count; with a key asked for,
+      // the exact message the owner signs to name it.
+      cmd.response["standby_name_nonce"] = acct.descriptor_history.size();
+      if (!cmd.request.standby_owner_key.empty())
+      {
+        crypto::eddsa_public_key k{};
+        if (!tools::hex_to_type(cmd.request.standby_owner_key, k))
+          throw rpc_error{ERROR_WRONG_PARAM, "invalid standby_owner_key (expected 64-char hex eddsa key)"};
+        cmd.response["standby_name_message"] = tools::type_to_hex(cryptonote::gateway_standby_name_message(
+            m_core.get_nettype(), gw_id, acct.descriptor_history.size(), cryptonote::gateway_owner_key_v{k}));
+      }
       if (d.has_standby && !started)
         cmd.response["takeover_begin_message"] = tools::type_to_hex(cryptonote::gateway_takeover_begin_message(
             m_core.get_nettype(), gw_id, d, acct.takeover_log.size()));
@@ -4406,6 +4425,60 @@ namespace cryptonote::rpc {
   }
 
   //------------------------------------------------------------------------------------------------------------------------------
+  void core_rpc_server::invoke(BRIDGE_GET_STANDBY& cmd, rpc_context context)
+  {
+    const auto nettype = m_core.get_nettype();
+    const auto& mnl = m_core.get_master_node_list();
+    std::optional<uint64_t> owner_epoch;
+    // The bridge gateway's owner: the tracked gateway's latest descriptor.
+    for (const auto& g : mnl.get_bridge_gateway_owners())
+    {
+      cryptonote::gateway_account_data acct;
+      if (!cryptonote::load_gateway_account(m_core.get_blockchain_storage().get_db(), g.gateway_id, acct)
+          || acct.descriptor_history.empty())
+        continue;
+      const auto& d = acct.latest_descriptor();
+      cmd.response["gateway_id"] = tools::type_to_hex(g.gateway_id);
+      if (const auto* vk = std::get_if<crypto::eddsa_public_key>(&d.owner_key))
+      {
+        cmd.response["owner_key"] = tools::type_to_hex(*vk);
+        if (auto r = mnl.attested_bridge_key(*vk))
+        {
+          owner_epoch = r->epoch;
+          cmd.response["owner_epoch"] = r->epoch;
+        }
+      }
+      if (d.has_standby)
+        if (const auto* vk = std::get_if<crypto::eddsa_public_key>(&d.standby_owner))
+          cmd.response["standby_key"] = tools::type_to_hex(*vk);
+    }
+    const uint64_t epoch_blocks = cryptonote::bridge_epoch_blocks(nettype);
+    const uint64_t top = m_core.get_current_blockchain_height();
+    const uint64_t committee_epoch = epoch_blocks && top ? (top - 1) / epoch_blocks : 0;
+    cmd.response["committee_epoch"] = committee_epoch;
+    if (owner_epoch)
+      if (auto shared = mnl.bridge_committee_overlap(*owner_epoch, committee_epoch))
+        cmd.response["committee_overlap"] = *shared;
+    cmd.response["overlap_limit"] =
+        cryptonote::bridge_committee_size(nettype) - cryptonote::bridge_committee_threshold(nettype);
+    cmd.response["threshold"] = cryptonote::bridge_committee_threshold(nettype);
+    auto list = json::array();
+    for (const auto& r : mnl.get_bridge_key_attestations())
+    {
+      json j{{"pgw_vk", tools::type_to_hex(r.pgw_vk)},
+             {"pevm_address", tools::type_to_hex(r.pevm_address)},
+             {"epoch", r.epoch},
+             {"voters", r.voters},
+             {"attested_height", r.attested_height}};
+      if (owner_epoch)
+        if (auto shared = mnl.bridge_committee_overlap(*owner_epoch, r.epoch))
+          j["overlap_with_owner"] = *shared;
+      list.push_back(std::move(j));
+    }
+    cmd.response["attestations"] = std::move(list);
+    cmd.response["status"] = STATUS_OK;
+  }
+
   void core_rpc_server::invoke(BRIDGE_GET_SEATS& cmd, rpc_context context)
   {
     auto infos = m_core.get_master_node_list_state({});

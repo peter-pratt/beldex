@@ -338,6 +338,62 @@ crypto::hash gateway_takeover_begin_message(network_type nettype, const crypto::
   return gateway_governance_message(hashkey::GW_TAKEOVER_BEGIN, nettype, fields);
 }
 
+crypto::hash gateway_standby_name_message(network_type nettype, const crypto::public_key& gateway_id,
+                                          uint64_t descriptor_count, const gateway_owner_key_v& standby)
+{
+  std::string fields;
+  fields.append(reinterpret_cast<const char*>(&gateway_id), sizeof(gateway_id));
+  append_u64_le(fields, descriptor_count);
+  fields.push_back(static_cast<char>(standby.index()));
+  std::visit([&fields](const auto& k) { fields.append(reinterpret_cast<const char*>(&k), sizeof(k)); }, standby);
+  return gateway_governance_message(hashkey::GW_STANDBY_NAME, nettype, fields);
+}
+
+std::string bridge_key_attestation_message(network_type nettype, const tx_extra_bridge_key_attestation& att)
+{
+  // DOMAIN || genesis(32) || version(u8) || epoch(u64 LE) || pgw_vk(32) || pevm_address(20).
+  // The voter is not in it: every member signs the same statement.
+  const crypto::hash& genesis = gateway_chain_binding(nettype);
+  std::string buf;
+  buf.append(hashkey::BRIDGE_KEY_ATTESTATION);
+  buf.append(reinterpret_cast<const char*>(&genesis), sizeof(genesis));
+  buf.push_back(static_cast<char>(att.version));
+  append_u64_le(buf, att.epoch);
+  buf.append(reinterpret_cast<const char*>(att.pgw_vk.data), sizeof(att.pgw_vk.data));
+  buf.append(reinterpret_cast<const char*>(att.pevm_address.data), sizeof(att.pevm_address.data));
+  return buf;
+}
+
+bool verify_bridge_key_attestation(const tx_extra_bridge_key_attestation& att,
+                                   const std::vector<crypto::ed25519_public_key>& signer_keys,
+                                   network_type nettype, std::string& reason)
+{
+  if (att.version != 0)
+  {
+    reason = "unknown key attestation version";
+    return false;
+  }
+  if (att.voter_index >= signer_keys.size() || signer_keys[att.voter_index] == crypto::ed25519_public_key::null())
+  {
+    reason = "key attestation voter " + std::to_string(att.voter_index) + " is not a member of committee epoch "
+             + std::to_string(att.epoch);
+    return false;
+  }
+  if (!att.pgw_vk || !att.pevm_address)
+  {
+    reason = "key attestation names an empty key";
+    return false;
+  }
+  const std::string msg = bridge_key_attestation_message(nettype, att);
+  if (crypto_sign_verify_detached(att.signature.data, reinterpret_cast<const unsigned char*>(msg.data()), msg.size(),
+                                  signer_keys[att.voter_index].data) != 0)
+  {
+    reason = "key attestation signature does not verify for voter " + std::to_string(att.voter_index);
+    return false;
+  }
+  return true;
+}
+
 crypto::hash gateway_takeover_complete_message(network_type nettype, const crypto::public_key& gateway_id,
                                                uint64_t started_height)
 {
@@ -1721,6 +1777,43 @@ bool validate_gateway_takeover_step(BlockchainDB& db, network_type nettype,
       }
       return true;
     }
+    case gateway_takeover_action::name_standby:
+    {
+      if (acct.frozen)
+      {
+        reason = "gateway is frozen; naming a standby rejected";
+        return false;
+      }
+      if (started != 0)
+      {
+        reason = "a takeover of this gateway is running; it must end before a standby is named";
+        return false;
+      }
+      if (t.started_height != acct.descriptor_history.size())
+      {
+        reason = "standby name is for descriptor " + std::to_string(t.started_height) + ", the gateway has "
+                 + std::to_string(acct.descriptor_history.size());
+        return false;
+      }
+      if (!is_valid_gateway_owner_key(t.new_owner) || t.new_owner == current.owner_key)
+      {
+        reason = "a gateway's standby owner must be a valid key that differs from its owner";
+        return false;
+      }
+      gateway_descriptor_base next = current;
+      next.version = 2;
+      next.has_standby = 1;
+      next.standby_owner = t.new_owner;
+      if (!standby_is_fresh(acct, next, reason))
+        return false;
+      if (!verify_gateway_owner_signature(current.owner_key, t.sig,
+            gateway_standby_name_message(nettype, t.gateway_id, t.started_height, t.new_owner)))
+      {
+        reason = "standby name is not signed by the gateway's owner";
+        return false;
+      }
+      return true;
+    }
   }
   reason = "unknown takeover step";
   return false;
@@ -2272,6 +2365,19 @@ namespace
             else
               continue;
             break;
+          case gateway_takeover_action::name_standby:
+          {
+            // Bound to the descriptor count it was signed for: a second copy finds the
+            // count moved on and changes nothing.
+            if (started != 0 || acct.descriptor_history.size() != t.started_height)
+              continue;
+            gateway_descriptor_base next = acct.latest_descriptor();
+            next.version = 2;
+            next.has_standby = 1;
+            next.standby_owner = t.new_owner;
+            acct.descriptor_history.push_back(next);
+            continue; // no takeover-log entry, and the account version is unchanged
+          }
         }
         if (acct.version < 3) acct.version = 3;
       }
@@ -2473,6 +2579,14 @@ bool rewind_gateways_from_transactions(BlockchainDB& db, const std::vector<trans
         continue;
       bool ok = false;
       gateway_account_data& acct = get(t.gateway_id, ok);
+      if (ok && t.action == gateway_takeover_action::name_standby)
+      {
+        // It appended exactly one descriptor, the one after started_height, if it applied.
+        if (acct.descriptor_history.size() == t.started_height + 1 && acct.latest_descriptor().has_standby
+            && acct.latest_descriptor().standby_owner == t.new_owner)
+          acct.descriptor_history.pop_back();
+        continue;
+      }
       if (ok && !acct.takeover_log.empty() && acct.takeover_log.back().tx == tx_hash)
       {
         acct.takeover_log.pop_back();

@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <optional>
 #include <chrono>
 #include <functional>
 #include <limits>
@@ -282,6 +283,38 @@ namespace master_nodes
       VARINT_FIELD(unlock_height)
     END_SERIALIZE()
   };
+
+  // HF23: a key some committee says it generated (tx_extra_bridge_key_attestation), with
+  // the distinct members who have said so. Attested once the epoch's threshold have.
+  struct bridge_key_attestation_record
+  {
+    crypto::eddsa_public_key pgw_vk{};
+    crypto::eth_address      pevm_address{};
+    uint64_t                 epoch = 0;
+    std::vector<uint32_t>    voters;
+    uint64_t                 attested_height = 0; // 0 until `threshold` members attested
+
+    BEGIN_SERIALIZE_OBJECT()
+      FIELD(pgw_vk)
+      FIELD(pevm_address)
+      VARINT_FIELD(epoch)
+      FIELD(voters)
+      VARINT_FIELD(attested_height)
+    END_SERIALIZE()
+  };
+
+  // The record of the committee that holds gateway key `pgw_vk`: the first to have attested it.
+  std::optional<bridge_key_attestation_record> find_attested_bridge_key(const std::vector<bridge_key_attestation_record>& records,
+                                                                        const crypto::eddsa_public_key& pgw_vk);
+  // The standby-naming rule over attestation `records`: owner and standby are attested keys
+  // whose committees (`overlap` gives how many members two epochs' committees share, or
+  // nullopt if unknown) share at most size - threshold members.
+  bool check_bridge_standby_naming(const std::vector<bridge_key_attestation_record>& records,
+                                   const cryptonote::gateway_owner_key_v& owner,
+                                   const cryptonote::gateway_owner_key_v& standby,
+                                   cryptonote::network_type nettype,
+                                   const std::function<std::optional<size_t>(uint64_t, uint64_t)>& overlap,
+                                   std::string& reason);
 
   struct master_node_info // registration information
   {
@@ -612,6 +645,32 @@ namespace master_nodes
       std::lock_guard lock{m_mn_mutex};
       return m_state.bridge_departed_bonds;
     }
+    /// HF23: THE bridge gateway (at most one entry) and its last seen owner.
+    std::vector<bridge_gateway_owner> get_bridge_gateway_owners() const
+    {
+      std::lock_guard lock{m_mn_mutex};
+      return m_state.bridge_gateway_owners;
+    }
+    /// HF23: keys committees have attested to generating (attested or still collecting).
+    std::vector<bridge_key_attestation_record> get_bridge_key_attestations() const
+    {
+      std::lock_guard lock{m_mn_mutex};
+      return m_state.bridge_key_attestations;
+    }
+    /// HF23: whether this member's attestation of this key is already recorded.
+    bool has_bridge_key_attestation_vote(const cryptonote::tx_extra_bridge_key_attestation& att) const;
+    /// HF23: the attested record of a gateway (Pgw) key, if a committee has attested it.
+    std::optional<bridge_key_attestation_record> attested_bridge_key(const crypto::eddsa_public_key& pgw_vk) const;
+    /// HF23: whether `gateway_id` is THE bridge gateway (whose owner changes are hand-overs).
+    bool is_bridge_gateway(const crypto::public_key& gateway_id) const;
+    /// HF23: may the bridge gateway, owned by `owner`, name `standby`? Both must be attested
+    /// keys, and their committees may share at most size - threshold members: then losing
+    /// enough of the live key's holders to silence it can never also silence the standby.
+    bool check_standby_naming(const cryptonote::gateway_owner_key_v& owner,
+                              const cryptonote::gateway_owner_key_v& standby, std::string& reason) const;
+    /// The members two attested committees share, or nullopt if either epoch's committee is
+    /// unknown.
+    std::optional<size_t> bridge_committee_overlap(uint64_t epoch_a, uint64_t epoch_b) const;
     /// Whether a rotation ack (whose signatures have already been verified) may advance the
     /// current state: see state_t::check_bridge_rotation_ack.
     bool check_bridge_rotation_ack(const cryptonote::tx_extra_bridge_rotation_ack& ack, std::string& reason) const;
@@ -803,8 +862,8 @@ namespace master_nodes
 
     struct state_serialized
     {
-      enum struct version_t : uint8_t { version_0, version_1_serialize_hash, version_2_bridge_rotation, version_3_bridge_gateway_owner, version_4_bridge_chain_contract, version_5_bridge_departed_bond, count, };
-      static version_t get_version(cryptonote::hf /*hf_version*/) { return version_t::version_5_bridge_departed_bond; }
+      enum struct version_t : uint8_t { version_0, version_1_serialize_hash, version_2_bridge_rotation, version_3_bridge_gateway_owner, version_4_bridge_chain_contract, version_5_bridge_departed_bond, version_6_bridge_key_attestation, count, };
+      static version_t get_version(cryptonote::hf /*hf_version*/) { return version_t::version_6_bridge_key_attestation; }
 
       version_t                              version;
       uint64_t                               height;
@@ -817,6 +876,7 @@ namespace master_nodes
       std::vector<bridge_gateway_owner>      bridge_gateway_owners; // HF23: gateway hand-over
       std::vector<bridge_chain_contract>     bridge_chain_contracts; // HF23: rotation-ack binding
       std::vector<bridge_departed_bond>      bridge_departed_bonds; // HF23: deregistered key holders' bonds
+      std::vector<bridge_key_attestation_record> bridge_key_attestations; // HF23: who generated which key
 
       BEGIN_SERIALIZE()
         ENUM_FIELD(version, version < version_t::count)
@@ -836,6 +896,8 @@ namespace master_nodes
           FIELD(bridge_chain_contracts);
         if (version >= version_t::version_5_bridge_departed_bond)
           FIELD(bridge_departed_bonds);
+        if (version >= version_t::version_6_bridge_key_attestation)
+          FIELD(bridge_key_attestations);
       END_SERIALIZE()
     };
 
@@ -881,6 +943,8 @@ namespace master_nodes
       // Bonds of seats deregistered while they could still hold a live key share, held
       // until those keys are retired (see bridge_departed_bond).
       std::vector<bridge_departed_bond>      bridge_departed_bonds;
+      // Keys committees have attested to generating (tx_extra_bridge_key_attestation).
+      std::vector<bridge_key_attestation_record> bridge_key_attestations;
       master_node_list*                     mn_list;
 
       state_t(master_node_list* mnl) : mn_list{mnl} {}
@@ -940,6 +1004,9 @@ namespace master_nodes
                                      cryptonote::network_type nettype, std::string& reason) const;
       // Returns true if the bridge gateway's owner key changed (the gateway was handed to a
       // new key), which advances observed_key_epoch for BRIDGE_GATEWAY_CHAIN_ID (HF23).
+      bool process_bridge_key_attestation_tx(cryptonote::network_type nettype, const cryptonote::block& block,
+                                             const cryptonote::transaction& tx,
+                                             const bridge_committee_resolver& resolve_committee);
       bool process_bridge_gateway_owner_tx(cryptonote::network_type nettype, const cryptonote::transaction& tx);
       // Release (clear) any bridge seat whose bond unlock height has been reached.
       void finalize_bridge_unbonds(uint64_t block_height);

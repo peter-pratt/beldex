@@ -380,8 +380,11 @@ namespace cryptonote::rpc {
   }
 
   void parse_request(GET_GATEWAY_INFO& c, rpc_input in) {
-    get_values(in, "gateway_address", required{c.request.gateway_address});
+    get_values(in, "gateway_address", required{c.request.gateway_address},
+                   "standby_owner_key", c.request.standby_owner_key);
   }
+
+  void parse_request(BRIDGE_GET_STANDBY&, rpc_input) {}
 
   void parse_request(GET_ALL_GATEWAYS& c, rpc_input in) {
     get_values(in,

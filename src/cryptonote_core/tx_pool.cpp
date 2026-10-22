@@ -225,18 +225,20 @@ namespace cryptonote
       //   * registration / unbond — operator-driven, keyed by the master node pubkey;
       //   * slash (Phase F)        — committee-driven, keyed by (epoch, accused_index);
       //   * rotation-ack (H.6.3)   — committee-driven, keyed by (chain_id, key_epoch);
-      //   * takeover step          — a gateway committee's, keyed by (gateway, step, height).
+      //   * takeover step          — a gateway committee's, keyed by (gateway, step, height);
+      //   * key attestation        — one committee member's, keyed by (key, epoch, member).
       // The committee-driven ops are not signed by any operator, and any committee member
       // may submit them — so they are keyed by their subject, not a pubkey.
       //
       // Dedupe so at most one pending bridge op per subject sits in the pool.
-      enum class bridge_kind { op_pubkey, slash, rotation, takeover };
+      enum class bridge_kind { op_pubkey, slash, rotation, takeover, attestation };
       struct bridge_key {
         bridge_kind kind;
         crypto::public_key            mn_pubkey{};
         std::pair<uint64_t, uint16_t> slash_key{};
         std::pair<uint64_t, uint64_t> rot_key{};
         std::tuple<crypto::public_key, uint8_t, uint64_t> takeover_key{};
+        std::pair<crypto::public_key, uint64_t> attestation_key{}; // (key, epoch << 16 | voter)
       };
       auto bridge_op_key = [](const transaction& t, bridge_key& k) -> bool {
         tx_extra_bridge_rotation_ack rot{};
@@ -246,6 +248,14 @@ namespace cryptonote
         tx_extra_gateway_takeover    takeover{};
         if (cryptonote::get_field_from_tx_extra(t.extra, takeover) && takeover.version >= 1)
         { k.kind = bridge_kind::takeover; k.takeover_key = {takeover.gateway_id, static_cast<uint8_t>(takeover.action), takeover.started_height}; return true; }
+        tx_extra_bridge_key_attestation att{};
+        if (cryptonote::get_field_from_tx_extra(t.extra, att))
+        {
+          k.kind = bridge_kind::attestation;
+          std::memcpy(k.attestation_key.first.data, att.pgw_vk.data, sizeof(att.pgw_vk.data));
+          k.attestation_key.second = (att.epoch << 16) | att.voter_index;
+          return true;
+        }
         if (cryptonote::get_field_from_tx_extra(t.extra, rot))
         { k.kind = bridge_kind::rotation; k.rot_key = {rot.chain_id, rot.key_epoch}; return true; }
         if (cryptonote::get_field_from_tx_extra(t.extra, slash))
@@ -284,6 +294,7 @@ namespace cryptonote
           case bridge_kind::slash:     same_subject = pool_key.slash_key == key.slash_key; break;
           case bridge_kind::rotation:  same_subject = pool_key.rot_key   == key.rot_key;   break;
           case bridge_kind::takeover:  same_subject = pool_key.takeover_key == key.takeover_key; break;
+          case bridge_kind::attestation: same_subject = pool_key.attestation_key == key.attestation_key; break;
         }
         if (same_subject)
         {

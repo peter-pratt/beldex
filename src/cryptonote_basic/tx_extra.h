@@ -73,6 +73,7 @@ constexpr uint8_t
   TX_EXTRA_TAG_BRIDGE_ROTATION_ACK          = 0x83, // HF23 (H.6.3 rotation observation)
   TX_EXTRA_TAG_GATEWAY_RELEASE_REF          = 0x84, // HF23 (release replay guard, §6a)
   TX_EXTRA_TAG_GATEWAY_TAKEOVER             = 0x85, // HF23 (standby owner takeover)
+  TX_EXTRA_TAG_BRIDGE_KEY_ATTESTATION       = 0x86, // HF23 (which committee generated a key)
   TX_EXTRA_TAG_SECURITY_SIGNATURE          = 0x88,
   TX_EXTRA_MYSTERIOUS_MINERGATE_TAG       = 0xDE;
 
@@ -679,7 +680,11 @@ namespace cryptonote
   //             the takeover; new_owner must be the standby, and becomes the owner.
   //  - cancel   (OWNER signs gateway_takeover_cancel_message): ends the takeover that
   //             began at started_height.
-  enum class gateway_takeover_action : uint8_t { begin = 1, complete = 2, cancel = 3 };
+  //  - name_standby (OWNER signs gateway_standby_name_message): names new_owner as the
+  //             gateway's standby; started_height carries the gateway's descriptor count, so
+  //             it applies to exactly the descriptor it was signed for. On the bridge gateway
+  //             the standby must be an attested key (tx_extra_bridge_key_attestation).
+  enum class gateway_takeover_action : uint8_t { begin = 1, complete = 2, cancel = 3, name_standby = 4 };
 
   struct tx_extra_gateway_takeover
   {
@@ -689,18 +694,18 @@ namespace cryptonote
     // version >= 1 (standalone):
     uint64_t                started_height = 0;
     gateway_owner_sig_v     sig;
-    gateway_owner_key_v     new_owner; // complete only
+    gateway_owner_key_v     new_owner; // complete and name_standby only
 
     BEGIN_SERIALIZE()
       FIELD(version)
       FIELD(gateway_id)
       ENUM_FIELD(action, action == gateway_takeover_action::begin || action == gateway_takeover_action::complete
-                         || action == gateway_takeover_action::cancel)
+                         || action == gateway_takeover_action::cancel || action == gateway_takeover_action::name_standby)
       if (version >= 1)
       {
         VARINT_FIELD(started_height)
         FIELD(sig)
-        if (action == gateway_takeover_action::complete)
+        if (action == gateway_takeover_action::complete || action == gateway_takeover_action::name_standby)
           FIELD(new_owner)
       }
     END_SERIALIZE()
@@ -858,6 +863,31 @@ namespace cryptonote
   // epoch's committee. The signature is over the canonical, genesis-bound rotation-ack
   // message (see `bridge_rotation_ack_message` in gateway_utils) — the same bytes the
   // off-chain signer produced (`rotation_ack.rs`).
+  // Key attestation (HF23). One member of the committee that ran a DKG says, under its
+  // bridge-seat signer key, "committee epoch `epoch` generated this gateway key and this wBDX
+  // address". Each member submits its own; consensus counts distinct members and records
+  // the key as attested once the epoch's threshold have. That is how consensus learns which
+  // committee holds a key: the live owner's, to compare a standby's committee against, and
+  // a standby's, which must not share too many members with it.
+  struct tx_extra_bridge_key_attestation
+  {
+    uint8_t                   version = 0;
+    uint64_t                  epoch = 0;        // the committee epoch that ran the DKG
+    crypto::eddsa_public_key  pgw_vk{};         // its gateway (Pgw) group key
+    crypto::eth_address       pevm_address{};   // its wBDX (Pevm) signer address
+    uint16_t                  voter_index = 0;  // this member's index in that committee
+    crypto::ed25519_signature signature{};      // over bridge_key_attestation_message
+
+    BEGIN_SERIALIZE()
+      FIELD(version)
+      VARINT_FIELD(epoch)
+      FIELD(pgw_vk)
+      FIELD(pevm_address)
+      VARINT_FIELD(voter_index)
+      FIELD(signature)
+    END_SERIALIZE()
+  };
+
   struct bridge_rotation_signature
   {
     uint16_t                  voter_index = 0;
@@ -1017,6 +1047,7 @@ namespace cryptonote
       tx_extra_gateway_repoint,
       tx_extra_gateway_release_ref,
       tx_extra_gateway_takeover,
+      tx_extra_bridge_key_attestation,
       tx_extra_bridge_registration,
       tx_extra_bridge_unbond,
       tx_extra_bridge_slash,
@@ -1053,6 +1084,7 @@ BINARY_VARIANT_TAG(cryptonote::tx_extra_gateway_freeze,               cryptonote
 BINARY_VARIANT_TAG(cryptonote::tx_extra_gateway_repoint,              cryptonote::TX_EXTRA_TAG_GATEWAY_REPOINT);
 BINARY_VARIANT_TAG(cryptonote::tx_extra_gateway_release_ref,          cryptonote::TX_EXTRA_TAG_GATEWAY_RELEASE_REF);
 BINARY_VARIANT_TAG(cryptonote::tx_extra_gateway_takeover,             cryptonote::TX_EXTRA_TAG_GATEWAY_TAKEOVER);
+BINARY_VARIANT_TAG(cryptonote::tx_extra_bridge_key_attestation,       cryptonote::TX_EXTRA_TAG_BRIDGE_KEY_ATTESTATION);
 BINARY_VARIANT_TAG(cryptonote::tx_extra_bridge_registration,          cryptonote::TX_EXTRA_TAG_BRIDGE_REGISTRATION);
 BINARY_VARIANT_TAG(cryptonote::tx_extra_bridge_unbond,                cryptonote::TX_EXTRA_TAG_BRIDGE_UNBOND);
 BINARY_VARIANT_TAG(cryptonote::tx_extra_bridge_slash,                 cryptonote::TX_EXTRA_TAG_BRIDGE_SLASH);

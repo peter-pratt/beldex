@@ -32,6 +32,7 @@
 #include "cryptonote_core/uptime_proof.h"          // complete uptime_proof::Proof for master_node_info's proof dtor
 #include "cryptonote_config.h"
 #include "crypto/crypto.h"
+#include "crypto/eddsa_signature.h"
 
 #include <limits>
 #include <memory>
@@ -2677,4 +2678,227 @@ TEST(GatewayBridgeRotation, a_standalone_takeover_complete_counts_as_a_hand_over
   EXPECT_EQ(observed_epoch(cur, BRIDGE_GATEWAY_CHAIN_ID), 1u);
   EXPECT_FALSE(cur.process_bridge_gateway_owner_tx(NET_FC, complete)) << "a second copy counts nothing";
   EXPECT_EQ(observed_epoch(cur, BRIDGE_GATEWAY_CHAIN_ID), 1u);
+}
+
+// The owner names its next standby with a standalone step, signed over the gateway and its
+// descriptor count, so the live committee signs it from chain state alone.
+TEST(GatewayStandbyTakeover, the_owner_names_a_standby_with_a_standalone_step)
+{
+  MemGatewayDB db;
+  const OwnerKeys owner = new_owner_keys(), standby = new_owner_keys(), fresh = new_owner_keys();
+  const crypto::public_key gw = seed_with_standby(db, owner, standby);
+  const std::string before = blob_of(gw, db);
+  std::string reason;
+  db.chain_height = 1100;
+  auto name = [&](uint64_t count, const OwnerKeys& signer, const crypto::public_key& who) {
+    return standalone_step(gw, gateway_takeover_action::name_standby, count,
+                           gateway_standby_name_message(NET_TO, gw, count, who), signer, who);
+  };
+
+  // Only the owner, for the gateway's current descriptor count, and never the owner itself.
+  EXPECT_FALSE(tx_valid(db, name(1, standby, fresh.pub), reason));
+  EXPECT_NE(reason.find("not signed by the gateway's owner"), std::string::npos) << reason;
+  EXPECT_FALSE(tx_valid(db, name(0, owner, fresh.pub), reason));
+  EXPECT_NE(reason.find("the gateway has 1"), std::string::npos) << reason;
+  EXPECT_FALSE(tx_valid(db, name(1, owner, owner.pub), reason));
+  EXPECT_NE(reason.find("differs from its owner"), std::string::npos) << reason;
+
+  // Two wallets carry the same naming into one block: the first applies, the second finds
+  // the count moved on.
+  const auto named = name(1, owner, fresh.pub);
+  ASSERT_TRUE(tx_valid(db, named, reason)) << reason;
+  auto copy = named;
+  copy.vin.front() = txin_gen{1};
+  ASSERT_TRUE(append_gateways_from_transactions(db, {named, copy}, 1100, true, &reason)) << reason;
+  gateway_account_data a;
+  ASSERT_TRUE(load_gateway_account(db, gw, a));
+  EXPECT_EQ(a.descriptor_history.size(), 2u);
+  EXPECT_TRUE(a.latest_descriptor().standby_owner == gateway_owner_key_v{fresh.pub});
+  EXPECT_TRUE(a.latest_descriptor().owner_key == gateway_owner_key_v{owner.pub});
+  EXPECT_TRUE(a.latest_descriptor().is_bridge_reserve());
+  db.chain_height = 1101;
+  EXPECT_FALSE(tx_valid(db, named, reason)) << "spent: the count moved on";
+
+  // The old standby can no longer begin; the new one can, and once it runs no standby is named.
+  EXPECT_FALSE(tx_valid(db, standalone_step(gw, gateway_takeover_action::begin, 0,
+      gateway_takeover_begin_message(NET_TO, gw, current(db, gw), 0), standby), reason));
+  const auto begin = standalone_step(gw, gateway_takeover_action::begin, 0,
+      gateway_takeover_begin_message(NET_TO, gw, current(db, gw), 0), fresh);
+  ASSERT_TRUE(tx_valid(db, begin, reason)) << reason;
+  ASSERT_TRUE(append_gateways_from_transactions(db, {begin}, 1101, true, &reason)) << reason;
+  db.chain_height = 1102;
+  EXPECT_FALSE(tx_valid(db, name(2, owner, new_owner_keys().pub), reason));
+  EXPECT_NE(reason.find("takeover of this gateway is running"), std::string::npos) << reason;
+
+  // A reorg undoes it all, byte for byte.
+  ASSERT_TRUE(rewind_gateways_from_transactions(db, {begin}, 1101, true, &reason)) << reason;
+  ASSERT_TRUE(rewind_gateways_from_transactions(db, {named, copy}, 1100, true, &reason)) << reason;
+  EXPECT_EQ(blob_of(gw, db), before);
+}
+
+// Key attestations: each committee member says, in its own tx, that its committee generated a
+// key; the key is attested once the epoch's threshold have.
+namespace
+{
+  using master_nodes::bridge_key_attestation_record;
+  using master_nodes::check_bridge_standby_naming;
+  using master_nodes::find_attested_bridge_key;
+
+  tx_extra_bridge_key_attestation sign_attestation(const committee_keys& c, uint16_t voter, uint64_t epoch,
+                                                   const crypto::eddsa_public_key& vk, uint8_t pevm_fill = 0x77)
+  {
+    tx_extra_bridge_key_attestation att{};
+    att.epoch = epoch;
+    att.pgw_vk = vk;
+    std::memset(att.pevm_address.data, pevm_fill, sizeof(att.pevm_address.data));
+    att.voter_index = voter;
+    const std::string msg = bridge_key_attestation_message(NET_FC, att);
+    crypto_sign_detached(att.signature.data, nullptr, reinterpret_cast<const unsigned char*>(msg.data()), msg.size(),
+                         c.ed_sec[voter].data);
+    return att;
+  }
+
+  bool run_attestation(master_node_list::state_t& cur, const committee_keys& c,
+                       const tx_extra_bridge_key_attestation& att, uint64_t block_height,
+                       uint64_t committee_epoch = 3)
+  {
+    master_nodes::bridge_committee_resolver resolver =
+      [&](uint64_t eh, std::vector<crypto::public_key>& members,
+          std::vector<crypto::ed25519_public_key>& signer_keys, size_t& threshold) -> bool {
+        if (eh != committee_epoch * cryptonote::bridge_epoch_blocks(NET_FC))
+          return false;
+        members = c.mn;
+        signer_keys = c.ed_pub;
+        threshold = cryptonote::bridge_committee_threshold(NET_FC);
+        return true;
+      };
+    block blk{};
+    blk.major_version = hf::hf23_bridge;
+    blk.miner_tx.vin.push_back(txin_gen{block_height});
+    transaction tx{};
+    tx.type = txtype::bridge_registration;
+    EXPECT_TRUE(add_bridge_key_attestation_to_tx_extra(tx.extra, att));
+    return cur.process_bridge_key_attestation_tx(NET_FC, blk, tx, resolver);
+  }
+
+  crypto::eddsa_public_key new_vk()
+  {
+    crypto::eddsa_public_key pub; crypto::eddsa_secret_key sec;
+    crypto::generate_eddsa_keypair(pub, sec);
+    return pub;
+  }
+}
+
+TEST(GatewayBridgeKeyAttestation, a_key_is_attested_once_the_threshold_of_its_committee_say_so)
+{
+  master_node_list::state_t cur(nullptr);
+  const committee_keys c = make_committee(cryptonote::bridge_committee_size(NET_FC));
+  const size_t threshold = cryptonote::bridge_committee_threshold(NET_FC);
+  const crypto::eddsa_public_key vk = new_vk();
+
+  for (uint16_t i = 0; i + 1 < threshold; ++i)
+    ASSERT_TRUE(run_attestation(cur, c, sign_attestation(c, i, 3, vk), 50 + i));
+  ASSERT_EQ(cur.bridge_key_attestations.size(), 1u);
+  EXPECT_EQ(cur.bridge_key_attestations[0].attested_height, 0u) << "one short of the threshold";
+  EXPECT_FALSE(find_attested_bridge_key(cur.bridge_key_attestations, vk));
+
+  // A member counts once; a forged or foreign signature not at all.
+  EXPECT_FALSE(run_attestation(cur, c, sign_attestation(c, 0, 3, vk), 60));
+  auto forged = sign_attestation(c, 0, 3, vk);
+  forged.voter_index = static_cast<uint16_t>(threshold - 1);
+  EXPECT_FALSE(run_attestation(cur, c, forged, 60));
+  auto outsider = sign_attestation(c, 0, 3, vk);
+  outsider.voter_index = static_cast<uint16_t>(c.mn.size());
+  EXPECT_FALSE(run_attestation(cur, c, outsider, 60));
+  EXPECT_FALSE(run_attestation(cur, c, sign_attestation(c, 5, 99, vk), 60)) << "no committee for that epoch";
+  // A different wBDX address is a different claim, collected apart.
+  ASSERT_TRUE(run_attestation(cur, c, sign_attestation(c, 0, 3, vk, 0x55), 61));
+  EXPECT_EQ(cur.bridge_key_attestations.size(), 2u);
+
+  ASSERT_TRUE(run_attestation(cur, c, sign_attestation(c, static_cast<uint16_t>(threshold - 1), 3, vk), 70));
+  const auto rec = find_attested_bridge_key(cur.bridge_key_attestations, vk);
+  ASSERT_TRUE(rec);
+  EXPECT_EQ(rec->epoch, 3u);
+  EXPECT_EQ(rec->attested_height, 70u);
+  EXPECT_EQ(rec->voters.size(), threshold);
+
+  // Later members still count, but the attested height stays the first.
+  ASSERT_TRUE(run_attestation(cur, c, sign_attestation(c, static_cast<uint16_t>(threshold), 3, vk), 80));
+  EXPECT_EQ(find_attested_bridge_key(cur.bridge_key_attestations, vk)->attested_height, 70u);
+}
+
+TEST(GatewayBridgeKeyAttestation, attestations_survive_state_serialization)
+{
+  master_node_list::state_serialized s{};
+  s.version = master_node_list::state_serialized::get_version(hf::hf23_bridge);
+  bridge_key_attestation_record r{};
+  r.pgw_vk = new_vk();
+  r.epoch = 4;
+  r.voters = {0, 2, 5};
+  r.attested_height = 90;
+  s.bridge_key_attestations.push_back(r);
+
+  master_node_list::state_serialized got{};
+  ASSERT_NO_THROW(serialization::parse_binary(serialization::dump_binary(s), got));
+  ASSERT_EQ(got.bridge_key_attestations.size(), 1u);
+  EXPECT_EQ(got.bridge_key_attestations[0].pgw_vk, r.pgw_vk);
+  EXPECT_EQ(got.bridge_key_attestations[0].voters, r.voters);
+  EXPECT_EQ(got.bridge_key_attestations[0].attested_height, 90u);
+
+  // A state saved before the field loads with none.
+  s.version = master_node_list::state_serialized::version_t::version_5_bridge_departed_bond;
+  master_node_list::state_serialized older{};
+  ASSERT_NO_THROW(serialization::parse_binary(serialization::dump_binary(s), older));
+  EXPECT_TRUE(older.bridge_key_attestations.empty());
+}
+
+// A standby may be named only when both keys are attested and their committees share at most
+// size - threshold members: losing enough holders to silence the live key then never also
+// silences the standby.
+TEST(GatewayBridgeKeyAttestation, a_standby_needs_attested_keys_from_committees_that_barely_overlap)
+{
+  const size_t limit = cryptonote::bridge_committee_size(NET_FC) - cryptonote::bridge_committee_threshold(NET_FC);
+  const crypto::eddsa_public_key live = new_vk(), next = new_vk();
+  auto rec = [](const crypto::eddsa_public_key& vk, uint64_t epoch, uint64_t height) {
+    bridge_key_attestation_record r{};
+    r.pgw_vk = vk; r.epoch = epoch; r.attested_height = height;
+    return r;
+  };
+  std::map<std::pair<uint64_t, uint64_t>, size_t> shared{{{1, 2}, limit}, {{1, 3}, limit + 1}};
+  auto overlap = [&](uint64_t a, uint64_t b) -> std::optional<size_t> {
+    auto it = shared.find({a, b});
+    return it == shared.end() ? std::nullopt : std::optional<size_t>{it->second};
+  };
+  std::string reason;
+
+  std::vector<bridge_key_attestation_record> records{rec(live, 1, 10)};
+  EXPECT_FALSE(check_bridge_standby_naming(records, live, next, NET_FC, overlap, reason));
+  EXPECT_NE(reason.find("standby key has no committee attestation"), std::string::npos) << reason;
+  EXPECT_FALSE(check_bridge_standby_naming(records, next, live, NET_FC, overlap, reason));
+  EXPECT_NE(reason.find("owner key has no committee attestation"), std::string::npos) << reason;
+
+  // Collecting is not attested.
+  records.push_back(rec(next, 2, 0));
+  EXPECT_FALSE(check_bridge_standby_naming(records, live, next, NET_FC, overlap, reason));
+
+  records.back().attested_height = 20;
+  EXPECT_TRUE(check_bridge_standby_naming(records, live, next, NET_FC, overlap, reason)) << reason;
+
+  // One member too many in common.
+  records.back().epoch = 3;
+  EXPECT_FALSE(check_bridge_standby_naming(records, live, next, NET_FC, overlap, reason));
+  EXPECT_NE(reason.find("at most " + std::to_string(limit)), std::string::npos) << reason;
+
+  // Unknown committee; and a key that is not a committee key at all.
+  records.back().epoch = 4;
+  EXPECT_FALSE(check_bridge_standby_naming(records, live, next, NET_FC, overlap, reason));
+  EXPECT_NE(reason.find("unknown"), std::string::npos) << reason;
+  EXPECT_FALSE(check_bridge_standby_naming(records, live, rand_pubkey(), NET_FC, overlap, reason));
+  EXPECT_NE(reason.find("eddsa"), std::string::npos) << reason;
+
+  // A key attested by two committees belongs to the first that reached its threshold.
+  records.back().epoch = 2;
+  records.push_back(rec(next, 3, 15));
+  EXPECT_EQ(find_attested_bridge_key(records, next)->epoch, 3u);
+  EXPECT_FALSE(check_bridge_standby_naming(records, live, next, NET_FC, overlap, reason));
 }

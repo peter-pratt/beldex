@@ -8568,6 +8568,50 @@ wallet2::bridge_slash_result wallet2::create_bridge_slash_tx(const std::string& 
   return result;
 }
 
+wallet2::bridge_rotation_ack_result wallet2::create_bridge_key_attestation_tx(const cryptonote::tx_extra_bridge_key_attestation& att, uint32_t priority, std::set<uint32_t> subaddr_indices)
+{
+  bridge_rotation_ack_result result{};
+  if (priority == tx_priority_flash)
+  {
+    result.msg = tr("Key attestations cannot use flash priority");
+    return result;
+  }
+  auto hf_version = get_hard_fork_version();
+  if (!hf_version)
+  {
+    result.msg = ERR_MSG_NETWORK_VERSION_QUERY_FAILED;
+    return result;
+  }
+  if (*hf_version < cryptonote::hf::hf23_bridge)
+  {
+    result.msg = tr("Key attestations require the bridge hard fork (HF23)");
+    return result;
+  }
+  std::vector<uint8_t> extra;
+  if (!cryptonote::add_bridge_key_attestation_to_tx_extra(extra, att))
+  {
+    result.msg = tr("Failed to serialize the key attestation into the transaction");
+    return result;
+  }
+  try
+  {
+    beldex_construct_tx_params tx_params = tools::wallet2::construct_params(*hf_version, txtype::bridge_registration, priority);
+    auto ptx_vector = create_transactions_2({} /*dsts*/, cryptonote::TX_OUTPUT_DECOYS, 0 /*unlock_at_block*/, priority, extra, 0, subaddr_indices, tx_params);
+    if (ptx_vector.size() == 1)
+    {
+      result.success = true;
+      result.ptx     = ptx_vector[0];
+    }
+    else
+      result.msg = ERR_MSG_TOO_MANY_TXS_CONSTRUCTED;
+  }
+  catch (const std::exception& e)
+  {
+    result.msg = std::string(tr("Failed to create the key attestation transaction: ")) + e.what();
+  }
+  return result;
+}
+
 wallet2::bridge_rotation_ack_result wallet2::create_gateway_takeover_step_tx(const cryptonote::tx_extra_gateway_takeover& step, uint32_t priority, std::set<uint32_t> subaddr_indices)
 {
   bridge_rotation_ack_result result{};

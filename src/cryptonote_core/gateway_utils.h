@@ -88,6 +88,18 @@ crypto::hash gateway_takeover_cancel_message(network_type nettype, const crypto:
 // that descriptor and that count, so a begin cancelled once can never be replayed.
 crypto::hash gateway_takeover_begin_message(network_type nettype, const crypto::public_key& gateway_id,
                                             const gateway_descriptor_base& current, uint64_t step_count);
+// What the OWNER signs to name `standby` as the standby of a gateway with
+// `descriptor_count` descriptors (the step applies to exactly that state).
+crypto::hash gateway_standby_name_message(network_type nettype, const crypto::public_key& gateway_id,
+                                          uint64_t descriptor_count, const gateway_owner_key_v& standby);
+
+// The bytes a committee member signs to attest that its committee generated a key, and the
+// check of one member's signature against that committee's signer keys.
+std::string bridge_key_attestation_message(network_type nettype, const tx_extra_bridge_key_attestation& att);
+bool verify_bridge_key_attestation(const tx_extra_bridge_key_attestation& att,
+                                   const std::vector<crypto::ed25519_public_key>& signer_keys,
+                                   network_type nettype, std::string& reason);
+
 // What the STANDBY signs to complete the takeover that began at `started_height`.
 crypto::hash gateway_takeover_complete_message(network_type nettype, const crypto::public_key& gateway_id,
                                                uint64_t started_height);
