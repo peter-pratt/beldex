@@ -3090,9 +3090,12 @@ namespace cryptonote::rpc {
   /// What the bridge needs to know about standby keys (HF23):
   /// - `owner_key` / `owner_epoch` -- the bridge gateway's owner key and the committee epoch
   ///   attested to have generated it (absent until attested).
-  /// - `committee_epoch` / `committee_overlap` -- the current committee, and how many members
-  ///   it shares with the owner's (absent if the owner is not attested).
-  /// - `overlap_limit` -- the most members a standby's committee may share with the owner's.
+  /// - `committee_epoch` / `committee_overlap` -- the current committee, and how many of its
+  ///   members are run by operators of the owner's committee (absent if the owner is not
+  ///   attested). One operator's trouble takes all its nodes, so operators are what count.
+  /// - `overlap_limit` -- the most such members a standby's committee may have.
+  /// - `standby_key`, `standby_last_seen_height`, `standby_stale` -- the named standby and
+  ///   its liveness.
   /// - `attestations` -- every key committees have attested or are attesting:
   ///   {pgw_vk, pevm_address, epoch, voters, threshold, attested_height, overlap_with_owner}.
   struct BRIDGE_GET_STANDBY : PUBLIC

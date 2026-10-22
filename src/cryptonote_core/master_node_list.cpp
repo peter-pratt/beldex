@@ -26,6 +26,7 @@
 // STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
 // THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+#include <unordered_set>
 #include "cryptonote_config.h"
 #include "beldex_economy.h"
 #include "ringct/rctTypes.h"
@@ -2690,11 +2691,31 @@ namespace master_nodes
         || !get_bridge_committee(epoch_b * cryptonote::bridge_epoch_blocks(m_blockchain.nettype()), b, keys, threshold)
         || a.empty() || b.empty())
       return std::nullopt;
-    size_t shared = 0;
+    std::lock_guard lock(m_mn_mutex);
+    // A node no longer registered has no known operator: it counts as its own.
+    return bridge_committee_operator_overlap(a, b, [this](const crypto::public_key &pk) {
+      auto it = m_state.master_nodes_infos.find(pk);
+      // Nor does one registered without an operator address.
+      if (it == m_state.master_nodes_infos.end() || it->second->operator_address == cryptonote::account_public_address{})
+        return std::string(reinterpret_cast<const char *>(&pk), sizeof(pk));
+      const auto &op = it->second->operator_address;
+      return std::string(reinterpret_cast<const char *>(&op.m_spend_public_key), sizeof(op.m_spend_public_key))
+             + std::string(reinterpret_cast<const char *>(&op.m_view_public_key), sizeof(op.m_view_public_key));
+    });
+  }
+
+  size_t bridge_committee_operator_overlap(const std::vector<crypto::public_key> &a,
+                                           const std::vector<crypto::public_key> &b,
+                                           const std::function<std::string(const crypto::public_key &)> &operator_of)
+  {
+    std::unordered_set<std::string> a_operators;
     for (const auto &m : a)
-      if (std::find(b.begin(), b.end(), m) != b.end())
-        ++shared;
-    return shared;
+      a_operators.insert(operator_of(m));
+    size_t exposed = 0;
+    for (const auto &m : b)
+      if (a_operators.count(operator_of(m)))
+        ++exposed;
+    return exposed;
   }
 
   bool master_node_list::check_standby_naming(const cryptonote::gateway_owner_key_v &owner,
@@ -2741,9 +2762,9 @@ namespace master_nodes
     const size_t limit = cryptonote::bridge_committee_size(nettype) - cryptonote::bridge_committee_threshold(nettype);
     if (*shared > limit)
     {
-      reason = "the standby's committee (epoch " + std::to_string(s->epoch) + ") shares " + std::to_string(*shared)
-               + " members with the owner's (epoch " + std::to_string(o->epoch) + "); at most "
-               + std::to_string(limit) + " may be shared";
+      reason = "the standby's committee (epoch " + std::to_string(s->epoch) + ") has " + std::to_string(*shared)
+               + " members run by operators of the owner's (epoch " + std::to_string(o->epoch) + "); at most "
+               + std::to_string(limit) + " may be";
       return false;
     }
     return true;

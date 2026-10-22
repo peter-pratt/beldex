@@ -323,6 +323,14 @@ namespace master_nodes
     END_SERIALIZE()
   };
 
+  // How exposed committee `b` is to a failure of committee `a`: the members of `b` whose
+  // operator (`operator_of`) also runs a member of `a`. One operator's trouble (an outage, a
+  // bad upgrade, a compromise) takes all of its nodes at once, so that is how many of `b`'s
+  // holders the failure silencing `a` can also take.
+  size_t bridge_committee_operator_overlap(const std::vector<crypto::public_key>& a,
+                                           const std::vector<crypto::public_key>& b,
+                                           const std::function<std::string(const crypto::public_key&)>& operator_of);
+
   // The record of the committee that holds gateway key `pgw_vk`: the first to have attested it.
   std::optional<bridge_key_attestation_record> find_attested_bridge_key(const std::vector<bridge_key_attestation_record>& records,
                                                                         const crypto::eddsa_public_key& pgw_vk);
@@ -694,8 +702,8 @@ namespace master_nodes
     /// enough of the live key's holders to silence it can never also silence the standby.
     bool check_standby_naming(const cryptonote::gateway_owner_key_v& owner,
                               const cryptonote::gateway_owner_key_v& standby, std::string& reason) const;
-    /// The members two attested committees share, or nullopt if either epoch's committee is
-    /// unknown.
+    /// How many members of committee `epoch_b` an operator of committee `epoch_a` also runs
+    /// (bridge_committee_operator_overlap), or nullopt if either epoch's committee is unknown.
     std::optional<size_t> bridge_committee_overlap(uint64_t epoch_a, uint64_t epoch_b) const;
     /// Whether a rotation ack (whose signatures have already been verified) may advance the
     /// current state: see state_t::check_bridge_rotation_ack.

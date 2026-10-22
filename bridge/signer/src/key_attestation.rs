@@ -57,7 +57,8 @@ pub struct Record {
     pub voters: Vec<u32>,
     /// 0 while still collecting.
     pub attested_height: u64,
-    /// How many members its committee shares with the live owner's, when known.
+    /// How many of its committee's members are run by operators of the live owner's
+    /// committee, when known (consensus counts operators, not nodes).
     pub overlap_with_owner: Option<u64>,
 }
 
@@ -96,7 +97,7 @@ pub fn holder<'a>(records: &'a [Record], pgw_vk: &[u8; 32]) -> Option<&'a Record
 /// The key the live committee should name as its standby: attested, newer than the owner's
 /// (`owner_epoch`; an older key was generated before it and has served already, or never
 /// will), not the owner's own nor `exclude` (a standby gone stale), and from a committee that
-/// shares at most `limit` members with the owner's. The newest such; consensus applies the
+/// has at most `limit` members run by operators of the owner's. The newest such; consensus applies the
 /// same overlap rule, and every live member reads the same records, so they all pick the same
 /// one.
 pub fn pick_standby<'a>(
@@ -129,14 +130,15 @@ pub struct StandbyView {
     /// It has neither been named nor proved it can sign for a day: treated as gone.
     pub standby_stale: bool,
     pub committee_epoch: u64,
-    /// How many members the current committee shares with the owner's, when known.
+    /// How many of the current committee's members are run by operators of the owner's
+    /// committee, when known.
     pub committee_overlap: Option<u64>,
     pub overlap_limit: u64,
 }
 
 /// Whether the current committee should generate the next standby key now: Ok, or why not.
 /// It should when no working standby is named (none, or one gone stale) and none is waiting
-/// to be, and it is a newer committee than the owner's that shares few enough members with it
+/// to be, and it is a newer committee than the owner's with few enough members run by its operators
 /// to be a standby consensus accepts.
 pub fn standby_dkg_due(view: &StandbyView, records: &[Record]) -> Result<(), String> {
     if view.standby_key.is_some() && !view.standby_stale {
@@ -155,7 +157,7 @@ pub fn standby_dkg_due(view: &StandbyView, records: &[Record]) -> Result<(), Str
         Some(o) if o <= view.overlap_limit => {}
         Some(o) => {
             return Err(format!(
-                "the current committee shares {o} members with the owner's; at most {} may",
+                "the current committee has {o} members run by operators of the owner's; at most {} may",
                 view.overlap_limit
             ))
         }

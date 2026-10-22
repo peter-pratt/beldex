@@ -2748,6 +2748,7 @@ namespace
   using master_nodes::bridge_key_attestation_record;
   using master_nodes::check_bridge_standby_naming;
   using master_nodes::find_attested_bridge_key;
+  using master_nodes::bridge_committee_operator_overlap;
 
   tx_extra_bridge_key_attestation sign_attestation(const committee_keys& c, uint16_t voter, uint64_t epoch,
                                                    const crypto::eddsa_public_key& vk, uint8_t pevm_fill = 0x77)
@@ -3064,4 +3065,32 @@ TEST(GatewayBridgeRotation, the_standbys_last_sign_of_life_is_tracked)
   master_node_list::state_serialized older{};
   ASSERT_NO_THROW(serialization::parse_binary(serialization::dump_binary(s), older));
   EXPECT_TRUE(older.bridge_standby_liveness.empty());
+}
+
+// Overlap counts operators, not nodes: one operator's trouble takes all its nodes at once, so a
+// standby member whose operator also runs a live member is exposed even if the nodes differ.
+TEST(GatewayBridgeKeyAttestation, overlap_counts_the_standbys_members_run_by_the_live_committees_operators)
+{
+  std::vector<crypto::public_key> a, b;
+  std::map<crypto::public_key, std::string> op;
+  auto node = [&](std::vector<crypto::public_key>& c, const std::string& who) {
+    const crypto::public_key pk = rand_pubkey();
+    c.push_back(pk);
+    op[pk] = who;
+    return pk;
+  };
+  const auto operator_of = [&](const crypto::public_key& pk) { return op.at(pk); };
+  for (const char* who : {"alpha", "alpha", "beta", "gamma", "delta", "epsilon"})
+    node(a, who);
+  // No node in common, but alpha runs two of b's and beta one: three exposed.
+  for (const char* who : {"alpha", "alpha", "beta", "zeta", "eta", "theta"})
+    node(b, who);
+  EXPECT_EQ(bridge_committee_operator_overlap(a, b, operator_of), 3u);
+  // A node in both committees counts once, as before.
+  b.push_back(a[3]);
+  EXPECT_EQ(bridge_committee_operator_overlap(a, b, operator_of), 4u);
+  // Operators only on one side expose nothing.
+  EXPECT_EQ(bridge_committee_operator_overlap({a[4], a[5]}, {b[3], b[4]}, operator_of), 0u);
+  // Counted from b's side: alpha's two nodes in a do not double what b exposes.
+  EXPECT_EQ(bridge_committee_operator_overlap({a[0], a[1]}, {b[0]}, operator_of), 1u);
 }
