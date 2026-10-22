@@ -1326,10 +1326,25 @@ bool validate_gateway_freeze_operation(BlockchainDB& db, network_type nettype, c
              + ", got " + std::to_string(op.governance_seq) + ")";
     return false;
   }
+  if (!governance_height_is_recent(db, nettype, op.epoch_height, reason))
+    return false;
   const crypto::hash msg = gateway_freeze_message(nettype, op.gateway_id, op.freeze != 0,
                                                   op.governance_seq, op.epoch_height);
   if (!verify_gateway_governance_evidence(op.evidence, op.epoch_height, msg, resolve_quorum, reason))
     return false;
+  return true;
+}
+
+bool governance_height_is_recent(BlockchainDB& db, network_type nettype, uint64_t epoch_height, std::string& reason)
+{
+  const uint64_t height = db.height();
+  const uint64_t max_age = gateway_governance_max_age_blocks(nettype);
+  if (epoch_height >= height || epoch_height + max_age < height)
+  {
+    reason = "governance quorum height " + std::to_string(epoch_height) + " is not a recent block (the chain is at "
+             + std::to_string(height) + "; at most " + std::to_string(max_age) + " blocks back)";
+    return false;
+  }
   return true;
 }
 
@@ -1358,12 +1373,21 @@ bool validate_gateway_repoint_operation(BlockchainDB& db, network_type nettype, 
   }
   if (!standby_is_fresh(acct, op.new_owner_descriptor, reason))
     return false;
+  // The bridge-reserve flag is sticky for governance too: a re-point dropping it would turn
+  // off the rule that every release from the reserve names the burn it pays out.
+  if (acct.latest_descriptor().is_bridge_reserve() && !op.new_owner_descriptor.is_bridge_reserve())
+  {
+    reason = "gateway bridge-reserve flag cannot be cleared by a repoint";
+    return false;
+  }
   if (op.governance_seq != acct.governance_seq)
   {
     reason = "stale governance nonce on repoint (expected " + std::to_string(acct.governance_seq)
              + ", got " + std::to_string(op.governance_seq) + ")";
     return false;
   }
+  if (!governance_height_is_recent(db, nettype, op.epoch_height, reason))
+    return false;
   const crypto::hash msg = gateway_repoint_message(nettype, op.gateway_id, op.new_owner_descriptor,
                                                    op.governance_seq, op.epoch_height);
   if (!verify_gateway_governance_evidence(op.evidence, op.epoch_height, msg, resolve_quorum, reason))

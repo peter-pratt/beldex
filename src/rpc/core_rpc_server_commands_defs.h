@@ -3104,6 +3104,64 @@ namespace cryptonote::rpc {
     struct request_parameters {} request;
   };
 
+  /// Governance (HF23), step 1 of 3: prepare a gateway freeze, unfreeze or re-point for the
+  /// checkpoint quorum to sign. The last resort when a gateway's owner key is lost; a re-point
+  /// needs no signature from it.
+  ///
+  /// Inputs:
+  /// - `gateway_id` -- the gateway, hex.
+  /// - `action` -- "freeze", "unfreeze" or "repoint".
+  /// - `new_owner_key` / `new_owner_key_type` -- repoint: the new owner ("eddsa" for a bridge
+  ///   committee key, also "schnorr" or "eth").
+  /// - `standby_key` -- repoint, optional: an eddsa standby to name with it (none by default).
+  /// - `epoch_height` -- optional: whose checkpoint quorum signs; default the latest one.
+  ///
+  /// Output: `op` (tx_extra hex, no signatures yet: pass it to every signer unchanged),
+  /// `message`, `governance_seq`, `epoch_height`, `quorum` (master node pubkeys, by voter
+  /// index), `required` (signatures needed), and what it does.
+  struct GATEWAY_GOVERNANCE_PREPARE : PUBLIC
+  {
+    static constexpr auto names() { return NAMES("gateway_governance_prepare"); }
+    struct request_parameters
+    {
+      std::string gateway_id;
+      std::string action;
+      std::string new_owner_key;
+      std::string new_owner_key_type;
+      std::string standby_key;
+      uint64_t epoch_height = 0;
+    } request;
+  };
+
+  /// Governance (HF23), step 2 of 3: a checkpoint-quorum master node signs a prepared `op`.
+  /// The daemon rebuilds the message from the op itself (it never signs a bare hash), checks
+  /// the op still applies (nonce, recent quorum height), and signs with this node's master
+  /// node key if it is in that quorum. Admin RPC; master node mode only. The operator should
+  /// confirm out of band, from the returned summary, that this change is really wanted.
+  ///
+  /// Output: `voter_index`, `signature`, `master_node_pubkey`, and the summary.
+  struct GATEWAY_GOVERNANCE_SIGN : RPC_COMMAND
+  {
+    static constexpr auto names() { return NAMES("gateway_governance_sign"); }
+    struct request_parameters
+    {
+      std::string op;
+    } request;
+  };
+
+  /// Governance (HF23), step 3 of 3: put the collected signatures (`"<voter_index>:<hex>"`)
+  /// into the op and check it exactly as consensus will. Output: the finished `op`, to submit
+  /// with the wallet's gateway_governance_submit, or an error saying what is missing.
+  struct GATEWAY_GOVERNANCE_ASSEMBLE : PUBLIC
+  {
+    static constexpr auto names() { return NAMES("gateway_governance_assemble"); }
+    struct request_parameters
+    {
+      std::string op;
+      std::vector<std::string> signatures;
+    } request;
+  };
+
   /// RPC: bridge/get_bridge_registration_cmd
   ///
   /// Produce a signed bridge-seat registration blob for THIS masternode (HF23,
@@ -3175,6 +3233,9 @@ namespace cryptonote::rpc {
     BRIDGE_GET_COMMITTEE,
     BRIDGE_GET_SEATS,
     BRIDGE_GET_STANDBY,
+    GATEWAY_GOVERNANCE_PREPARE,
+    GATEWAY_GOVERNANCE_SIGN,
+    GATEWAY_GOVERNANCE_ASSEMBLE,
     GET_BRIDGE_REGISTRATION_CMD,
     GET_BRIDGE_UNBOND_CMD,
     BANNED,

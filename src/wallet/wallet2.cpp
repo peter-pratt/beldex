@@ -8568,6 +8568,51 @@ wallet2::bridge_slash_result wallet2::create_bridge_slash_tx(const std::string& 
   return result;
 }
 
+wallet2::bridge_rotation_ack_result wallet2::create_gateway_governance_tx(const std::vector<uint8_t>& op_extra, uint32_t priority, std::set<uint32_t> subaddr_indices)
+{
+  bridge_rotation_ack_result result{};
+  if (priority == tx_priority_flash)
+  {
+    result.msg = tr("Governance transactions cannot use flash priority");
+    return result;
+  }
+  auto hf_version = get_hard_fork_version();
+  if (!hf_version)
+  {
+    result.msg = ERR_MSG_NETWORK_VERSION_QUERY_FAILED;
+    return result;
+  }
+  if (*hf_version < cryptonote::hf::hf23_bridge)
+  {
+    result.msg = tr("Gateway governance requires the bridge hard fork (HF23)");
+    return result;
+  }
+  cryptonote::tx_extra_gateway_freeze freeze{};
+  cryptonote::tx_extra_gateway_repoint repoint{};
+  if (cryptonote::get_field_from_tx_extra(op_extra, freeze) == cryptonote::get_field_from_tx_extra(op_extra, repoint))
+  {
+    result.msg = tr("The op must hold exactly one gateway freeze or re-point");
+    return result;
+  }
+  try
+  {
+    beldex_construct_tx_params tx_params = tools::wallet2::construct_params(*hf_version, txtype::bridge_registration, priority);
+    auto ptx_vector = create_transactions_2({} /*dsts*/, cryptonote::TX_OUTPUT_DECOYS, 0 /*unlock_at_block*/, priority, op_extra, 0, subaddr_indices, tx_params);
+    if (ptx_vector.size() == 1)
+    {
+      result.success = true;
+      result.ptx     = ptx_vector[0];
+    }
+    else
+      result.msg = ERR_MSG_TOO_MANY_TXS_CONSTRUCTED;
+  }
+  catch (const std::exception& e)
+  {
+    result.msg = std::string(tr("Failed to create the governance transaction: ")) + e.what();
+  }
+  return result;
+}
+
 wallet2::bridge_rotation_ack_result wallet2::create_bridge_key_attestation_tx(const cryptonote::tx_extra_bridge_key_attestation& att, uint32_t priority, std::set<uint32_t> subaddr_indices)
 {
   bridge_rotation_ack_result result{};

@@ -3337,8 +3337,12 @@ namespace master_nodes
         cryptonote::tx_extra_bridge_unbond       unbond{};
         cryptonote::tx_extra_gateway_takeover    takeover{};
         cryptonote::tx_extra_bridge_key_attestation attestation{};
-        if (cryptonote::get_field_from_tx_extra(tx.extra, takeover))
-          {} // a gateway takeover step: gateway state only (gateway_utils)
+        cryptonote::tx_extra_gateway_repoint     repoint{};
+        cryptonote::tx_extra_gateway_freeze      freeze{};
+        if (cryptonote::get_field_from_tx_extra(tx.extra, takeover)
+            || cryptonote::get_field_from_tx_extra(tx.extra, repoint)
+            || cryptonote::get_field_from_tx_extra(tx.extra, freeze))
+          {} // a gateway takeover step or governance op: gateway state only (gateway_utils)
         else if (cryptonote::get_field_from_tx_extra(tx.extra, attestation))
           process_bridge_key_attestation_tx(nettype, block, tx, resolve_bridge_committee);
         else if (cryptonote::get_field_from_tx_extra(tx.extra, rot_ack))

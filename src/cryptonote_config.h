@@ -415,6 +415,12 @@ constexpr uint64_t gateway_standby_alive_window_blocks(network_type n)
 {
   return is_local_bridge_net(n) ? 40 : 360; // three slots
 }
+// Governance (HF23): a freeze or re-point is signed by the checkpoint quorum of a height no
+// older than this, so a quorum whose operators have since left cannot be dug up to sign one.
+constexpr uint64_t gateway_governance_max_age_blocks(network_type n)
+{
+  return is_local_bridge_net(n) ? 120 : 2880; // ~1 day: time to collect the signatures
+}
 constexpr uint64_t gateway_standby_stale_blocks(network_type n)
 {
   return is_local_bridge_net(n) ? 120 : 2880; // ~1 day

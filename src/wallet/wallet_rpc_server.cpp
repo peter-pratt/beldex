@@ -3231,6 +3231,29 @@ namespace {
     return res;
   }
 
+  GATEWAY_GOVERNANCE_SUBMIT::response wallet_rpc_server::invoke(GATEWAY_GOVERNANCE_SUBMIT::request&& req)
+  {
+    require_open();
+    GATEWAY_GOVERNANCE_SUBMIT::response res{};
+    if (!oxenc::is_hex(req.op))
+      throw wallet_rpc_error{error_code::UNKNOWN_ERROR, "op must be hex"};
+    const std::string bin = oxenc::from_hex(req.op);
+    const std::vector<uint8_t> extra(bin.begin(), bin.end());
+    tools::wallet2::bridge_rotation_ack_result built = m_wallet->create_gateway_governance_tx(extra, req.priority);
+    if (!built.success)
+      throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, built.msg};
+    try
+    {
+      m_wallet->commit_tx(built.ptx, false /*flash*/);
+    }
+    catch (const std::exception& e)
+    {
+      throw wallet_rpc_error{error_code::GENERIC_TRANSFER_ERROR, std::string("Failed to commit the governance op: ") + e.what()};
+    }
+    res.tx_hash = tools::type_to_hex(cryptonote::get_transaction_hash(built.ptx.tx));
+    return res;
+  }
+
   BRIDGE_KEY_ATTESTATION::response wallet_rpc_server::invoke(BRIDGE_KEY_ATTESTATION::request&& req)
   {
     require_open();

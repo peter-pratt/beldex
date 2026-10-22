@@ -4507,6 +4507,263 @@ namespace cryptonote::rpc {
     cmd.response["status"] = STATUS_OK;
   }
 
+  namespace
+  {
+    // A governance op travels between prepare, the signers, assemble and the wallet as a
+    // tx_extra fragment (hex) holding exactly one gateway freeze or re-point.
+    struct governance_op_t
+    {
+      std::optional<cryptonote::tx_extra_gateway_freeze> freeze;
+      std::optional<cryptonote::tx_extra_gateway_repoint> repoint;
+
+      const crypto::public_key& gateway_id() const { return freeze ? freeze->gateway_id : repoint->gateway_id; }
+      uint64_t governance_seq() const { return freeze ? freeze->governance_seq : repoint->governance_seq; }
+      uint64_t epoch_height() const { return freeze ? freeze->epoch_height : repoint->epoch_height; }
+      std::vector<cryptonote::gateway_governance_signature>& evidence() { return freeze ? freeze->evidence : repoint->evidence; }
+    };
+
+    governance_op_t parse_governance_op(std::string_view hex)
+    {
+      if (!oxenc::is_hex(hex))
+        throw rpc_error{ERROR_WRONG_PARAM, "op must be hex"};
+      const std::string bin = oxenc::from_hex(hex);
+      const std::vector<uint8_t> extra(bin.begin(), bin.end());
+      cryptonote::tx_extra_gateway_freeze f{};
+      cryptonote::tx_extra_gateway_repoint r{};
+      const bool is_freeze = cryptonote::get_field_from_tx_extra(extra, f);
+      const bool is_repoint = cryptonote::get_field_from_tx_extra(extra, r);
+      if (is_freeze == is_repoint)
+        throw rpc_error{ERROR_WRONG_PARAM, "op must hold exactly one gateway freeze or re-point"};
+      governance_op_t g;
+      if (is_freeze) g.freeze = f; else g.repoint = r;
+      return g;
+    }
+
+    std::string governance_op_hex(const governance_op_t& g)
+    {
+      std::vector<uint8_t> extra;
+      const bool ok = g.freeze ? cryptonote::add_gateway_freeze_to_tx_extra(extra, *g.freeze)
+                               : cryptonote::add_gateway_repoint_to_tx_extra(extra, *g.repoint);
+      if (!ok)
+        throw rpc_error{ERROR_INTERNAL, "failed to serialize the governance op"};
+      return oxenc::to_hex(extra.begin(), extra.end());
+    }
+
+    crypto::hash governance_op_message(cryptonote::network_type nettype, const governance_op_t& g)
+    {
+      return g.freeze ? cryptonote::gateway_freeze_message(nettype, g.freeze->gateway_id, g.freeze->freeze != 0,
+                                                           g.freeze->governance_seq, g.freeze->epoch_height)
+                      : cryptonote::gateway_repoint_message(nettype, g.repoint->gateway_id, g.repoint->new_owner_descriptor,
+                                                            g.repoint->governance_seq, g.repoint->epoch_height);
+    }
+
+    // What the op does, for the people asked to sign it.
+    void describe_governance_op(nlohmann::json& out, const governance_op_t& g)
+    {
+      out["gateway_id"] = tools::type_to_hex(g.gateway_id());
+      out["governance_seq"] = g.governance_seq();
+      out["epoch_height"] = g.epoch_height();
+      if (g.freeze)
+        out["action"] = g.freeze->freeze ? "freeze" : "unfreeze";
+      else
+      {
+        const auto& d = g.repoint->new_owner_descriptor;
+        out["action"] = "repoint";
+        out["new_owner_key"] = std::visit([](const auto& k) { return tools::type_to_hex(k); }, d.owner_key);
+        out["new_owner_key_type"] = d.owner_key.index();
+        out["bridge_reserve"] = d.is_bridge_reserve();
+        if (d.has_standby)
+          out["standby_key"] = std::visit([](const auto& k) { return tools::type_to_hex(k); }, d.standby_owner);
+      }
+    }
+
+    size_t governance_required(size_t quorum_size)
+    {
+      return (quorum_size * cryptonote::GATEWAY_GOVERNANCE_SUPERMAJORITY_NUM + cryptonote::GATEWAY_GOVERNANCE_SUPERMAJORITY_DEN - 1)
+             / cryptonote::GATEWAY_GOVERNANCE_SUPERMAJORITY_DEN;
+    }
+  }
+
+  void core_rpc_server::invoke(GATEWAY_GOVERNANCE_PREPARE& cmd, rpc_context context)
+  {
+    const auto& req = cmd.request;
+    const auto nettype = m_core.get_nettype();
+    crypto::public_key gw{};
+    if (!tools::hex_to_type(req.gateway_id, gw))
+      throw rpc_error{ERROR_WRONG_PARAM, "gateway_id must be 64-char hex"};
+    cryptonote::gateway_account_data acct;
+    if (!cryptonote::load_gateway_account(m_core.get_blockchain_storage().get_db(), gw, acct) || acct.descriptor_history.empty())
+      throw rpc_error{ERROR_WRONG_PARAM, "unknown gateway"};
+
+    // Whose checkpoint quorum signs: the one asked for, or the latest there is.
+    const auto& mnl = m_core.get_master_node_list();
+    const uint64_t top = m_core.get_current_blockchain_height();
+    uint64_t height = req.epoch_height;
+    std::shared_ptr<const master_nodes::quorum> q;
+    if (height)
+      q = mnl.get_quorum(master_nodes::quorum_type::checkpointing, height, /*include_old=*/true);
+    else
+      for (uint64_t back = 1; back <= 64 && back < top && !(q && !q->validators.empty()); ++back)
+        if ((q = mnl.get_quorum(master_nodes::quorum_type::checkpointing, top - back, /*include_old=*/true)))
+          height = top - back;
+    if (!q || q->validators.empty())
+      throw rpc_error{ERROR_WRONG_PARAM, "no checkpoint quorum at height " + std::to_string(height)};
+    std::string reason;
+    if (!cryptonote::governance_height_is_recent(m_core.get_blockchain_storage().get_db(), nettype, height, reason))
+      throw rpc_error{ERROR_WRONG_PARAM, reason};
+
+    governance_op_t g;
+    if (req.action == "freeze" || req.action == "unfreeze")
+    {
+      cryptonote::tx_extra_gateway_freeze f{};
+      f.gateway_id = gw;
+      f.freeze = req.action == "freeze" ? 1 : 0;
+      f.governance_seq = acct.governance_seq;
+      f.epoch_height = height;
+      g.freeze = f;
+    }
+    else if (req.action == "repoint")
+    {
+      cryptonote::gateway_descriptor_base d = acct.latest_descriptor();
+      if (req.new_owner_key_type == "eddsa")
+      {
+        crypto::eddsa_public_key k{};
+        if (!tools::hex_to_type(req.new_owner_key, k)) throw rpc_error{ERROR_WRONG_PARAM, "new_owner_key must be 64-char hex"};
+        d.owner_key = k;
+      }
+      else if (req.new_owner_key_type == "schnorr" || req.new_owner_key_type == "ed25519")
+      {
+        crypto::public_key k{};
+        if (!tools::hex_to_type(req.new_owner_key, k)) throw rpc_error{ERROR_WRONG_PARAM, "new_owner_key must be 64-char hex"};
+        d.owner_key = k;
+      }
+      else if (req.new_owner_key_type == "eth")
+      {
+        crypto::eth_public_key k{};
+        if (!tools::hex_to_type(req.new_owner_key, k)) throw rpc_error{ERROR_WRONG_PARAM, "new_owner_key must be 66-char hex"};
+        d.owner_key = k;
+      }
+      else
+        throw rpc_error{ERROR_WRONG_PARAM, "new_owner_key_type must be one of: eddsa, schnorr, eth"};
+      // The lost key's standby goes with it unless a new one is named here.
+      d.has_standby = 0;
+      d.standby_owner = cryptonote::gateway_owner_key_v{};
+      if (!req.standby_key.empty())
+      {
+        crypto::eddsa_public_key k{};
+        if (!tools::hex_to_type(req.standby_key, k)) throw rpc_error{ERROR_WRONG_PARAM, "standby_key must be 64-char hex"};
+        d.has_standby = 1;
+        d.standby_owner = k;
+      }
+      if (d.version < 2)
+        d.version = 2;
+      cryptonote::tx_extra_gateway_repoint r{};
+      r.gateway_id = gw;
+      r.new_owner_descriptor = d;
+      r.governance_seq = acct.governance_seq;
+      r.epoch_height = height;
+      g.repoint = r;
+    }
+    else
+      throw rpc_error{ERROR_WRONG_PARAM, "action must be one of: freeze, unfreeze, repoint"};
+
+    auto quorum = json::array();
+    for (const auto& pk : q->validators)
+      quorum.push_back(tools::type_to_hex(pk));
+    describe_governance_op(cmd.response, g);
+    cmd.response["op"] = governance_op_hex(g);
+    cmd.response["message"] = tools::type_to_hex(governance_op_message(nettype, g));
+    cmd.response["quorum"] = std::move(quorum);
+    cmd.response["required"] = governance_required(q->validators.size());
+    cmd.response["status"] = STATUS_OK;
+  }
+
+  void core_rpc_server::invoke(GATEWAY_GOVERNANCE_SIGN& cmd, rpc_context context)
+  {
+    if (!m_core.master_node())
+      throw rpc_error{ERROR_WRONG_PARAM, "Daemon has not been started in master node mode, please relaunch with --master-node flag."};
+    const auto& keys = m_core.get_master_keys();
+    if (!keys.pub)
+      throw rpc_error{ERROR_INTERNAL, "Daemon has no master node keys"};
+    const auto nettype = m_core.get_nettype();
+    const governance_op_t g = parse_governance_op(cmd.request.op);
+
+    // Sign only what still applies: an op whose nonce moved on can never be used, and an old
+    // quorum height will be refused.
+    auto& db = m_core.get_blockchain_storage().get_db();
+    cryptonote::gateway_account_data acct;
+    if (!cryptonote::load_gateway_account(db, g.gateway_id(), acct) || acct.descriptor_history.empty())
+      throw rpc_error{ERROR_WRONG_PARAM, "unknown gateway"};
+    if (g.governance_seq() != acct.governance_seq)
+      throw rpc_error{ERROR_WRONG_PARAM, "the gateway's governance nonce is " + std::to_string(acct.governance_seq)
+                                             + ", not " + std::to_string(g.governance_seq()) + ": prepare a new op"};
+    std::string reason;
+    if (!cryptonote::governance_height_is_recent(db, nettype, g.epoch_height(), reason))
+      throw rpc_error{ERROR_WRONG_PARAM, reason};
+    auto q = m_core.get_master_node_list().get_quorum(master_nodes::quorum_type::checkpointing, g.epoch_height(), /*include_old=*/true);
+    if (!q || q->validators.empty())
+      throw rpc_error{ERROR_WRONG_PARAM, "no checkpoint quorum at height " + std::to_string(g.epoch_height())};
+    const auto it = std::find(q->validators.begin(), q->validators.end(), keys.pub);
+    if (it == q->validators.end())
+      throw rpc_error{ERROR_WRONG_PARAM, "this master node is not in the checkpoint quorum of height " + std::to_string(g.epoch_height())};
+
+    const crypto::hash msg = governance_op_message(nettype, g);
+    crypto::signature sig;
+    crypto::generate_signature(msg, keys.pub, keys.key, sig);
+    describe_governance_op(cmd.response, g);
+    cmd.response["voter_index"] = static_cast<uint64_t>(it - q->validators.begin());
+    cmd.response["signature"] = tools::type_to_hex(sig);
+    cmd.response["master_node_pubkey"] = tools::type_to_hex(keys.pub);
+    cmd.response["message"] = tools::type_to_hex(msg);
+    cmd.response["status"] = STATUS_OK;
+  }
+
+  void core_rpc_server::invoke(GATEWAY_GOVERNANCE_ASSEMBLE& cmd, rpc_context context)
+  {
+    const auto nettype = m_core.get_nettype();
+    governance_op_t g = parse_governance_op(cmd.request.op);
+    std::map<uint16_t, crypto::signature> by_voter; // ascending, one per voter
+    for (const auto& s : cmd.request.signatures)
+    {
+      const auto colon = s.find(':');
+      uint64_t index = 0;
+      crypto::signature sig;
+      if (colon == std::string::npos || !tools::parse_int(std::string_view{s}.substr(0, colon), index)
+          || index > std::numeric_limits<uint16_t>::max() || !tools::hex_to_type(std::string_view{s}.substr(colon + 1), sig))
+        throw rpc_error{ERROR_WRONG_PARAM, "signatures must be \"<voter_index>:<128-char hex>\", got \"" + s + "\""};
+      by_voter.emplace(static_cast<uint16_t>(index), sig);
+    }
+    auto& evidence = g.evidence();
+    evidence.clear();
+    for (const auto& [index, sig] : by_voter)
+    {
+      cryptonote::gateway_governance_signature e{};
+      e.voter_index = index;
+      e.signature = sig;
+      evidence.push_back(e);
+    }
+
+    // Exactly the check consensus makes, so a finished op is one that will be accepted.
+    auto& mnl = m_core.get_master_node_list();
+    const cryptonote::checkpoint_quorum_resolver resolve = [&mnl](uint64_t height, std::vector<crypto::public_key>& validators) {
+      auto q = mnl.get_quorum(master_nodes::quorum_type::checkpointing, height, /*include_old=*/true);
+      if (!q) return false;
+      validators = q->validators;
+      return !validators.empty();
+    };
+    auto& db = m_core.get_blockchain_storage().get_db();
+    std::string reason;
+    const bool ok = g.freeze
+        ? cryptonote::validate_gateway_freeze_operation(db, nettype, cryptonote::transaction{}, *g.freeze, resolve, reason)
+        : cryptonote::validate_gateway_repoint_operation(db, nettype, cryptonote::transaction{}, *g.repoint, resolve, reason);
+    if (!ok)
+      throw rpc_error{ERROR_WRONG_PARAM, "the op would be refused: " + reason};
+    describe_governance_op(cmd.response, g);
+    cmd.response["op"] = governance_op_hex(g);
+    cmd.response["signatures"] = evidence.size();
+    cmd.response["status"] = STATUS_OK;
+  }
+
   void core_rpc_server::invoke(BRIDGE_GET_SEATS& cmd, rpc_context context)
   {
     auto infos = m_core.get_master_node_list_state({});

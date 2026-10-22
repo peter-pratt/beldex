@@ -2220,6 +2220,29 @@ BELDEX_RPC_DOC_INTROSPECT
   };
 
   BELDEX_RPC_DOC_INTROSPECT
+  // Submit a finished gateway governance op (HF23): a freeze or re-point the checkpoint quorum
+  // signed (the daemon's gateway_governance_assemble output). This wallet only pays the fee.
+  struct GATEWAY_GOVERNANCE_SUBMIT : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("gateway_governance_submit"); }
+
+    struct request
+    {
+      std::string op;          // The finished op (tx_extra hex).
+      uint32_t    priority;    // (Optional) Transaction priority (flash not allowed).
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response
+    {
+      std::string tx_hash;
+
+      KV_MAP_SERIALIZABLE
+    };
+  };
+
+  BELDEX_RPC_DOC_INTROSPECT
   // Submit one committee member's attestation that its committee (epoch) generated a key
   // (HF23). Consensus records the key as attested once the epoch's threshold have. This
   // wallet only pays the fee; bridge signers call it for keys they hold.
@@ -2955,6 +2978,7 @@ This command is only required if the open wallet is one of the owners of a BNS r
     GATEWAY_TAKEOVER_CANCEL,
     GATEWAY_TAKEOVER_STEP,
     BRIDGE_KEY_ATTESTATION,
+    GATEWAY_GOVERNANCE_SUBMIT,
     REQUEST_STAKE_UNLOCK,
     CAN_REQUEST_STAKE_UNLOCK,
     VALIDATE_ADDRESS,

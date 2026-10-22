@@ -386,6 +386,24 @@ namespace cryptonote::rpc {
 
   void parse_request(BRIDGE_GET_STANDBY&, rpc_input) {}
 
+  void parse_request(GATEWAY_GOVERNANCE_PREPARE& c, rpc_input in) {
+    get_values(in,
+        "action", required{c.request.action},
+        "epoch_height", c.request.epoch_height,
+        "gateway_id", required{c.request.gateway_id},
+        "new_owner_key", c.request.new_owner_key,
+        "new_owner_key_type", c.request.new_owner_key_type,
+        "standby_key", c.request.standby_key);
+  }
+
+  void parse_request(GATEWAY_GOVERNANCE_SIGN& c, rpc_input in) {
+    get_values(in, "op", required{c.request.op});
+  }
+
+  void parse_request(GATEWAY_GOVERNANCE_ASSEMBLE& c, rpc_input in) {
+    get_values(in, "op", required{c.request.op}, "signatures", required{c.request.signatures});
+  }
+
   void parse_request(GET_ALL_GATEWAYS& c, rpc_input in) {
     get_values(in,
         "count", c.request.count,

@@ -203,6 +203,9 @@ std::string bridge_mint_publish_message(network_type nettype, std::string_view p
 bool validate_gateway_freeze_operation(BlockchainDB& db, network_type nettype, const transaction& tx,
                                        const tx_extra_gateway_freeze& op,
                                        const checkpoint_quorum_resolver& resolve_quorum, std::string& reason);
+// Governance is signed by the checkpoint quorum of a recent block: below the tip and no more
+// than gateway_governance_max_age_blocks back.
+bool governance_height_is_recent(BlockchainDB& db, network_type nettype, uint64_t epoch_height, std::string& reason);
 bool validate_gateway_repoint_operation(BlockchainDB& db, network_type nettype, const transaction& tx,
                                         const tx_extra_gateway_repoint& op,
                                         const checkpoint_quorum_resolver& resolve_quorum, std::string& reason);

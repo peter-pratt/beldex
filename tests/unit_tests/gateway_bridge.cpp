@@ -3094,3 +3094,67 @@ TEST(GatewayBridgeKeyAttestation, overlap_counts_the_standbys_members_run_by_the
   // Counted from b's side: alpha's two nodes in a do not double what b exposes.
   EXPECT_EQ(bridge_committee_operator_overlap({a[0], a[1]}, {b[0]}, operator_of), 1u);
 }
+
+// A governance re-point keeps the bridge-reserve flag, and both governance ops must be signed
+// by the checkpoint quorum of a recent block: an old quorum, whose operators may since have
+// left, cannot be dug up to move a gateway.
+TEST(GatewayBridgeGovernanceApply, governance_keeps_the_reserve_flag_and_needs_a_recent_quorum)
+{
+  MemGatewayDB db;
+  const crypto::public_key gw = seed_gateway(db, 10, /*bridge_reserve=*/true);
+  db.chain_height = 1000;
+  const uint64_t max_age = gateway_governance_max_age_blocks(NET_TO);
+
+  std::vector<crypto::public_key> pubs;
+  std::vector<crypto::secret_key> secs;
+  for (int i = 0; i < 20; ++i)
+  {
+    crypto::public_key p; crypto::secret_key k; crypto::generate_keys(p, k);
+    pubs.push_back(p); secs.push_back(k);
+  }
+  const checkpoint_quorum_resolver resolver = [&](uint64_t, std::vector<crypto::public_key>& v) { v = pubs; return true; };
+  const size_t required = (20 * GATEWAY_GOVERNANCE_SUPERMAJORITY_NUM + GATEWAY_GOVERNANCE_SUPERMAJORITY_DEN - 1)
+                          / GATEWAY_GOVERNANCE_SUPERMAJORITY_DEN;
+
+  gateway_account_data acct;
+  ASSERT_TRUE(load_gateway_account(db, gw, acct));
+  auto repoint = [&](uint64_t epoch, bool keep_flag, size_t signers) {
+    tx_extra_gateway_repoint op{};
+    op.gateway_id = gw;
+    op.new_owner_descriptor = acct.latest_descriptor();
+    op.new_owner_descriptor.owner_key = rand_pubkey();
+    if (!keep_flag)
+      op.new_owner_descriptor.flags &= ~GATEWAY_FLAG_BRIDGE_RESERVE;
+    op.governance_seq = acct.governance_seq;
+    op.epoch_height = epoch;
+    const crypto::hash msg = gateway_repoint_message(NET_TO, gw, op.new_owner_descriptor, op.governance_seq, epoch);
+    for (size_t i = 0; i < signers; ++i)
+    {
+      gateway_governance_signature s{};
+      s.voter_index = static_cast<uint16_t>(i);
+      crypto::generate_signature(msg, pubs[i], secs[i], s.signature);
+      op.evidence.push_back(s);
+    }
+    return op;
+  };
+  std::string reason;
+  EXPECT_TRUE(validate_gateway_repoint_operation(db, NET_TO, transaction{}, repoint(990, true, required), resolver, reason)) << reason;
+  EXPECT_FALSE(validate_gateway_repoint_operation(db, NET_TO, transaction{}, repoint(990, true, required - 1), resolver, reason));
+  EXPECT_NE(reason.find("insufficient governance evidence"), std::string::npos) << reason;
+
+  EXPECT_FALSE(validate_gateway_repoint_operation(db, NET_TO, transaction{}, repoint(990, false, required), resolver, reason));
+  EXPECT_NE(reason.find("bridge-reserve flag cannot be cleared"), std::string::npos) << reason;
+
+  for (uint64_t epoch : {uint64_t{1000}, uint64_t{1005}, 1000 - max_age - 1})
+  {
+    EXPECT_FALSE(validate_gateway_repoint_operation(db, NET_TO, transaction{}, repoint(epoch, true, required), resolver, reason)) << epoch;
+    EXPECT_NE(reason.find("not a recent block"), std::string::npos) << reason;
+  }
+  EXPECT_TRUE(validate_gateway_repoint_operation(db, NET_TO, transaction{}, repoint(1000 - max_age, true, required), resolver, reason)) << reason;
+
+  // A freeze too.
+  tx_extra_gateway_freeze fz{};
+  fz.gateway_id = gw; fz.freeze = 1; fz.governance_seq = acct.governance_seq; fz.epoch_height = 1000 - max_age - 1;
+  EXPECT_FALSE(validate_gateway_freeze_operation(db, NET_TO, transaction{}, fz, resolver, reason));
+  EXPECT_NE(reason.find("not a recent block"), std::string::npos) << reason;
+}

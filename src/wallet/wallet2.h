@@ -1454,6 +1454,9 @@ private:
     // HF23 standby takeover: carry a standalone step (a version-1 tx_extra_gateway_takeover:
     // the standby's begin or complete, or the owner's cancel) on chain. As with the ack, the
     // authority is the signature inside it, not this wallet, which only pays the fee.
+    // HF23: carry a finished governance freeze or re-point (a tx_extra fragment holding it,
+    // signed by the checkpoint quorum); this wallet only pays the fee.
+    bridge_rotation_ack_result create_gateway_governance_tx(const std::vector<uint8_t>& op_extra, uint32_t priority = 0, std::set<uint32_t> subaddr_indices = {});
     // HF23: carry one committee member's key attestation (tx_extra_bridge_key_attestation).
     bridge_rotation_ack_result create_bridge_key_attestation_tx(const cryptonote::tx_extra_bridge_key_attestation& att, uint32_t priority = 0, std::set<uint32_t> subaddr_indices = {});
     bridge_rotation_ack_result create_gateway_takeover_step_tx(const cryptonote::tx_extra_gateway_takeover& step, uint32_t priority = 0, std::set<uint32_t> subaddr_indices = {});
