@@ -2879,6 +2879,15 @@ where
     let reconcile_recheck_ticks = std::cmp::max(1, 60 / poll_secs.max(1));
     // The rotation-ack sweep: about once a minute.
     let ack_sweep_ticks = std::cmp::max(1, 60 / poll_secs.max(1));
+    // This node's attestation that its committee generated the key it serves: consensus
+    // names a standby only between keys whose committees it knows. Sent once, by each
+    // member, whichever role it serves; re-sent if not counted after a while (a dropped
+    // tx), and never once the key is attested.
+    let mut attest_next_at: u64 = 0;
+    let mut attest_done = bus_genesis == [0u8; 32];
+    if attest_done {
+        println!("  key attestation DISABLED: BRIDGE_SIGNER_GENESIS_HASH is unset, and the attestation is genesis-bound");
+    }
     // The solvency check (H-06): about once a minute unless configured.
     let solvency_secs: u64 = std::env::var("BRIDGE_SIGNER_SOLVENCY_CHECK_SECS")
         .ok()
@@ -3493,6 +3502,72 @@ where
                         ),
                     }
                 }
+            }
+        }
+
+        if !attest_done && ticks % ack_sweep_ticks == 0 {
+            use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
+            use beldex_bridge_signer::key_attestation as ka;
+            let now = beldex_bridge_signer::release_outbox::now_secs();
+            let records = key_probe_gw
+                .call("bridge_get_standby", serde_json::json!({}))
+                .map_err(|e| format!("{e:?}"))
+                .and_then(|v| ka::parse_records(&v).ok_or_else(|| "no attestations in the reply".to_string()));
+            match records.map(|r| ka::status(&r, ls.committee.epoch, &ls.pgw_group_vk, &ls.pevm_address, ls.self_index)) {
+                Ok(ka::Status::Attested) => {
+                    println!(
+                        "key attested: committee epoch {} holds gateway key {}",
+                        ls.committee.epoch,
+                        hex(&ls.pgw_group_vk)
+                    );
+                    attest_done = true;
+                }
+                Ok(ka::Status::Counted) => {}
+                Ok(ka::Status::Missing) if now >= attest_next_at => {
+                    match ka::sign(&ls.ed25519_secret, &bus_genesis, ls.committee.epoch, &ls.pgw_group_vk, &ls.pevm_address) {
+                        Err(e) => eprintln!("  key attestation not signed: {e}"),
+                        Ok(sig) => match &ack_wallet {
+                            Some(w) => match w.call(
+                                "bridge_key_attestation",
+                                serde_json::json!({
+                                    "epoch": ls.committee.epoch,
+                                    "pgw_vk": hex(&ls.pgw_group_vk),
+                                    "pevm_address": hex(&ls.pevm_address),
+                                    "voter_index": ls.self_index,
+                                    "signature": hex(&sig),
+                                }),
+                            ) {
+                                Ok(r) => {
+                                    println!(
+                                        "key attestation (committee epoch {}, member {}) submitted: tx {}",
+                                        ls.committee.epoch,
+                                        ls.self_index,
+                                        r.get("tx_hash").and_then(serde_json::Value::as_str).unwrap_or("?")
+                                    );
+                                    attest_next_at = now + 600;
+                                }
+                                Err(e) => {
+                                    eprintln!("  key attestation not submitted ({e:?}); will retry");
+                                    attest_next_at = now + 60;
+                                }
+                            },
+                            None => {
+                                println!(
+                                    "KEY-ATTESTATION epoch={} pgw_vk={} pevm_address={} voter_index={} signature={} \
+                                     (no wallet RPC: submit with the wallet RPC bridge_key_attestation)",
+                                    ls.committee.epoch,
+                                    hex(&ls.pgw_group_vk),
+                                    hex(&ls.pevm_address),
+                                    ls.self_index,
+                                    hex(&sig)
+                                );
+                                attest_next_at = now + 3600;
+                            }
+                        },
+                    }
+                }
+                Ok(ka::Status::Missing) => {}
+                Err(e) => eprintln!("  bridge_get_standby failed ({e}); key attestation waits"),
             }
         }
 

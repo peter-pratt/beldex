@@ -260,6 +260,11 @@ pub mod slash;
 #[cfg(feature = "tss-integration")]
 pub mod rotation_ack;
 
+/// A committee member's attestation that its committee generated a key, which consensus
+/// needs before it lets the bridge gateway name a standby (see [`key_attestation`]).
+#[cfg(feature = "tss-integration")]
+pub mod key_attestation;
+
 /// C.2 live-mesh **`Pevm` (cggmp21) DKG driver**: runs the real cggmp21 keygen MPC
 /// over a [`wire::SessionTransport`] via `round_based`'s sync state machine bridged
 /// to the mesh by channels. The `Pevm` counterpart to [`dkg_driver`]. Needs the

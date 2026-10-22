@@ -2902,3 +2902,22 @@ TEST(GatewayBridgeKeyAttestation, a_standby_needs_attested_keys_from_committees_
   EXPECT_EQ(find_attested_bridge_key(records, next)->epoch, 3u);
   EXPECT_FALSE(check_bridge_standby_naming(records, live, next, NET_FC, overlap, reason));
 }
+
+// The signer builds this message itself (bridge/signer/src/key_attestation.rs): pin its layout.
+TEST(GatewayBridgeKeyAttestation, the_message_layout_is_pinned)
+{
+  tx_extra_bridge_key_attestation att{};
+  att.epoch = 0x0102;
+  std::memset(att.pgw_vk.data, 2, sizeof(att.pgw_vk.data));
+  std::memset(att.pevm_address.data, 3, sizeof(att.pevm_address.data));
+  att.voter_index = 9; // not in the message: every member signs the same statement
+  block genesis_block{};
+  ASSERT_TRUE(generate_genesis_block(genesis_block, NET_FC));
+  const crypto::hash genesis = get_block_hash(genesis_block);
+  std::string want = "bridge_key_attestation_v1";
+  want.append(reinterpret_cast<const char*>(&genesis), sizeof(genesis));
+  want.append(std::string("\x00\x02\x01\x00\x00\x00\x00\x00\x00", 9));
+  want.append(std::string(32, '\x02'));
+  want.append(std::string(20, '\x03'));
+  EXPECT_EQ(bridge_key_attestation_message(NET_FC, att), want);
+}
