@@ -3446,14 +3446,20 @@ where
             match (everywhere, retired_since) {
                 (false, _) => retired_since = None,
                 (true, None) => retired_since = Some(std::time::Instant::now()),
-                (true, Some(t)) if t.elapsed() >= retire_after && orch.outstanding().is_empty() => {
+                // Duties still open are not waited for: a replaced key can never sign them (that
+                // is why it was replaced), and its successor's signers pick the same deposits and
+                // burns up under their own key. Waiting would hold the retired key, its mesh ports
+                // and its RPC load for good.
+                (true, Some(t)) if t.elapsed() >= retire_after => {
+                    let left = orch.outstanding().len();
                     let mut to = share_dir.as_os_str().to_owned();
                     to.push(format!(".retired-{}", beldex_bridge_signer::release_outbox::now_secs()));
                     match std::fs::rename(&share_dir, &to) {
                         Ok(()) => {
                             println!(
                                 "serve: this share set's key was replaced on every chain {}s ago: archived it to \
-                                 {} and exiting; this signer waits for the node's next share set",
+                                 {} and exiting ({left} duty(ies) left to the successor key); this signer waits \
+                                 for the node's next share set",
                                 t.elapsed().as_secs(),
                                 std::path::Path::new(&to).display()
                             );
@@ -3557,7 +3563,9 @@ where
                         eprintln!("!! this standby set should step aside: {why}");
                         standby_retire_since = Some(std::time::Instant::now());
                     }
-                    (Some(why), Some(t)) if t.elapsed() >= retire_after && orch.outstanding().is_empty() => {
+                    // As for a replaced live key: a stale or superseded standby's open duties
+                    // (a begin it can no longer get signed) are not waited for.
+                    (Some(why), Some(t)) if t.elapsed() >= retire_after => {
                         let mut to = share_dir.as_os_str().to_owned();
                         to.push(format!(".retired-{}", beldex_bridge_signer::release_outbox::now_secs()));
                         match std::fs::rename(&share_dir, &to) {
