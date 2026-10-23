@@ -1235,6 +1235,11 @@ void BlockchainLMDB::remove_tx_outputs(const uint64_t tx_id, const transaction& 
   bool is_pseudo_rct = tx.version >= cryptonote::txversion::v2_ringct && tx.vin.size() == 1 && std::holds_alternative<txin_gen>(tx.vin[0]);
   for (size_t i = tx.vout.size(); i-- > 0;)
   {
+    // A gateway deposit output was never indexed (add_transaction records a placeholder 0
+    // for it). Removing it as an amount-0 output would delete the chain's real amount-0
+    // output 0, and every later block would then collide with an existing index.
+    if (std::holds_alternative<cryptonote::tx_out_gateway>(tx.vout[i].target))
+      continue;
     uint64_t amount = is_pseudo_rct ? 0 : tx.vout[i].amount;
     remove_output(amount, amount_output_indices[i]);
   }

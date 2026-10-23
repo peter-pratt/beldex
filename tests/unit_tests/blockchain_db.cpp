@@ -341,6 +341,76 @@ TYPED_TEST(BlockchainDBTest, RetrieveBlockData)
 
 }  // anonymous namespace
 
+// A block holding a gateway deposit output can be popped (a reorg, or a block consensus
+// refuses after the database added it). Gateway outputs are never indexed, so popping must
+// not remove anything for them: it used to remove amount-0 output 0, after which every new
+// output collided with an existing index and no block could be added again.
+namespace
+{
+  cryptonote::block block_with_gateway_output(const crypto::hash& prev, uint64_t height,
+                                              const crypto::public_key& out_key, const crypto::public_key& gw)
+  {
+    cryptonote::block b{};
+    b.major_version = cryptonote::hf::hf7;
+    b.minor_version = 7;
+    b.timestamp = 1700000000 + height;
+    b.prev_id = prev;
+    auto& tx = b.miner_tx;
+    tx.version = cryptonote::txversion::v4_tx_types;
+    tx.type = cryptonote::txtype::standard;
+    tx.vin.push_back(cryptonote::txin_gen{height});
+    tx.vout.push_back(cryptonote::tx_out{1000, cryptonote::txout_to_key{out_key}});
+    cryptonote::tx_out_gateway g{};
+    g.gateway_addr = gw;
+    g.amount = 500;
+    tx.vout.push_back(cryptonote::tx_out{0, g});
+    tx.output_unlock_times = {0, 0};
+    tx.rct_signatures.type = rct::RCTType::Null;
+    return b;
+  }
+}
+
+TYPED_TEST(BlockchainDBTest, PoppingAGatewayDepositKeepsTheOutputIndex)
+{
+  fs::path tempPath = random_tmp_file();
+  std::string dirPath = tempPath.string();
+  this->set_prefix(dirPath);
+  ASSERT_NO_THROW(this->m_db->open(dirPath, cryptonote::FAKECHAIN));
+  this->get_filenames();
+
+  crypto::public_key k0, k1, k2, gw;
+  crypto::secret_key sk;
+  crypto::generate_keys(k0, sk); crypto::generate_keys(k1, sk); crypto::generate_keys(k2, sk); crypto::generate_keys(gw, sk);
+  auto add = [&](const cryptonote::block& b) {
+    db_wtxn_guard guard(this->m_db);
+    this->m_db->add_block(std::make_pair(b, cryptonote::block_to_blob(b)), 100, 100, 1, 1, {});
+  };
+
+  const auto b0 = block_with_gateway_output(crypto::null_hash, 0, k0, gw);
+  const auto b1 = block_with_gateway_output(cryptonote::get_block_hash(b0), 1, k1, gw);
+  ASSERT_NO_THROW(add(b0));
+  ASSERT_NO_THROW(add(b1));
+  // Coinbase outputs of RCT-era txes are indexed as amount 0; the gateway outputs are not.
+  ASSERT_EQ(this->m_db->get_num_outputs(0), 2u);
+
+  cryptonote::block popped;
+  std::vector<cryptonote::transaction> txs;
+  try { this->m_db->pop_block(popped, txs); }
+  catch (const std::exception& e) { FAIL() << "pop_block threw: " << e.what(); }
+  db_wtxn_guard guard(this->m_db);
+  ASSERT_EQ(this->m_db->get_num_outputs(0), 1u);
+  EXPECT_EQ(this->m_db->get_output_key(0, 0).pubkey, k0) << "the first output must survive";
+
+  // And the chain goes on: the next block's output takes index 1, not a taken one.
+  const auto b1b = block_with_gateway_output(cryptonote::get_block_hash(b0), 1, k2, gw);
+  guard.stop();
+  try { add(b1b); }
+  catch (const std::exception& e) { FAIL() << "adding the next block threw: " << e.what(); }
+  db_rtxn_guard rguard(this->m_db);
+  ASSERT_EQ(this->m_db->get_num_outputs(0), 2u);
+  EXPECT_EQ(this->m_db->get_output_key(0, 1).pubkey, k2);
+}
+
 // Permanent gateway release-ref index (HF23): never pruned, exact add/remove inverses,
 // and a completeness marker that lives in the table itself.
 TYPED_TEST(BlockchainDBTest, GatewayReleaseRefIndex)

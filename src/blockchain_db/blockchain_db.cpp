@@ -32,6 +32,7 @@
 #include "cryptonote_core/master_node_rules.h"
 #include "checkpoints/checkpoints.h"
 #include "epee/string_tools.h"
+#include <algorithm>
 #include "blockchain_db.h"
 #include "cryptonote_basic/cryptonote_format_utils.h"
 #include "ringct/rctOps.h"
@@ -210,10 +211,13 @@ uint64_t BlockchainDB::add_block( const std::pair<block, blobdata>& blck
 
   started = std::chrono::steady_clock::now();
 
+  // Spendable RCT outputs only: gateway deposit outputs are not indexed (add_transaction),
+  // so counting them would put outputs that do not exist into the output distribution.
+  const auto indexed = [](const cryptonote::tx_out& o) { return !std::holds_alternative<cryptonote::tx_out_gateway>(o.target); };
   uint64_t num_rct_outs = 0;
   add_transaction(blk_hash, std::make_pair(blk.miner_tx, tx_to_blob(blk.miner_tx)));
   if (blk.miner_tx.version >= cryptonote::txversion::v2_ringct)
-    num_rct_outs += blk.miner_tx.vout.size();
+    num_rct_outs += std::count_if(blk.miner_tx.vout.begin(), blk.miner_tx.vout.end(), indexed);
 
   int tx_i = 0;
   crypto::hash tx_hash = crypto::null_hash;
@@ -223,7 +227,7 @@ uint64_t BlockchainDB::add_block( const std::pair<block, blobdata>& blck
     add_transaction(blk_hash, tx, &tx_hash);
     for (const auto &vout: tx.first.vout)
     {
-      if (vout.amount == 0)
+      if (vout.amount == 0 && indexed(vout))
         ++num_rct_outs;
     }
     ++tx_i;
