@@ -228,8 +228,10 @@ for d in beldex-127.0.0.1-*/; do
   # (A standby signer reads it from its own standby tree: the node may hold no live share.)
   own="$SOCKBASE/${d}devnet/shares"; [ "$ROLE" = standby ] && own="$share"
   idx=$(ls "$own"/pgw-*.keypackage 2>/dev/null | sed -E 's/.*pgw-([0-9]+)\.keypackage/\1/' | head -1) || true
-  if [ -z "$idx" ] && [ "${SUPERVISE:-0}" = 1 ] && [ "$ROLE" = live ]; then
-    idx=waiting # supervised: it waits for this node's first share set
+  if [ -z "$idx" ] && [ "${SUPERVISE:-0}" = 1 ]; then
+    # Supervised: it waits for this node's first share set. A standby signer waiting with
+    # the rest of the current committee generates the next standby key itself (AUTO_DKG).
+    idx=waiting
   fi
   [ -n "$idx" ] || { echo "skip ${d%/}: no pgw share (did dkg run here?)"; continue; }
   if [ "$NODES" != "all" ] && [ "$idx" != waiting ]; then

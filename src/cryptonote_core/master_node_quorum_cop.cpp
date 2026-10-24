@@ -108,7 +108,9 @@ namespace master_nodes
 
     });
 
-    if (hf_version >= hf::hf19_enhance_bns) {
+    // A local devnet runs every node on one IP, so the per-IP limit would leave only
+    // MAX_ALLOWED_MASTERNODES_PER_IP of them active (too few for a bridge committee).
+    if (hf_version >= hf::hf19_enhance_bns && !cryptonote::is_local_bridge_net(m_core.get_nettype())) {
 
       std::vector<std::pair<crypto::public_key, uint64_t>> multi_mns = multi_mns_list[ips[0].first];
 

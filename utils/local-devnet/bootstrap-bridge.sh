@@ -131,12 +131,21 @@ echo "WBDX=$WBDX"
 # ── 6. gateway ───────────────────────────────────────────────────────────────
 say "bridge gateway"
 EXISTING=$(jrpc get_all_gateways | python3 -c 'import sys,json; r=json.load(sys.stdin)["result"]; print(r.get("total",0))')
+PENDING="$PWD/.gateway-secret.pending"
 if [ "$EXISTING" != "0" ] && [ -f "$ENVFILE" ] && grep -q VIEW_SECRET "$ENVFILE"; then
   echo "gateway already registered and its secret is in $ENVFILE — reusing"
   # shellcheck disable=SC1090
   . "$ENVFILE"
+elif [ "$EXISTING" != "0" ] && [ -f "$PENDING" ]; then
+  # A registration from an earlier run that this script stopped waiting for: its secret was
+  # saved before it was sent, so the gateway is still usable.
+  echo "gateway already registered; its secret was saved in $PENDING — reusing"
+  VIEW_SECRET="$(cat "$PENDING")"
 else
   VIEW_SECRET="$(openssl rand -hex 31)00"
+  # Saved BEFORE the registration is sent: the secret is the only way to read the gateway's
+  # deposits, and a run that dies before the env file is written must not lose it.
+  ( umask 077; echo "$VIEW_SECRET" > "$PENDING" )
   # a funded devnet wallet-rpc (Mike = the one with a balance)
   WPORT=""
   for p in $(ls -d testdata/wallet-127.0.0.1-* 2>/dev/null | grep -v stderr | sed 's/.*-//' | sort -n); do
@@ -154,7 +163,11 @@ else
                 \"meta_info\":\"devnet bridge reserve\",\"priority\":1}}")
   echo "$REG" | grep -q '"tx_hash"' || { echo "!! registration failed: $REG"; exit 1; }
   echo "registration tx submitted; mining it in…"
-  ./mine.sh 12 >/dev/null
+  # Wait for it to land, however long the miner takes (it can be slow on a busy host).
+  for i in $(seq 1 60); do
+    [ "$(jrpc get_all_gateways | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"].get("total",0))')" != "0" ] && break
+    ./mine.sh 2 >/dev/null
+  done
 fi
 # read the (only) gateway back — fresh chain, so newest == ours
 GWJSON=$(jrpc get_all_gateways)
