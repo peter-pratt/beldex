@@ -568,8 +568,27 @@ where
         report: &mut StepReport,
     ) {
         let mut finished: Vec<[u8; 32]> = Vec::new();
-        // At most one blocking signing round per step (see the Sign arm).
-        let mut signed_this_step = false;
+        // The one session whose round runs this step, on every node: the first, in the map
+        // order all nodes share, that is ready to sign — whether or not this node is one of
+        // its signers. A node outside that session's signer set signs nothing this step. If
+        // it went on to the next session instead, it would wait at that round's barrier for
+        // members busy in this one, while they wait for it in theirs, and each round would
+        // time out against the other (seen on the devnet: a takeover's EVM and gateway
+        // completes, signed by overlapping sets, stalled for half an hour).
+        let settle = self.sign_settle_steps;
+        let hold = self.hold.is_some();
+        let turn: Option<[u8; 32]> = self
+            .live
+            .iter()
+            .find(|(_, l)| {
+                let ticks = if l.session.stage() == l.last_stage { l.ticks_in_stage } else { 0 };
+                l.session.stage() == Stage::Sign
+                    && l.signature.is_none()
+                    && (!hold || matches!(l.duty, Duty::Takeover(_)))
+                    && ticks >= settle
+                    && l.session.canonical_signers().is_some()
+            })
+            .map(|(sk, _)| *sk);
 
         for (sk, live) in self.live.iter_mut() {
             // Reset per-attempt local state after an engine retry (fresh leader, re-verify).
@@ -636,15 +655,14 @@ where
                     // Only members that accepted the proposal participate in signing (C.5).
                     // Gated on: (a) the ACK-settle delay, so every node derives the SAME
                     // canonical participant set (its peers' barriers wait on exactly that
-                    // set); and (b) one signing round per step across all sessions — the
-                    // scheme drivers are blocking and bind a per-leg mesh port, so fanning
-                    // out over several duties at once would have nodes waiting on each
-                    // other's barriers. Deterministic map order makes every node pick the
-                    // same duty first.
+                    // set); and (b) one signing round per step, for the same session on every
+                    // node (`turn`) — the scheme drivers are blocking and bind a per-leg mesh
+                    // port, so fanning out over several duties at once would have nodes
+                    // waiting on each other's barriers.
                     if live.signature.is_none()
                         && live.acked
                         && (self.hold.is_none() || matches!(live.duty, Duty::Takeover(_)))
-                        && !signed_this_step
+                        && turn == Some(*sk)
                         && live.ticks_in_stage >= self.sign_settle_steps
                     {
                         if let (Some(p), Some(signers)) =
@@ -653,7 +671,6 @@ where
                             // A node outside the canonical set does not run the round; the
                             // set's members produce the aggregate and distribute it.
                             if signers.contains(&self.self_index) {
-                                signed_this_step = true;
                                 let message = self.policy.signing_message(&live.duty, &p);
                                 let attempt = live.session.attempt();
                                 match (self.sign)(live.duty.leg(), &message, &signers, attempt) {
@@ -1459,6 +1476,114 @@ mod tests {
             assert_eq!(set, first_set, "node {node} disagreed on the participant set");
             assert_eq!(*attempt, 0, "no retry happened, so attempt stays 0");
             assert!(set.contains(&(*node as u16)), "a node only signs if it is in the set");
+        }
+    }
+
+    /// Two duties in flight whose signer sets differ: node 0 rejects mint A (its view of the
+    /// amount differs), so A's signers are 1..=4 while B's are 0..=3. A signing round blocks
+    /// at a barrier until all its signers join, so the duties must be signed one after the
+    /// other in the order every node shares. The member that signs only the later one must
+    /// not start it before the earlier one is done. Before, it skipped straight to the later
+    /// one: on a real mesh it then waited at that barrier for members busy in the earlier
+    /// round while they waited for it, and both rounds timed out (devnet: a takeover's EVM and
+    /// gateway completes stalled for half an hour).
+    #[test]
+    fn a_member_outside_the_first_round_waits_instead_of_starting_another() {
+        let (n, t) = (6, 4);
+        let bus = Bus::new(n);
+        // (step, node, signing message) per round started; (step, node, duty) per completion.
+        let rounds: Rc<RefCell<Vec<(usize, usize, Vec<u8>)>>> = Rc::new(RefCell::new(Vec::new()));
+        let completions: Rc<RefCell<Vec<(usize, usize, DutyKey)>>> = Rc::new(RefCell::new(Vec::new()));
+        let step_no = Rc::new(RefCell::new(0usize));
+
+        struct Rec {
+            coord: Coordinator<
+                MintPolicy,
+                Box<dyn FnMut(Leg, &[u8], &[u16], u32) -> Result<Vec<u8>, String>>,
+                Box<dyn FnMut(&Duty, &[u8], &[u8]) -> ExecOutcome>,
+            >,
+            orch: Orchestrator,
+            net: NodeNet,
+        }
+
+        let mut nodes: Vec<Rec> = (0..n)
+            .map(|i| {
+                let (log, at) = (rounds.clone(), step_no.clone());
+                let (done, at2) = (completions.clone(), step_no.clone());
+                let mut coord = Coordinator::new(
+                    committee(n, t),
+                    i as u16,
+                    MintPolicy { contracts: contracts() },
+                    |_l: Leg, m: &[u8], sig: &[u8]| sha256(m).as_slice() == sig,
+                    Box::new(move |_l: Leg, m: &[u8], _s: &[u16], _a: u32| {
+                        log.borrow_mut().push((*at.borrow(), i, m.to_vec()));
+                        Ok(sha256(m).to_vec())
+                    })
+                        as Box<dyn FnMut(Leg, &[u8], &[u16], u32) -> Result<Vec<u8>, String>>,
+                    Box::new(move |d: &Duty, _p: &[u8], _s: &[u8]| {
+                        done.borrow_mut().push((*at2.borrow(), i, d.key()));
+                        ExecOutcome::Submitted
+                    }) as Box<dyn FnMut(&Duty, &[u8], &[u8]) -> ExecOutcome>,
+                );
+                coord.sign_settle_steps = 1; // as in production: one step for ACKs to settle
+                Rec { coord, orch: Orchestrator::new(), net: bus.node(i) }
+            })
+            .collect();
+
+        let mint_a = Duty::Mint(mint_ev(1000));
+        let mint_b = Duty::Mint(MintEvent { beldex_txid: [0x44; 32], ..mint_ev(2000) });
+        nodes[0].orch.observe(Duty::Mint(mint_ev(999)));
+        for nd in nodes.iter_mut().skip(1) {
+            nd.orch.observe(mint_a.clone());
+        }
+        for nd in &mut nodes {
+            nd.orch.observe(mint_b.clone());
+        }
+        for step in 0..40 {
+            *step_no.borrow_mut() = step;
+            for nd in &mut nodes {
+                nd.coord.step(&mut nd.orch, &mut nd.net);
+            }
+        }
+
+        // Which duty every node signs first, which member signs only the other, and that
+        // member's view of when each happened.
+        let epoch = nodes[1].coord.committee.epoch;
+        let sk = |d: &Duty| session_key(d.leg(), epoch, &d.key());
+        let signers_a: [usize; 4] = [1, 2, 3, 4];
+        let signers_b: [usize; 4] = [0, 1, 2, 3];
+        let (first, second, outsider) = if sk(&mint_b) < sk(&mint_a) {
+            (&mint_b, &mint_a, *signers_a.iter().find(|i| !signers_b.contains(i)).unwrap())
+        } else {
+            (&mint_a, &mint_b, *signers_b.iter().find(|i| !signers_a.contains(i)).unwrap())
+        };
+        let policy = &mut nodes[1].coord.policy;
+        let second_msg = { let p = policy.build(second).unwrap(); policy.signing_message(second, &p) };
+        let started_second = rounds
+            .borrow()
+            .iter()
+            .find(|(_, i, m)| *i == outsider && *m == second_msg)
+            .map(|(s, _, _)| *s);
+        let finished_first = completions
+            .borrow()
+            .iter()
+            .find(|(_, i, k)| *i == outsider && *k == first.key())
+            .map(|(s, _, _)| *s)
+            .expect("the outsider completes the first duty");
+        // (It may not run the second round at all: a quicker signer's aggregate can complete
+        // it first. What it must never do is start it while the first is still open.)
+        if let Some(started) = started_second {
+            assert!(
+                started >= finished_first,
+                "node {outsider} started the second round at step {started}, before the first was done (step {finished_first})"
+            );
+        }
+
+        // Both mints still complete: A on the five that agreed, B everywhere.
+        let done = completions.borrow();
+        assert_eq!(done.iter().filter(|(_, i, _)| *i == 0).count(), 1, "node 0 completes B only");
+        for i in 1..n {
+            assert_eq!(done.iter().filter(|(_, j, _)| *j == i).count(), 2, "node {i} completes both");
         }
     }
 
