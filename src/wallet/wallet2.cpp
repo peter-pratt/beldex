@@ -11998,11 +11998,17 @@ std::vector<wallet2::pending_tx> wallet2::create_transactions_2(std::vector<cryp
       idx = pop_back(preferred_inputs);
       pop_if_present(*unused_transfers_indices, idx);
       pop_if_present(*unused_dust_indices, idx);
-    } else if ((dsts.empty() || (dsts[0].amount == 0 && !(is_bns_tx || is_burn_tx))) && !adding_fee) {
+    } else if ((dsts.empty() || (dsts[0].amount == 0 && !(is_bns_tx || is_burn_tx || is_gateway_op_tx || is_bridge_cmd_tx))) && !adding_fee
+               && !tx.selected_transfers.empty()) {
       // NOTE: A BNS tx sets dsts[0].amount to 0, but this branch is for the
       // 2 inputs/2 outputs. We only have 1 output as BNS transactions are
       // distinguishable, so we actually want the last branch which uses unused
-      // outputs in the wallet to pay off the BNS fee.
+      // outputs in the wallet to pay off the BNS fee. The same holds for the
+      // other fee-only txs (gateway and bridge commands), whose dummy dest is
+      // also 0. This branch adds a *second* input next to the first, so it
+      // needs one picked already: with none (no single output covered the fee,
+      // so nothing was preferred) it read the first of an empty list and
+      // crashed the wallet.
 
       // the "make rct txes 2/2" case - we pick a small value output to "clean up" the wallet too
       std::vector<size_t> indices = get_only_rct(*unused_dust_indices, *unused_transfers_indices);
