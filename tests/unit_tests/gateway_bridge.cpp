@@ -37,6 +37,9 @@
 #include <limits>
 #include <memory>
 #include <set>
+#include <algorithm>
+#include <optional>
+#include <unordered_set>
 #include <sodium/crypto_sign.h> // ed25519 keypair/sign for the slash-evidence test
 
 using namespace cryptonote;
@@ -3157,4 +3160,313 @@ TEST(GatewayBridgeGovernanceApply, governance_keeps_the_reserve_flag_and_needs_a
   fz.gateway_id = gw; fz.freeze = 1; fz.governance_seq = acct.governance_seq; fz.epoch_height = 1000 - max_age - 1;
   EXPECT_FALSE(validate_gateway_freeze_operation(db, NET_TO, transaction{}, fz, resolver, reason));
   EXPECT_NE(reason.find("not a recent block"), std::string::npos) << reason;
+}
+
+// Standby rounds (HF23): while the gateway has no working standby, consensus draws a fresh
+// standby committee at the start of every round, from operators that run none of the owner's
+// committee, so a committee that cannot generate the key costs a round instead of an epoch.
+namespace
+{
+  using master_nodes::bridge_standby_candidate;
+  using master_nodes::bridge_standby_round_at;
+  using master_nodes::bridge_standby_round_seed;
+  using master_nodes::draw_bridge_standby_committee;
+
+  // A seated bridge seat run by operator `who` (any nonzero byte); `leaving` asks to unbond.
+  crypto::public_key seat_run_by(master_node_list::state_t& st, uint8_t who, bool leaving = false)
+  {
+    const crypto::public_key pk = rand_pubkey();
+    seat_member(st, pk, crypto::ed25519_public_key{}, 1);
+    auto info = std::make_shared<master_node_info>(*st.master_nodes_infos[pk]);
+    info->operator_address.m_spend_public_key.data[0] = who;
+    if (leaving)
+      info->bridge_seat.requested_unbond_height = 5;
+    st.master_nodes_infos[pk] = info;
+    return pk;
+  }
+
+  // The bridge gateway, registered with `owner` as its owner key.
+  void track_gateway(master_node_list::state_t& st, const crypto::eddsa_public_key& owner)
+  {
+    tx_extra_gateway_descriptor_operation op{};
+    op.op_type = gateway_descriptor_op_type::register_address;
+    op.address_id = rand_pubkey();
+    op.descriptor.version = 2;
+    op.descriptor.owner_key = owner;
+    op.descriptor.flags = GATEWAY_FLAG_BRIDGE_RESERVE;
+    transaction tx{};
+    add_gateway_descriptor_operation_to_tx_extra(tx.extra, op);
+    st.process_bridge_gateway_owner_tx(NET_FC, tx);
+  }
+
+  bridge_key_attestation_record attested(const crypto::eddsa_public_key& vk, uint64_t round_height,
+                                         const std::vector<crypto::public_key>& members, uint64_t at = 50)
+  {
+    bridge_key_attestation_record r{};
+    r.pgw_vk = vk;
+    r.epoch = 1;
+    r.round_height = round_height;
+    r.members = members;
+    r.attested_height = at;
+    return r;
+  }
+
+  const master_nodes::bridge_committee_resolver no_resolver{};
+}
+
+TEST(GatewayStandbyRounds, rounds_start_every_round_length_up_to_the_cap)
+{
+  // Local networks: 120-block epochs, 10-block rounds, so 12 rounds an epoch.
+  ASSERT_EQ(bridge_standby_round_blocks(NET_FC), 10u);
+  ASSERT_EQ(bridge_standby_max_rounds(NET_FC), 12u);
+  EXPECT_EQ(bridge_standby_round_at(NET_FC, 0), std::optional<uint64_t>{0});
+  EXPECT_EQ(bridge_standby_round_at(NET_FC, 10), std::optional<uint64_t>{1});
+  EXPECT_EQ(bridge_standby_round_at(NET_FC, 110), std::optional<uint64_t>{11});
+  EXPECT_EQ(bridge_standby_round_at(NET_FC, 120), std::optional<uint64_t>{0}) << "a new epoch starts again at 0";
+  EXPECT_FALSE(bridge_standby_round_at(NET_FC, 125));
+
+  // Mainnet: 60-block rounds, at most 24 an epoch (half of its 2,880 blocks).
+  const auto MAIN = network_type::MAINNET;
+  const uint64_t epoch = bridge_epoch_blocks(MAIN);
+  EXPECT_EQ(bridge_standby_round_blocks(MAIN), 60u);
+  EXPECT_EQ(bridge_standby_max_rounds(MAIN), 24u);
+  EXPECT_EQ(bridge_standby_round_at(MAIN, 3 * epoch + 23 * 60), std::optional<uint64_t>{23});
+  EXPECT_FALSE(bridge_standby_round_at(MAIN, 3 * epoch + 24 * 60)) << "past the cap: wait for the next epoch";
+  EXPECT_FALSE(bridge_standby_round_at(MAIN, 3 * epoch + 30));
+}
+
+TEST(GatewayStandbyRounds, the_seed_is_apart_from_the_epoch_committees)
+{
+  const crypto::hash block = crypto::cn_fast_hash("block", 5);
+  EXPECT_NE(bridge_standby_round_seed(block), block);
+  EXPECT_EQ(bridge_standby_round_seed(block), bridge_standby_round_seed(block));
+  EXPECT_NE(bridge_standby_round_seed(block), bridge_standby_round_seed(crypto::cn_fast_hash("other", 5)));
+}
+
+TEST(GatewayStandbyRounds, the_draw_leaves_out_the_owners_operators)
+{
+  const size_t size = bridge_committee_size(NET_FC);
+  std::vector<bridge_standby_candidate> candidates;
+  std::map<crypto::public_key, std::string> op_of;
+  auto add = [&](const std::string& op) {
+    candidates.push_back({rand_pubkey(), op});
+    op_of[candidates.back().mn] = op;
+  };
+  const std::unordered_set<std::string> owners{"o1", "o2", "o3", "o4", "o5", "o6"};
+  for (const auto& o : owners)
+    add(o);
+  for (int i = 0; i < 10; ++i)
+    add("n" + std::to_string(i));
+  add("n0"); add("n0"); // an operator with three seats still gets one slot
+
+  const crypto::hash seed = crypto::cn_fast_hash("seed", 4);
+  const auto members = draw_bridge_standby_committee(candidates, owners, seed, hf::hf23_bridge, NET_FC);
+  ASSERT_EQ(members.size(), size);
+  EXPECT_TRUE(std::is_sorted(members.begin(), members.end()));
+  std::set<std::string> ops;
+  for (const auto& m : members)
+  {
+    EXPECT_EQ(owners.count(op_of.at(m)), 0u) << "an owner operator was drawn though enough others were seated";
+    ops.insert(op_of.at(m));
+  }
+  EXPECT_EQ(ops.size(), size) << "one seat per operator";
+
+  // Every node draws the same committee, whatever order it lists the seats in.
+  auto reversed = candidates;
+  std::reverse(reversed.begin(), reversed.end());
+  EXPECT_EQ(draw_bridge_standby_committee(reversed, owners, seed, hf::hf23_bridge, NET_FC), members);
+
+  // Another round's seed draws another committee.
+  bool differs = false;
+  for (int i = 0; i < 8 && !differs; ++i)
+    differs = draw_bridge_standby_committee(candidates, owners, crypto::cn_fast_hash(&i, sizeof(i)), hf::hf23_bridge,
+                                            NET_FC) != members;
+  EXPECT_TRUE(differs);
+}
+
+TEST(GatewayStandbyRounds, the_draw_tops_up_from_the_owners_operators_only_within_the_overlap_limit)
+{
+  const size_t size = bridge_committee_size(NET_FC);
+  const size_t limit = size - bridge_committee_threshold(NET_FC);
+  const std::unordered_set<std::string> owners{"o1", "o2", "o3", "o4", "o5", "o6"};
+  const crypto::hash seed = crypto::cn_fast_hash("seed", 4);
+  auto draw = [&](size_t others) {
+    std::vector<bridge_standby_candidate> candidates;
+    for (const auto& o : owners)
+      candidates.push_back({rand_pubkey(), o});
+    for (size_t i = 0; i < others; ++i)
+      candidates.push_back({rand_pubkey(), "n" + std::to_string(i)});
+    std::set<std::string> from_owners;
+    const auto members = draw_bridge_standby_committee(candidates, owners, seed, hf::hf23_bridge, NET_FC);
+    for (const auto& m : members)
+      for (const auto& c : candidates)
+        if (c.mn == m && owners.count(c.op))
+          from_owners.insert(c.op);
+    return std::make_pair(members.size(), from_owners.size());
+  };
+  // Exactly enough room in the overlap limit: topped up to a full committee.
+  EXPECT_EQ(draw(size - limit), std::make_pair(size, limit));
+  // One short: a committee with more of the owner's operators could not be named, so none.
+  EXPECT_EQ(draw(size - limit - 1), std::make_pair(size_t{0}, size_t{0}));
+}
+
+TEST(GatewayStandbyRounds, a_round_draws_a_committee_only_while_a_standby_is_due)
+{
+  master_node_list::state_t cur(nullptr);
+  cur.block_hash = crypto::cn_fast_hash("tip", 3);
+  std::vector<crypto::public_key> owner_committee, others;
+  for (uint8_t who = 1; who <= 6; ++who)
+    owner_committee.push_back(seat_run_by(cur, who));
+  for (uint8_t who = 11; who <= 18; ++who)
+    others.push_back(seat_run_by(cur, who));
+  const crypto::public_key leaving = seat_run_by(cur, 30, /*leaving=*/true);
+
+  const crypto::eddsa_public_key owner = new_vk();
+  track_gateway(cur, owner);
+  std::vector<crypto::public_key> owner_members;
+  std::string reason;
+  EXPECT_FALSE(cur.bridge_standby_due(NET_FC, 130, no_resolver, owner_members, reason));
+  EXPECT_NE(reason.find("owner's key has no committee attestation"), std::string::npos) << reason;
+
+  cur.bridge_key_attestations.push_back(attested(owner, 0, owner_committee));
+  ASSERT_TRUE(cur.bridge_standby_due(NET_FC, 130, no_resolver, owner_members, reason)) << reason;
+  EXPECT_EQ(owner_members, owner_committee);
+
+  // Not a round's start: nothing. A round's start: a committee with none of the owner's operators
+  // and never a seat that asked to leave.
+  cur.update_bridge_standby_rounds(NET_FC, hf::hf23_bridge, 125, no_resolver);
+  EXPECT_TRUE(cur.bridge_standby_rounds.empty());
+  cur.update_bridge_standby_rounds(NET_FC, hf::hf23_bridge, 130, no_resolver);
+  ASSERT_EQ(cur.bridge_standby_rounds.size(), 1u);
+  const auto& round = cur.bridge_standby_rounds[0];
+  EXPECT_EQ(round.round_height, 130u);
+  ASSERT_EQ(round.members.size(), bridge_committee_size(NET_FC));
+  for (const auto& m : round.members)
+  {
+    EXPECT_EQ(std::count(owner_committee.begin(), owner_committee.end(), m), 0);
+    EXPECT_NE(m, leaving);
+  }
+
+  // A round stays for its attestation window, then goes; the next round draws its own.
+  cur.block_hash = crypto::cn_fast_hash("next", 4);
+  cur.update_bridge_standby_rounds(NET_FC, hf::hf23_bridge, 140, no_resolver);
+  ASSERT_EQ(cur.bridge_standby_rounds.size(), 2u);
+  EXPECT_NE(cur.bridge_standby_rounds[1].members, cur.bridge_standby_rounds[0].members)
+      << "a different block seeds a different draw";
+  cur.update_bridge_standby_rounds(NET_FC, hf::hf23_bridge, 141, no_resolver);
+  ASSERT_EQ(cur.bridge_standby_rounds.size(), 1u);
+  EXPECT_EQ(cur.bridge_standby_rounds[0].round_height, 140u);
+}
+
+TEST(GatewayStandbyRounds, what_makes_a_standby_due)
+{
+  master_node_list::state_t cur(nullptr);
+  std::vector<crypto::public_key> owner_committee, others, mixed;
+  for (uint8_t who = 1; who <= 6; ++who)
+    owner_committee.push_back(seat_run_by(cur, who));
+  for (uint8_t who = 11; who <= 16; ++who)
+    others.push_back(seat_run_by(cur, who));
+  // Three of the owner's operators: one past the overlap limit of 2.
+  for (uint8_t who : {1, 2, 3, 21, 22, 23})
+    mixed.push_back(seat_run_by(cur, who));
+  const crypto::eddsa_public_key owner = new_vk(), named = new_vk(), waiting = new_vk(), older = new_vk();
+  track_gateway(cur, owner);
+  cur.bridge_key_attestations.push_back(attested(owner, 0, owner_committee));
+  std::vector<crypto::public_key> owner_members;
+  std::string reason;
+  const uint64_t stale = gateway_standby_stale_blocks(NET_FC);
+
+  // A working standby: not due. Gone stale: due.
+  master_nodes::bridge_standby_liveness_record live{};
+  live.standby = named;
+  live.named_height = 1000;
+  cur.bridge_standby_liveness.push_back(live);
+  EXPECT_FALSE(cur.bridge_standby_due(NET_FC, 1000 + stale, no_resolver, owner_members, reason));
+  EXPECT_NE(reason.find("a standby is named"), std::string::npos) << reason;
+  ASSERT_TRUE(cur.bridge_standby_due(NET_FC, 1001 + stale, no_resolver, owner_members, reason)) << reason;
+
+  // An attested key a round generated after the named one is waiting to be named: not due...
+  cur.bridge_key_attestations.push_back(attested(named, 900, others));
+  cur.bridge_key_attestations.push_back(attested(waiting, 1100, others, 1110));
+  EXPECT_FALSE(cur.bridge_standby_due(NET_FC, 1001 + stale, no_resolver, owner_members, reason));
+  EXPECT_NE(reason.find("waiting to be named"), std::string::npos) << reason;
+  // ...unless its committee shares too many operators with the owner's: it could never be named.
+  cur.bridge_key_attestations.back().members = mixed;
+  ASSERT_TRUE(cur.bridge_standby_due(NET_FC, 1001 + stale, no_resolver, owner_members, reason)) << reason;
+  cur.bridge_key_attestations.pop_back();
+
+  // A key from before the named standby can never be named (a gateway never names a key twice),
+  // so it waits for nothing, however well it would fit.
+  cur.bridge_key_attestations.push_back(attested(older, 800, others));
+  ASSERT_TRUE(cur.bridge_standby_due(NET_FC, 1001 + stale, no_resolver, owner_members, reason)) << reason;
+
+  // A key still collecting is not waiting either.
+  cur.bridge_key_attestations.push_back(attested(waiting, 1100, others, 0));
+  ASSERT_TRUE(cur.bridge_standby_due(NET_FC, 1001 + stale, no_resolver, owner_members, reason)) << reason;
+}
+
+TEST(GatewayStandbyRounds, too_few_seats_draw_no_committee)
+{
+  master_node_list::state_t cur(nullptr);
+  cur.block_hash = crypto::cn_fast_hash("tip", 3);
+  std::vector<crypto::public_key> owner_committee;
+  for (uint8_t who = 1; who <= 6; ++who)
+    owner_committee.push_back(seat_run_by(cur, who));
+  const crypto::eddsa_public_key owner = new_vk();
+  track_gateway(cur, owner);
+  cur.bridge_key_attestations.push_back(attested(owner, 0, owner_committee));
+
+  // Only the owner's operators are seated: the overlap limit allows two of them, short of six.
+  cur.update_bridge_standby_rounds(NET_FC, hf::hf23_bridge, 130, no_resolver);
+  EXPECT_TRUE(cur.bridge_standby_rounds.empty());
+  // Four more operators make exactly enough.
+  for (uint8_t who = 11; who <= 14; ++who)
+    seat_run_by(cur, who);
+  cur.update_bridge_standby_rounds(NET_FC, hf::hf23_bridge, 140, no_resolver);
+  EXPECT_EQ(cur.bridge_standby_rounds.size(), 1u);
+}
+
+TEST(GatewayStandbyRounds, an_attestation_record_keeps_its_committee)
+{
+  master_node_list::state_t cur(nullptr);
+  const committee_keys c = make_committee(bridge_committee_size(NET_FC));
+  const crypto::eddsa_public_key vk = new_vk();
+  ASSERT_TRUE(run_attestation(cur, c, sign_attestation(c, 0, 3, vk), 50));
+  ASSERT_EQ(cur.bridge_key_attestations.size(), 1u);
+  EXPECT_EQ(cur.bridge_key_attestations[0].members, c.mn);
+  EXPECT_EQ(cur.bridge_key_attestations[0].round_height, 0u);
+  EXPECT_EQ(cur.bridge_key_attestations[0].committee_height(NET_FC), 3 * bridge_epoch_blocks(NET_FC));
+}
+
+TEST(GatewayStandbyRounds, rounds_and_record_committees_survive_state_serialization)
+{
+  master_node_list::state_serialized s{};
+  s.version = master_node_list::state_serialized::get_version(hf::hf23_bridge);
+  ASSERT_EQ(s.version, master_node_list::state_serialized::version_t::version_8_bridge_standby_rounds);
+  master_nodes::bridge_standby_round round{};
+  round.round_height = 130;
+  round.members = {rand_pubkey(), rand_pubkey()};
+  s.bridge_standby_rounds.push_back(round);
+  bridge_key_attestation_record r{};
+  r.pgw_vk = new_vk();
+  s.bridge_key_attestations.push_back(r);
+  s.bridge_key_attestation_committees.push_back({130, round.members});
+
+  master_node_list::state_serialized got{};
+  ASSERT_NO_THROW(serialization::parse_binary(serialization::dump_binary(s), got));
+  ASSERT_EQ(got.bridge_standby_rounds.size(), 1u);
+  EXPECT_EQ(got.bridge_standby_rounds[0].round_height, 130u);
+  EXPECT_EQ(got.bridge_standby_rounds[0].members, round.members);
+  ASSERT_EQ(got.bridge_key_attestation_committees.size(), 1u);
+  EXPECT_EQ(got.bridge_key_attestation_committees[0].round_height, 130u);
+  EXPECT_EQ(got.bridge_key_attestation_committees[0].members, round.members);
+  ASSERT_EQ(got.bridge_key_attestations.size(), 1u);
+
+  // A state saved before rounds loads with none, and its records keep their old layout.
+  s.version = master_node_list::state_serialized::version_t::version_7_bridge_standby_liveness;
+  master_node_list::state_serialized older{};
+  ASSERT_NO_THROW(serialization::parse_binary(serialization::dump_binary(s), older));
+  EXPECT_TRUE(older.bridge_standby_rounds.empty());
+  EXPECT_TRUE(older.bridge_key_attestation_committees.empty());
+  EXPECT_EQ(older.bridge_key_attestations.size(), 1u);
 }

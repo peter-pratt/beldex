@@ -425,6 +425,23 @@ constexpr uint64_t gateway_standby_stale_blocks(network_type n)
 {
   return is_local_bridge_net(n) ? 120 : 2880; // ~1 day
 }
+// Standby rounds (HF23): while the bridge gateway has no working standby, consensus draws a
+// fresh standby committee at the start of every round, so a committee that cannot generate
+// the key (a member offline) costs a round, not an epoch. A round's committee attests its key
+// only within the window from the round's start, and an epoch has at most max_rounds rounds.
+constexpr uint64_t bridge_standby_round_blocks(network_type n)
+{
+  return is_local_bridge_net(n) ? 10 : 60; // ~30 min: a 20-member DKG takes minutes
+}
+constexpr uint64_t bridge_standby_round_window_blocks(network_type n)
+{
+  return is_local_bridge_net(n) ? 10 : 60;
+}
+constexpr uint64_t bridge_standby_max_rounds(network_type n)
+{
+  const uint64_t fit = bridge_epoch_blocks(n) / bridge_standby_round_blocks(n);
+  return fit < 24 ? fit : 24;
+}
 constexpr uint64_t bridge_bond_unlock_blocks(network_type n)
 {
   return is_local_bridge_net(n) ? 360 : BRIDGE_BOND_UNLOCK_BLOCKS;
