@@ -373,7 +373,8 @@ uint64_t gateway_standby_alive_height(network_type nettype, uint64_t chain_heigh
 
 std::string bridge_key_attestation_message(network_type nettype, const tx_extra_bridge_key_attestation& att)
 {
-  // DOMAIN || genesis(32) || version(u8) || epoch(u64 LE) || pgw_vk(32) || pevm_address(20).
+  // DOMAIN || genesis(32) || version(u8) || epoch(u64 LE) || pgw_vk(32) || pevm_address(20),
+  // and for version >= 1 || round_height(u64 LE).
   // The voter is not in it: every member signs the same statement.
   const crypto::hash& genesis = gateway_chain_binding(nettype);
   std::string buf;
@@ -383,6 +384,8 @@ std::string bridge_key_attestation_message(network_type nettype, const tx_extra_
   append_u64_le(buf, att.epoch);
   buf.append(reinterpret_cast<const char*>(att.pgw_vk.data), sizeof(att.pgw_vk.data));
   buf.append(reinterpret_cast<const char*>(att.pevm_address.data), sizeof(att.pevm_address.data));
+  if (att.version >= 1)
+    append_u64_le(buf, att.round_height);
   return buf;
 }
 
@@ -390,9 +393,16 @@ bool verify_bridge_key_attestation(const tx_extra_bridge_key_attestation& att,
                                    const std::vector<crypto::ed25519_public_key>& signer_keys,
                                    network_type nettype, std::string& reason)
 {
-  if (att.version != 0)
+  if (att.version > 1)
   {
     reason = "unknown key attestation version";
+    return false;
+  }
+  // A round's attestation names the epoch its round is in, so the two can never disagree.
+  if (att.version == 1 && (att.round_height == 0 || att.epoch != att.round_height / bridge_epoch_blocks(nettype)))
+  {
+    reason = "key attestation of standby round " + std::to_string(att.round_height) + " names epoch "
+             + std::to_string(att.epoch);
     return false;
   }
   if (att.voter_index >= signer_keys.size() || signer_keys[att.voter_index] == crypto::ed25519_public_key::null())
@@ -512,6 +522,8 @@ std::string bridge_slash_message(network_type nettype, const tx_extra_bridge_sla
   buf.push_back(static_cast<char>((slash.accused_index >> 8) & 0xff));
   append_u64_le(buf, slash.epoch);
   append_u64_le(buf, slash.height);
+  if (slash.version >= 2)
+    append_u64_le(buf, slash.round_height);
   return buf;
 }
 
@@ -519,6 +531,12 @@ bool verify_bridge_slash_evidence(const tx_extra_bridge_slash& slash,
                                   const std::vector<crypto::ed25519_public_key>& signer_keys,
                                   size_t threshold, network_type nettype, std::string& reason)
 {
+  // Only version 2 names a standby round, and it must name one.
+  if ((slash.version >= 2) != (slash.round_height != 0))
+  {
+    reason = "slash report version and standby round disagree";
+    return false;
+  }
   // Coarse/unattributed `Pevm` fault (failing_check == 3) is a governance freeze,
   // not a slash — never admissible slashing evidence.
   if (slash.failing_check == 3)

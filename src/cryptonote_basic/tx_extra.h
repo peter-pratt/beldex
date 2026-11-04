@@ -852,6 +852,9 @@ namespace cryptonote
     uint64_t     height = 0;                        // session height
     crypto::hash transcript_root{};                // S4 agreed session transcript root
     std::vector<bridge_slash_signature> accusers;  // >= t+1 distinct committee signers
+    // version >= 2: the key is a standby round's, so the committee (accused_index, accusers) is
+    // that round's, found from the key's attestation record.
+    uint64_t     round_height = 0;
 
     BEGIN_SERIALIZE()
       FIELD(version)
@@ -862,6 +865,8 @@ namespace cryptonote
       VARINT_FIELD(height)
       FIELD(transcript_root)
       FIELD(accusers)
+      if (version >= 2)
+        VARINT_FIELD(round_height)
     END_SERIALIZE()
   };
 
@@ -876,6 +881,10 @@ namespace cryptonote
   // the key as attested once the epoch's threshold have. That is how consensus learns which
   // committee holds a key: the live owner's, to compare a standby's committee against, and
   // a standby's, which must not share too many members with it.
+  //
+  // Version 1 is a standby round's committee speaking: `round_height` is the round's start and
+  // `voter_index` an index in that round's committee. It counts only within the round's window
+  // (bridge_standby_round_window_blocks), so a committee can never be picked after the fact.
   struct tx_extra_bridge_key_attestation
   {
     uint8_t                   version = 0;
@@ -884,6 +893,7 @@ namespace cryptonote
     crypto::eth_address       pevm_address{};   // its wBDX (Pevm) signer address
     uint16_t                  voter_index = 0;  // this member's index in that committee
     crypto::ed25519_signature signature{};      // over bridge_key_attestation_message
+    uint64_t                  round_height = 0; // version >= 1: the standby round's start
 
     BEGIN_SERIALIZE()
       FIELD(version)
@@ -892,6 +902,8 @@ namespace cryptonote
       FIELD(pevm_address)
       VARINT_FIELD(voter_index)
       FIELD(signature)
+      if (version >= 1)
+        VARINT_FIELD(round_height)
     END_SERIALIZE()
   };
 

@@ -2500,6 +2500,60 @@ namespace master_nodes
   }
 
 
+  // Who runs master node `pk`, for counting committee overlap by operator: its operator address,
+  // or, for a node no longer registered or registered without one, the node itself.
+  static std::string bridge_operator_id(const master_nodes_infos_t &infos, const crypto::public_key &pk)
+  {
+    auto it = infos.find(pk);
+    if (it == infos.end() || it->second->operator_address == cryptonote::account_public_address{})
+      return std::string(reinterpret_cast<const char *>(&pk), sizeof(pk));
+    const auto &op = it->second->operator_address;
+    return std::string(reinterpret_cast<const char *>(&op.m_spend_public_key), sizeof(op.m_spend_public_key))
+           + std::string(reinterpret_cast<const char *>(&op.m_view_public_key), sizeof(op.m_view_public_key));
+  }
+
+  // What the state keeps of a gateway owner key (bridge_gateway_owner::owner).
+  static crypto::hash bridge_owner_hash(const cryptonote::gateway_owner_key_v &key)
+  {
+    std::string buf(1, static_cast<char>(key.index()));
+    std::visit([&buf](const auto &k) { buf.append(reinterpret_cast<const char *>(&k), sizeof(k)); }, key);
+    return crypto::cn_fast_hash(buf.data(), buf.size());
+  }
+
+  // The members of the committee that generated `r`: kept with the record, or, for a record kept
+  // before they were, its epoch's committee.
+  static std::vector<crypto::public_key> bridge_record_members(const bridge_key_attestation_record &r,
+                                                               cryptonote::network_type nettype,
+                                                               const bridge_committee_resolver &resolve_committee)
+  {
+    if (!r.members.empty())
+      return r.members;
+    std::vector<crypto::public_key> members;
+    std::vector<crypto::ed25519_public_key> signer_keys;
+    size_t threshold = 0;
+    if (r.round_height == 0 && resolve_committee)
+      resolve_committee(r.epoch * cryptonote::bridge_epoch_blocks(nettype), members, signer_keys, threshold);
+    return members;
+  }
+
+  // The signer keys of `members`, in order. Zero for a member that can no longer be keyed (its seat
+  // is gone) or has nothing left at stake (slashed): a zero ed25519 key is a small-order point
+  // libsodium rejects, so that member simply cannot be counted.
+  static std::vector<crypto::ed25519_public_key> bridge_signer_keys(const master_nodes_infos_t &infos,
+                                                                    const std::vector<crypto::public_key> &members)
+  {
+    std::vector<crypto::ed25519_public_key> keys;
+    keys.reserve(members.size());
+    for (const crypto::public_key &pk : members)
+    {
+      auto it = infos.find(pk);
+      keys.push_back(it != infos.end() && it->second->bridge_seat.registered && !it->second->bridge_seat.is_forfeited()
+                         ? it->second->bridge_seat.signer_ed25519
+                         : crypto::ed25519_public_key::null());
+    }
+    return keys;
+  }
+
   bool master_node_list::state_t::process_bridge_slash_tx(cryptonote::network_type nettype,
                                                           const cryptonote::block &block,
                                                           const cryptonote::transaction &tx,
@@ -2527,11 +2581,16 @@ namespace master_nodes
     std::vector<crypto::public_key> members;
     std::vector<crypto::ed25519_public_key> signer_keys;
     size_t threshold = 0;
-    if (!resolve_committee(epoch_height, members, signer_keys, threshold) || members.empty()
-        || members.size() != signer_keys.size())
+    // A report about a standby round's key is judged against that round's committee.
+    const bool resolved = op.version >= 2
+        ? bridge_round_committee(op.round_height, members, signer_keys)
+        : resolve_committee(epoch_height, members, signer_keys, threshold);
+    if (op.version >= 2)
+      threshold = cryptonote::bridge_committee_threshold(nettype);
+    if (!resolved || members.empty() || members.size() != signer_keys.size())
     {
       LOG_PRINT_L1("Bridge slash TX: no bridge committee for epoch " << op.epoch
-                   << " (height " << epoch_height << ")");
+                   << " (height " << epoch_height << ", standby round " << op.round_height << ")");
       return false;
     }
 
@@ -2607,13 +2666,22 @@ namespace master_nodes
     std::vector<crypto::public_key> members;
     std::vector<crypto::ed25519_public_key> signer_keys;
     size_t threshold = 0;
-    if (!resolve_committee(epoch_height, members, signer_keys, threshold) || members.empty()
-        || members.size() != signer_keys.size())
+    std::string reason;
+    if (att.version >= 1)
+    {
+      if (!check_bridge_standby_attestation(att, block_height, nettype, members, signer_keys, reason))
+      {
+        LOG_PRINT_L1("Bridge key attestation rejected: " << reason);
+        return false;
+      }
+      threshold = cryptonote::bridge_committee_threshold(nettype);
+    }
+    else if (!resolve_committee(epoch_height, members, signer_keys, threshold) || members.empty()
+             || members.size() != signer_keys.size())
     {
       LOG_PRINT_L1("Bridge key attestation: no bridge committee for epoch " << att.epoch);
       return false;
     }
-    std::string reason;
     if (!cryptonote::verify_bridge_key_attestation(att, signer_keys, nettype, reason))
     {
       LOG_PRINT_L1("Bridge key attestation rejected: " << reason);
@@ -2621,20 +2689,32 @@ namespace master_nodes
     }
 
     auto it = std::find_if(bridge_key_attestations.begin(), bridge_key_attestations.end(), [&](const auto &r) {
-      return r.pgw_vk == att.pgw_vk && r.pevm_address == att.pevm_address && r.epoch == att.epoch;
+      return r.pgw_vk == att.pgw_vk && r.pevm_address == att.pevm_address && r.epoch == att.epoch
+             && r.round_height == att.round_height;
     });
     if (it == bridge_key_attestations.end())
     {
-      // Bounded: drop the oldest record still collecting, else the oldest of all.
+      // Bounded: drop the oldest record still collecting, else the oldest of all. Never the
+      // owner's or the named standby's: naming, new rounds and slashing all rest on those.
       constexpr size_t MAX_RECORDS = 64;
       if (bridge_key_attestations.size() >= MAX_RECORDS)
       {
+        const auto in_use = [&](const bridge_key_attestation_record &r) {
+          return (!bridge_gateway_owners.empty()
+                  && bridge_owner_hash(cryptonote::gateway_owner_key_v{r.pgw_vk}) == bridge_gateway_owners.front().owner)
+                 || (!bridge_standby_liveness.empty() && bridge_standby_liveness.front().standby == r.pgw_vk);
+        };
         auto old = std::find_if(bridge_key_attestations.begin(), bridge_key_attestations.end(),
-                                [](const auto &r) { return r.attested_height == 0; });
-        bridge_key_attestations.erase(old != bridge_key_attestations.end() ? old : bridge_key_attestations.begin());
+                                [&](const auto &r) { return r.attested_height == 0 && !in_use(r); });
+        if (old == bridge_key_attestations.end())
+          old = std::find_if(bridge_key_attestations.begin(), bridge_key_attestations.end(),
+                             [&](const auto &r) { return !in_use(r); });
+        if (old != bridge_key_attestations.end())
+          bridge_key_attestations.erase(old);
       }
       bridge_key_attestations.push_back(bridge_key_attestation_record{att.pgw_vk, att.pevm_address, att.epoch, {}, 0});
       it = std::prev(bridge_key_attestations.end());
+      it->round_height = att.round_height;
       it->members = members;
     }
     if (std::find(it->voters.begin(), it->voters.end(), att.voter_index) != it->voters.end())
@@ -2654,7 +2734,8 @@ namespace master_nodes
   {
     std::lock_guard lock(m_mn_mutex);
     for (const auto &r : m_state.bridge_key_attestations)
-      if (r.pgw_vk == att.pgw_vk && r.pevm_address == att.pevm_address && r.epoch == att.epoch)
+      if (r.pgw_vk == att.pgw_vk && r.pevm_address == att.pevm_address && r.epoch == att.epoch
+          && r.round_height == att.round_height)
         return std::find(r.voters.begin(), r.voters.end(), att.voter_index) != r.voters.end();
     return false;
   }
@@ -2683,26 +2764,6 @@ namespace master_nodes
                        [&](const bridge_gateway_owner &g) { return g.gateway_id == gateway_id; });
   }
 
-  // Who runs master node `pk`, for counting committee overlap by operator: its operator address,
-  // or, for a node no longer registered or registered without one, the node itself.
-  static std::string bridge_operator_id(const master_nodes_infos_t &infos, const crypto::public_key &pk)
-  {
-    auto it = infos.find(pk);
-    if (it == infos.end() || it->second->operator_address == cryptonote::account_public_address{})
-      return std::string(reinterpret_cast<const char *>(&pk), sizeof(pk));
-    const auto &op = it->second->operator_address;
-    return std::string(reinterpret_cast<const char *>(&op.m_spend_public_key), sizeof(op.m_spend_public_key))
-           + std::string(reinterpret_cast<const char *>(&op.m_view_public_key), sizeof(op.m_view_public_key));
-  }
-
-  // What the state keeps of a gateway owner key (bridge_gateway_owner::owner).
-  static crypto::hash bridge_owner_hash(const cryptonote::gateway_owner_key_v &key)
-  {
-    std::string buf(1, static_cast<char>(key.index()));
-    std::visit([&buf](const auto &k) { buf.append(reinterpret_cast<const char *>(&k), sizeof(k)); }, key);
-    return crypto::cn_fast_hash(buf.data(), buf.size());
-  }
-
   std::optional<size_t> master_node_list::bridge_committee_overlap(uint64_t epoch_a, uint64_t epoch_b) const
   {
     std::vector<crypto::public_key> a, b;
@@ -2716,6 +2777,42 @@ namespace master_nodes
     return bridge_committee_operator_overlap(a, b, [this](const crypto::public_key &pk) {
       return bridge_operator_id(m_state.master_nodes_infos, pk);
     });
+  }
+
+  std::optional<size_t> master_node_list::bridge_committee_overlap(const bridge_key_attestation_record &a,
+                                                                    const bridge_key_attestation_record &b) const
+  {
+    const bridge_committee_resolver resolve = [this](uint64_t epoch_height, std::vector<crypto::public_key> &members,
+                                                     std::vector<crypto::ed25519_public_key> &signer_keys, size_t &threshold) {
+      return get_bridge_committee(epoch_height, members, signer_keys, threshold);
+    };
+    const auto ma = bridge_record_members(a, m_blockchain.nettype(), resolve);
+    const auto mb = bridge_record_members(b, m_blockchain.nettype(), resolve);
+    if (ma.empty() || mb.empty())
+      return std::nullopt;
+    std::lock_guard lock(m_mn_mutex);
+    return bridge_committee_operator_overlap(ma, mb, [this](const crypto::public_key &pk) {
+      return bridge_operator_id(m_state.master_nodes_infos, pk);
+    });
+  }
+
+  bool master_node_list::check_bridge_standby_attestation(const cryptonote::tx_extra_bridge_key_attestation &att,
+                                                          std::vector<crypto::public_key> &members,
+                                                          std::vector<crypto::ed25519_public_key> &signer_keys,
+                                                          std::string &reason) const
+  {
+    std::lock_guard lock(m_mn_mutex);
+    return m_state.check_bridge_standby_attestation(att, m_state.height + 1, m_blockchain.nettype(), members, signer_keys, reason);
+  }
+
+  bool master_node_list::get_bridge_round_committee(uint64_t round_height,
+                                                    std::vector<crypto::public_key> &members,
+                                                    std::vector<crypto::ed25519_public_key> &signer_keys,
+                                                    size_t &threshold) const
+  {
+    std::lock_guard lock(m_mn_mutex);
+    threshold = cryptonote::bridge_committee_threshold(m_blockchain.nettype());
+    return m_state.bridge_round_committee(round_height, members, signer_keys);
   }
 
   size_t bridge_committee_operator_overlap(const std::vector<crypto::public_key> &a,
@@ -2736,16 +2833,25 @@ namespace master_nodes
                                               const cryptonote::gateway_owner_key_v &standby,
                                               std::string &reason) const
   {
+    uint64_t height;
+    {
+      std::lock_guard lock(m_mn_mutex);
+      height = m_state.height + 1;
+    }
     return check_bridge_standby_naming(get_bridge_key_attestations(), owner, standby, m_blockchain.nettype(),
-                                       [this](uint64_t a, uint64_t b) { return bridge_committee_overlap(a, b); },
-                                       reason);
+                                       [this](const bridge_key_attestation_record &a, const bridge_key_attestation_record &b) {
+                                         return bridge_committee_overlap(a, b);
+                                       },
+                                       get_bridge_standby_liveness(), height, reason);
   }
 
   bool check_bridge_standby_naming(const std::vector<bridge_key_attestation_record> &records,
                                    const cryptonote::gateway_owner_key_v &owner,
                                    const cryptonote::gateway_owner_key_v &standby,
                                    cryptonote::network_type nettype,
-                                   const std::function<std::optional<size_t>(uint64_t, uint64_t)> &overlap,
+                                   const bridge_record_overlap_fn &overlap,
+                                   const std::vector<bridge_standby_liveness_record> &liveness,
+                                   uint64_t height,
                                    std::string &reason)
   {
     const auto *owner_vk = std::get_if<crypto::eddsa_public_key>(&owner);
@@ -2767,7 +2873,7 @@ namespace master_nodes
       reason = "the standby key has no committee attestation";
       return false;
     }
-    const auto shared = overlap(o->epoch, s->epoch);
+    const auto shared = overlap(*o, *s);
     if (!shared)
     {
       reason = "the committee of epoch " + std::to_string(o->epoch) + " or " + std::to_string(s->epoch) + " is unknown";
@@ -2781,7 +2887,52 @@ namespace master_nodes
                + std::to_string(limit) + " may be";
       return false;
     }
+    if (s->round_height != 0)
+    {
+      const auto first = first_waiting_bridge_key(records, *o, liveness, height, nettype, overlap);
+      if (first && first->pgw_vk != s->pgw_vk)
+      {
+        reason = "another standby round's key was attested first (round " + std::to_string(first->round_height) + ")";
+        return false;
+      }
+    }
     return true;
+  }
+
+  std::optional<bridge_key_attestation_record> first_waiting_bridge_key(
+      const std::vector<bridge_key_attestation_record> &records,
+      const bridge_key_attestation_record &owner,
+      const std::vector<bridge_standby_liveness_record> &liveness,
+      uint64_t height,
+      cryptonote::network_type nettype,
+      const bridge_record_overlap_fn &overlap)
+  {
+    uint64_t newer_than = owner.committee_height(nettype);
+    std::optional<crypto::eddsa_public_key> named;
+    if (!liveness.empty())
+    {
+      named = liveness.front().standby;
+      if (const auto rec = find_attested_bridge_key(records, *named))
+        newer_than = std::max(newer_than, rec->committee_height(nettype));
+    }
+    const size_t limit = cryptonote::bridge_committee_size(nettype) - cryptonote::bridge_committee_threshold(nettype);
+    const uint64_t recent = cryptonote::gateway_standby_stale_blocks(nettype);
+    std::optional<bridge_key_attestation_record> first;
+    for (const auto &r : records)
+    {
+      if (r.attested_height == 0 || r.attested_height + recent < height || r.pgw_vk == owner.pgw_vk
+          || (named && r.pgw_vk == *named) || r.committee_height(nettype) <= newer_than)
+        continue;
+      // The committee that holds a key is the first to have attested it.
+      const auto holder = find_attested_bridge_key(records, r.pgw_vk);
+      if (!holder || holder->attested_height != r.attested_height || holder->round_height != r.round_height
+          || holder->epoch != r.epoch)
+        continue;
+      const auto shared = overlap(owner, r);
+      if (shared && *shared <= limit && (!first || r.attested_height < first->attested_height))
+        first = r;
+    }
+    return first;
   }
 
   std::optional<uint64_t> bridge_standby_round_at(cryptonote::network_type nettype, uint64_t height)
@@ -2845,22 +2996,6 @@ namespace master_nodes
     return members;
   }
 
-  // The members of the committee that generated `r`: kept with the record, or, for a record kept
-  // before they were, its epoch's committee.
-  static std::vector<crypto::public_key> bridge_record_members(const bridge_key_attestation_record &r,
-                                                               cryptonote::network_type nettype,
-                                                               const bridge_committee_resolver &resolve_committee)
-  {
-    if (!r.members.empty())
-      return r.members;
-    std::vector<crypto::public_key> members;
-    std::vector<crypto::ed25519_public_key> signer_keys;
-    size_t threshold = 0;
-    if (r.round_height == 0 && resolve_committee)
-      resolve_committee(r.epoch * cryptonote::bridge_epoch_blocks(nettype), members, signer_keys, threshold);
-    return members;
-  }
-
   bool master_node_list::state_t::bridge_standby_due(cryptonote::network_type nettype, uint64_t height,
                                                      const bridge_committee_resolver &resolve_committee,
                                                      std::vector<crypto::public_key> &owner_members,
@@ -2898,38 +3033,80 @@ namespace master_nodes
       return false;
     }
 
-    // A key from a committee no newer than the last named standby's can never be named: a
-    // gateway never names a key twice, and named standbys only ever get newer.
-    uint64_t newer_than = owner_rec->committee_height(nettype);
-    std::optional<crypto::eddsa_public_key> named;
-    if (!bridge_standby_liveness.empty())
+    if (!bridge_standby_liveness.empty()
+        && height <= bridge_standby_liveness.front().last_seen() + cryptonote::gateway_standby_stale_blocks(nettype))
     {
-      const auto &standby = bridge_standby_liveness.front();
-      if (height <= standby.last_seen() + cryptonote::gateway_standby_stale_blocks(nettype))
-      {
-        reason = "a standby is named";
-        return false;
-      }
-      named = standby.standby;
-      if (const auto rec = find_attested_bridge_key(bridge_key_attestations, standby.standby))
-        newer_than = std::max(newer_than, rec->committee_height(nettype));
+      reason = "a standby is named";
+      return false;
     }
-
-    const size_t limit = cryptonote::bridge_committee_size(nettype) - cryptonote::bridge_committee_threshold(nettype);
-    const auto operator_of = [this](const crypto::public_key &pk) { return bridge_operator_id(master_nodes_infos, pk); };
-    for (const auto &r : bridge_key_attestations)
+    const auto overlap = [&](const bridge_key_attestation_record &a, const bridge_key_attestation_record &b) -> std::optional<size_t> {
+      const auto ma = bridge_record_members(a, nettype, resolve_committee);
+      const auto mb = bridge_record_members(b, nettype, resolve_committee);
+      if (ma.empty() || mb.empty())
+        return std::nullopt;
+      return bridge_committee_operator_overlap(ma, mb, [this](const crypto::public_key &pk) {
+        return bridge_operator_id(master_nodes_infos, pk);
+      });
+    };
+    if (first_waiting_bridge_key(bridge_key_attestations, *owner_rec, bridge_standby_liveness, height, nettype, overlap))
     {
-      if (r.attested_height == 0 || !holds(r) || r.pgw_vk == owner_rec->pgw_vk || (named && r.pgw_vk == *named)
-          || r.committee_height(nettype) <= newer_than)
-        continue;
-      const auto members = bridge_record_members(r, nettype, resolve_committee);
-      if (!members.empty() && bridge_committee_operator_overlap(owner_members, members, operator_of) <= limit)
-      {
-        reason = "an attested key is waiting to be named";
-        return false;
-      }
+      reason = "an attested key is waiting to be named";
+      return false;
     }
     return true;
+  }
+
+  bool master_node_list::state_t::check_bridge_standby_attestation(const cryptonote::tx_extra_bridge_key_attestation &att,
+                                                                   uint64_t height, cryptonote::network_type nettype,
+                                                                   std::vector<crypto::public_key> &members,
+                                                                   std::vector<crypto::ed25519_public_key> &signer_keys,
+                                                                   std::string &reason) const
+  {
+    const uint64_t window = cryptonote::bridge_standby_round_window_blocks(nettype);
+    if (height <= att.round_height || height > att.round_height + window)
+    {
+      reason = "standby round " + std::to_string(att.round_height) + " does not take attestations at height "
+               + std::to_string(height) + " (its window is " + std::to_string(window) + " blocks)";
+      return false;
+    }
+    const auto round = std::find_if(bridge_standby_rounds.begin(), bridge_standby_rounds.end(),
+                                    [&](const bridge_standby_round &r) { return r.round_height == att.round_height; });
+    if (round == bridge_standby_rounds.end())
+    {
+      reason = "no standby round started at height " + std::to_string(att.round_height);
+      return false;
+    }
+    for (const auto &r : bridge_key_attestations)
+      if (r.round_height == att.round_height && (r.pgw_vk != att.pgw_vk || r.pevm_address != att.pevm_address)
+          && std::find(r.voters.begin(), r.voters.end(), att.voter_index) != r.voters.end())
+      {
+        reason = "member " + std::to_string(att.voter_index) + " of standby round " + std::to_string(att.round_height)
+                 + " already attested another key";
+        return false;
+      }
+    members = round->members;
+    signer_keys = bridge_signer_keys(master_nodes_infos, members);
+    return true;
+  }
+
+  bool master_node_list::state_t::bridge_round_committee(uint64_t round_height, std::vector<crypto::public_key> &members,
+                                                         std::vector<crypto::ed25519_public_key> &signer_keys) const
+  {
+    if (round_height == 0)
+      return false;
+    members.clear();
+    for (const auto &r : bridge_standby_rounds)
+      if (r.round_height == round_height)
+        members = r.members;
+    if (members.empty())
+      for (const auto &r : bridge_key_attestations)
+        if (r.round_height == round_height && r.attested_height != 0)
+        {
+          members = r.members;
+          break;
+        }
+    signer_keys = bridge_signer_keys(master_nodes_infos, members);
+    return !members.empty();
   }
 
   void master_node_list::state_t::update_bridge_standby_rounds(cryptonote::network_type nettype, hf hf_version,

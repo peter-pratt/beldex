@@ -267,7 +267,7 @@ namespace cryptonote
         if (cryptonote::get_field_from_tx_extra(t.extra, rot))
         { k.kind = bridge_kind::rotation; k.rot_key = {rot.chain_id, rot.key_epoch}; return true; }
         if (cryptonote::get_field_from_tx_extra(t.extra, slash))
-        { k.kind = bridge_kind::slash; k.slash_key = {slash.epoch, slash.accused_index}; return true; }
+        { k.kind = bridge_kind::slash; k.slash_key = {slash.round_height ? slash.round_height : slash.epoch, slash.accused_index}; return true; }
         if (cryptonote::get_field_from_tx_extra(t.extra, reg))
         { k.kind = bridge_kind::op_pubkey; k.mn_pubkey = reg.master_node_pubkey; return true; }
         if (cryptonote::get_field_from_tx_extra(t.extra, unbond))

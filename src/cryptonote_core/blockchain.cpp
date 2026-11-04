@@ -3453,8 +3453,12 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
       std::vector<crypto::ed25519_public_key> signer_keys;
       size_t threshold = 0;
       std::string slash_reason;
-      if (!m_master_node_list.get_bridge_committee(epoch_height, members, signer_keys, threshold))
-        slash_reason = "no bridge committee for epoch " + std::to_string(slash.epoch);
+      const bool known = slash.version >= 2
+          ? m_master_node_list.get_bridge_round_committee(slash.round_height, members, signer_keys, threshold)
+          : m_master_node_list.get_bridge_committee(epoch_height, members, signer_keys, threshold);
+      if (!known)
+        slash_reason = "no bridge committee for epoch " + std::to_string(slash.epoch) + " (standby round "
+                       + std::to_string(slash.round_height) + ")";
       else if (!cryptonote::verify_bridge_slash_evidence(slash, signer_keys, threshold, m_nettype, slash_reason))
         { /* reason set by the verifier */ }
       else if (slash.accused_index >= members.size())
@@ -3513,8 +3517,12 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
       std::vector<crypto::ed25519_public_key> signer_keys;
       size_t threshold = 0;
       std::string att_reason;
-      if (!m_master_node_list.get_bridge_committee(epoch_height, members, signer_keys, threshold))
+      if (att.version >= 1)
+        m_master_node_list.check_bridge_standby_attestation(att, members, signer_keys, att_reason);
+      else if (!m_master_node_list.get_bridge_committee(epoch_height, members, signer_keys, threshold))
         att_reason = "no bridge committee for epoch " + std::to_string(att.epoch);
+      if (!att_reason.empty())
+        { /* reason set above */ }
       else if (!cryptonote::verify_bridge_key_attestation(att, signer_keys, m_nettype, att_reason))
         { /* reason set by the verifier */ }
       else if (m_master_node_list.has_bridge_key_attestation_vote(att))

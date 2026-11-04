@@ -4447,6 +4447,7 @@ namespace cryptonote::rpc {
     const auto nettype = m_core.get_nettype();
     const auto& mnl = m_core.get_master_node_list();
     std::optional<uint64_t> owner_epoch;
+    std::optional<master_nodes::bridge_key_attestation_record> owner_record;
     // The bridge gateway's owner: the tracked gateway's latest descriptor.
     for (const auto& g : mnl.get_bridge_gateway_owners())
     {
@@ -4462,6 +4463,7 @@ namespace cryptonote::rpc {
         if (auto r = mnl.attested_bridge_key(*vk))
         {
           owner_epoch = r->epoch;
+          owner_record = r;
           cmd.response["owner_epoch"] = r->epoch;
         }
       }
@@ -4498,8 +4500,8 @@ namespace cryptonote::rpc {
              {"epoch", r.epoch},
              {"voters", r.voters},
              {"attested_height", r.attested_height}};
-      if (owner_epoch)
-        if (auto shared = mnl.bridge_committee_overlap(*owner_epoch, r.epoch))
+      if (owner_record)
+        if (auto shared = mnl.bridge_committee_overlap(*owner_record, r))
           j["overlap_with_owner"] = *shared;
       list.push_back(std::move(j));
     }

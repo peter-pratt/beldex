@@ -372,14 +372,31 @@ namespace master_nodes
   // The record of the committee that holds gateway key `pgw_vk`: the first to have attested it.
   std::optional<bridge_key_attestation_record> find_attested_bridge_key(const std::vector<bridge_key_attestation_record>& records,
                                                                         const crypto::eddsa_public_key& pgw_vk);
+  // How many members two records' committees share (operators of the first running members of
+  // the second), or nullopt if either committee is unknown.
+  using bridge_record_overlap_fn = std::function<std::optional<size_t>(const bridge_key_attestation_record&,
+                                                                       const bridge_key_attestation_record&)>;
+  // The key waiting to be named at `height`, the first attested if several: attested in the last
+  // gateway_standby_stale_blocks (older, and its holders are presumed to have moved on), from a
+  // committee newer than the owner's and than the last named standby's (`liveness`; a gateway
+  // never names a key twice, and named standbys only get newer) and within the overlap limit.
+  std::optional<bridge_key_attestation_record> first_waiting_bridge_key(
+      const std::vector<bridge_key_attestation_record>& records,
+      const bridge_key_attestation_record& owner,
+      const std::vector<bridge_standby_liveness_record>& liveness,
+      uint64_t height,
+      cryptonote::network_type nettype,
+      const bridge_record_overlap_fn& overlap);
   // The standby-naming rule over attestation `records`: owner and standby are attested keys
-  // whose committees (`overlap` gives how many members two epochs' committees share, or
-  // nullopt if unknown) share at most size - threshold members.
+  // whose committees share at most size - threshold members, and a round's key is named only if
+  // it is the first waiting (first_waiting_bridge_key): rounds racing do not get to choose.
   bool check_bridge_standby_naming(const std::vector<bridge_key_attestation_record>& records,
                                    const cryptonote::gateway_owner_key_v& owner,
                                    const cryptonote::gateway_owner_key_v& standby,
                                    cryptonote::network_type nettype,
-                                   const std::function<std::optional<size_t>(uint64_t, uint64_t)>& overlap,
+                                   const bridge_record_overlap_fn& overlap,
+                                   const std::vector<bridge_standby_liveness_record>& liveness,
+                                   uint64_t height,
                                    std::string& reason);
 
   // The number (within its epoch) of the standby round that starts at `height`, if one does.
@@ -770,6 +787,20 @@ namespace master_nodes
     /// How many members of committee `epoch_b` an operator of committee `epoch_a` also runs
     /// (bridge_committee_operator_overlap), or nullopt if either epoch's committee is unknown.
     std::optional<size_t> bridge_committee_overlap(uint64_t epoch_a, uint64_t epoch_b) const;
+    /// The same for the committees that generated two attested keys, whichever kind they are.
+    std::optional<size_t> bridge_committee_overlap(const bridge_key_attestation_record& a,
+                                                   const bridge_key_attestation_record& b) const;
+    /// HF23: may this standby round's attestation land on the next block? On success, the round's
+    /// committee. See state_t::check_bridge_standby_attestation.
+    bool check_bridge_standby_attestation(const cryptonote::tx_extra_bridge_key_attestation& att,
+                                          std::vector<crypto::public_key>& members,
+                                          std::vector<crypto::ed25519_public_key>& signer_keys,
+                                          std::string& reason) const;
+    /// HF23: the committee of a standby round, open or behind an attested key, for a slash report.
+    bool get_bridge_round_committee(uint64_t round_height,
+                                    std::vector<crypto::public_key>& members,
+                                    std::vector<crypto::ed25519_public_key>& signer_keys,
+                                    size_t& threshold) const;
     /// Whether a rotation ack (whose signatures have already been verified) may advance the
     /// current state: see state_t::check_bridge_rotation_ack.
     bool check_bridge_rotation_ack(const cryptonote::tx_extra_bridge_rotation_ack& ack, std::string& reason) const;
@@ -1131,6 +1162,18 @@ namespace master_nodes
       bool bridge_standby_due(cryptonote::network_type nettype, uint64_t height,
                               const bridge_committee_resolver& resolve_committee,
                               std::vector<crypto::public_key>& owner_members, std::string& reason) const;
+      // HF23: whether standby round attestation `att` may land at `height`: within the round's
+      // window, from an open round, and not this member's attestation of a second key in that
+      // round (a round runs one DKG, and otherwise one member could flood the record cap). Fills
+      // the round's committee. False with `reason` otherwise.
+      bool check_bridge_standby_attestation(const cryptonote::tx_extra_bridge_key_attestation& att, uint64_t height,
+                                            cryptonote::network_type nettype,
+                                            std::vector<crypto::public_key>& members,
+                                            std::vector<crypto::ed25519_public_key>& signer_keys,
+                                            std::string& reason) const;
+      // HF23: a standby round's committee: the open round's, or that kept by a key's record.
+      bool bridge_round_committee(uint64_t round_height, std::vector<crypto::public_key>& members,
+                                  std::vector<crypto::ed25519_public_key>& signer_keys) const;
       // HF23: drop standby rounds whose window has closed and, at a round's start while a
       // standby is due, draw that round's committee from this state's seats.
       void update_bridge_standby_rounds(cryptonote::network_type nettype, cryptonote::hf hf_version,

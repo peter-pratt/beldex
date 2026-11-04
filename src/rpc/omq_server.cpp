@@ -681,6 +681,7 @@ void omq_rpc::on_bridge_slash_report(oxenmq::Message& m)
     slash.accused_index = req.at("accused_index").get<uint16_t>();
     slash.epoch         = req.at("epoch").get<uint64_t>();
     slash.height        = req.at("height").get<uint64_t>();
+    slash.round_height  = req.value("round_height", uint64_t{0});
 
     if (!tools::hex_to_type(req.at("transcript_root").get<std::string>(), slash.transcript_root))
     {
@@ -712,7 +713,9 @@ void omq_rpc::on_bridge_slash_report(oxenmq::Message& m)
   std::vector<crypto::public_key> members;
   std::vector<crypto::ed25519_public_key> signer_keys;
   size_t threshold = 0;
-  if (!core_.get_master_node_list().get_bridge_committee(epoch_height, members, signer_keys, threshold))
+  const auto& mnl = core_.get_master_node_list();
+  if (!(slash.version >= 2 ? mnl.get_bridge_round_committee(slash.round_height, members, signer_keys, threshold)
+                           : mnl.get_bridge_committee(epoch_height, members, signer_keys, threshold)))
   {
     m.send_reply(OMQ_BAD_REQUEST,
                  "bridge.slash_report: no bridge committee for epoch " + std::to_string(slash.epoch));
