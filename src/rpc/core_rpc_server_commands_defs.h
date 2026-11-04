@@ -3102,6 +3102,8 @@ namespace cryptonote::rpc {
   /// - `owner_committee_height` -- the height whose committee generated the owner key.
   /// - `standby_rounds` -- standby rounds still taking attestations (consensus draws one each
   ///   round while no standby works): {round, round_height, window_end, members}.
+  /// - `standby_round_window` -- how many blocks from its start a round takes attestations.
+  /// - `height` -- the chain tip these answers are for.
   /// - `waiting_key` -- the attested key waiting to be named, the one naming will accept if
   ///   several (absent if none): the first attested, from a committee newer than the owner's and
   ///   than the last named standby's, within the overlap limit.

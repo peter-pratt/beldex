@@ -39,6 +39,8 @@ pub const ROTATION_ACK_DOMAIN: &[u8] = b"bridge_rotation_ack_v2";
 /// The ack layout these bytes describe. MUST match the C++
 /// `tx_extra_bridge_rotation_ack::CURRENT_VERSION`; consensus accepts no other.
 pub const ROTATION_ACK_VERSION: u8 = 1;
+/// The layout whose observers are a standby round's committee (`tx_extra_bridge_rotation_ack`).
+pub const ROTATION_ACK_ROUND_VERSION: u8 = 2;
 
 /// The objective on-chain fact an ack attests: `contract` on chain `chain_id` emitted
 /// `Rotated(new_signer, key_epoch)` in transaction `evm_txid` at log `log_index`.
@@ -112,6 +114,10 @@ pub struct SignedRotationAck {
     /// The L1 committee epoch that observed + signed this (the verifier's resolver hint;
     /// **not** part of the signed canonical bytes).
     pub epoch: u64,
+    /// The standby round whose committee holds the key these observers serve (its start), so
+    /// their indices are that round's: unsigned like `epoch`, for the same reason. 0 for an
+    /// epoch committee.
+    pub round_height: u64,
     /// `(committee_index, detached ed25519 signature)` per observer.
     pub observers: Vec<(u16, [u8; 64])>,
 }
@@ -120,7 +126,7 @@ impl SignedRotationAck {
     /// Start an ack from an observed rotation (no signatures yet). `epoch` is the observing
     /// committee's L1 epoch.
     pub fn new(ack: RotationAck, epoch: u64) -> SignedRotationAck {
-        SignedRotationAck { ack, epoch, observers: Vec::new() }
+        SignedRotationAck { ack, epoch, round_height: 0, observers: Vec::new() }
     }
 
     /// This node signs the ack with its bridge-signer ed25519 secret and adds itself as an
@@ -220,10 +226,13 @@ impl SignedRotationAck {
 
         format!(
             concat!(
-                r#"{{"version":{},"chain_id":{},"contract":"{}","key_epoch":{},"new_signer":"{}","#,
+                r#"{{"version":{},"round_height":{},"chain_id":{},"contract":"{}","key_epoch":{},"new_signer":"{}","#,
                 r#""evm_txid":"{}","log_index":{},"epoch":{},"observers":[{}]}}"#
             ),
-            ROTATION_ACK_VERSION,
+            // The signed bytes stay version 1 either way (the fact is the same): this version
+            // only says the observers' indices are a standby round's.
+            if self.round_height != 0 { ROTATION_ACK_ROUND_VERSION } else { ROTATION_ACK_VERSION },
+            self.round_height,
             self.ack.chain_id,
             hexs(&self.ack.contract),
             self.ack.key_epoch,
@@ -240,6 +249,20 @@ impl SignedRotationAck {
 mod tests {
     use super::*;
     use crate::ffi::{ed25519_keypair, ensure_init};
+
+    #[test]
+    fn a_rounds_holders_sign_the_same_fact_and_say_whose_indices_they_are() {
+        let ack = sample_ack();
+        let genesis = [7; 32];
+        let epoch_ack = SignedRotationAck::new(ack.clone(), 1);
+        let mut round_ack = SignedRotationAck::new(ack.clone(), 1);
+        round_ack.round_height = 130;
+        assert!(epoch_ack.to_submission_json().contains(r#""version":1,"round_height":0,"#));
+        assert!(round_ack.to_submission_json().contains(r#""version":2,"round_height":130,"#));
+        // What is signed does not depend on who observed it, so the signed version stays 1.
+        assert_eq!(ack.canonical(&genesis)[ROTATION_ACK_DOMAIN.len() + 32], ROTATION_ACK_VERSION);
+        assert_eq!(RotationAckCollector::for_round(130).round_height, 130);
+    }
 
     fn committee_with_signer_keys(n: u16, t: u16) -> (CommitteeView, Vec<[u8; 64]>) {
         let mut pks = Vec::new();
@@ -258,6 +281,7 @@ mod tests {
             member_x25519: Vec::new(),
             daemon_self_index: None,
             threshold: t as usize,
+            round_height: 0,
         };
         (c, sks)
     }
@@ -413,6 +437,7 @@ mod merge_tests {
                 member_x25519: Vec::new(),
                 daemon_self_index: None,
                 threshold: t as usize,
+                round_height: 0,
             },
             sks,
         )
@@ -524,6 +549,7 @@ mod merge_tests {
 #[derive(Debug, Default)]
 pub struct RotationAckCollector {
     pending: Vec<SignedRotationAck>,
+    round_height: u64,
 }
 
 /// Body of a [`SessionMsg::RotationAckSig`](crate::wire::SessionMsg): the sender's
@@ -548,7 +574,12 @@ pub fn decode_ack_sig(body: &[u8]) -> Option<(u16, [u8; 64])> {
 
 impl RotationAckCollector {
     pub fn new() -> RotationAckCollector {
-        RotationAckCollector { pending: Vec::new() }
+        RotationAckCollector { pending: Vec::new(), round_height: 0 }
+    }
+
+    /// A collector for the holders of a standby round's key (`round_height` 0 for an epoch's).
+    pub fn for_round(round_height: u64) -> RotationAckCollector {
+        RotationAckCollector { pending: Vec::new(), round_height }
     }
 
     /// Record this node's own observation and signature, returning the bytes to broadcast.
@@ -566,7 +597,9 @@ impl RotationAckCollector {
         let entry = match self.pending.iter_mut().find(|p| p.ack == ack) {
             Some(e) => e,
             None => {
-                self.pending.push(SignedRotationAck::new(ack, epoch));
+                let mut pending = SignedRotationAck::new(ack, epoch);
+                pending.round_height = self.round_height;
+                self.pending.push(pending);
                 self.pending.last_mut().expect("just pushed")
             }
         };
@@ -831,6 +864,7 @@ mod collector_tests {
                 member_x25519: Vec::new(),
                 daemon_self_index: None,
                 threshold: t as usize,
+                round_height: 0,
             },
             sks,
         )

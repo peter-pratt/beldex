@@ -609,7 +609,7 @@ std::string bridge_rotation_ack_message(network_type nettype, const tx_extra_bri
   buf.reserve(hashkey::BRIDGE_ROTATION_ACK.size() + sizeof(genesis) + 1 + 8 + 20 + 8 + 20 + 32 + 4);
   buf.append(hashkey::BRIDGE_ROTATION_ACK);
   buf.append(reinterpret_cast<const char*>(&genesis), sizeof(genesis));
-  buf.push_back(static_cast<char>(ack.version));
+  buf.push_back(static_cast<char>(tx_extra_bridge_rotation_ack::CURRENT_VERSION)); // whichever committee observed it
   append_u64_le(buf, ack.chain_id);
   buf.append(reinterpret_cast<const char*>(ack.contract.data()), ack.contract.size());
   append_u64_le(buf, ack.key_epoch);
@@ -626,9 +626,14 @@ bool verify_bridge_rotation_evidence(const tx_extra_bridge_rotation_ack& ack,
 {
   // Only the current layout: an older ack signed less (no contract, no log), and an
   // unknown one cannot be interpreted.
-  if (ack.version != tx_extra_bridge_rotation_ack::CURRENT_VERSION)
+  if (ack.version != tx_extra_bridge_rotation_ack::CURRENT_VERSION && ack.version != tx_extra_bridge_rotation_ack::ROUND_VERSION)
   {
     reason = "rotation ack: unsupported version " + std::to_string(ack.version);
+    return false;
+  }
+  if ((ack.version == tx_extra_bridge_rotation_ack::ROUND_VERSION) != (ack.round_height != 0))
+  {
+    reason = "rotation ack: version and standby round disagree";
     return false;
   }
   // The addresses are appended raw to the signed bytes, so a wrong length would silently

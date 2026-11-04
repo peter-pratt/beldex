@@ -152,6 +152,7 @@ fn frost_dkg_produces_a_consensus_verifiable_group_key() {
             member_x25519: Vec::new(),
             daemon_self_index: None,
             threshold: t as usize,
+            round_height: 0,
         };
         let mut sess = DkgSession::start(&committee, DkgLeg::Pgw, 0, 0).unwrap();
         for i in 0..n as usize {

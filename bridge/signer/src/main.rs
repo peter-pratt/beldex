@@ -129,13 +129,14 @@ fn run_dkg(cfg: &Config) -> Result<(), String> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    run_dkg_into(cfg, std::env::var("BRIDGE_SIGNER_SHARE_DIR").ok().as_deref(), key_generation)
+    run_dkg_into(cfg, std::env::var("BRIDGE_SIGNER_SHARE_DIR").ok().as_deref(), key_generation, None)
 }
 
 /// The DKG itself: shares written to `share_dir` (none kept without one), execution ids
-/// derived from the committee and `key_generation`.
+/// derived from the committee and `key_generation`. By the current epoch's committee, or with
+/// `standby_round` by that standby round's.
 #[cfg(feature = "live-dkg")]
-fn run_dkg_into(cfg: &Config, share_dir: Option<&str>, key_generation: u32) -> Result<(), String> {
+fn run_dkg_into(cfg: &Config, share_dir: Option<&str>, key_generation: u32, standby_round: Option<u64>) -> Result<(), String> {
     use beldex_bridge_signer::dkg_driver::live::{run_live_capture, MeshIdentity, PeerTransportAddr};
     use beldex_bridge_signer::ffi;
     use beldex_bridge_signer::omq_client::OmqCommitteeClient;
@@ -150,7 +151,11 @@ fn run_dkg_into(cfg: &Config, share_dir: Option<&str>, key_generation: u32) -> R
     //    the daemon reports for itself (OMQ `self_index`) so no per-node pubkey
     //    config is needed; fall back to matching the configured MN pubkey.
     let client = OmqCommitteeClient::new(cfg.oxenmq_endpoint.clone());
-    let committee_json = client.fetch_committee_json(None).map_err(|e| e.to_string())?;
+    let committee_json = match standby_round {
+        Some(round) => client.fetch_standby_round_json(round),
+        None => client.fetch_committee_json(None),
+    }
+    .map_err(|e| e.to_string())?;
     let committee = beldex_bridge_signer::committee::CommitteeView::from_bridge_committee_json(&committee_json)
         .map_err(|e| e.to_string())?;
     let self_index = committee
@@ -223,7 +228,7 @@ fn run_dkg_into(cfg: &Config, share_dir: Option<&str>, key_generation: u32) -> R
         std::env::var("BRIDGE_SIGNER_DKG_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(120),
+            .unwrap_or(900),
     );
     // Channel encryption. Production: CURVE (needs libzmq built with CURVE). Set
     // BRIDGE_SIGNER_MESH_USE_CURVE=false for a libzmq without CURVE — plain sockets,
@@ -1977,7 +1982,7 @@ impl TakeoverReader {
                             let msg = info.get("standby_name_message").and_then(|v| v.as_str()).and_then(config::parse_hex32);
                             if let (Some(n), Some(m)) = (nonce, msg) {
                                 out.push((
-                                    TakeoverStep { chain_id: TakeoverStep::GATEWAY, step: TakeoverStepKind::NameStandby, takeover_id: n, key_epoch: cand.epoch },
+                                    TakeoverStep { chain_id: TakeoverStep::GATEWAY, step: TakeoverStepKind::NameStandby, takeover_id: n, key_epoch: cand.committee_height },
                                     m.to_vec(),
                                 ));
                             }
@@ -2188,32 +2193,25 @@ impl ProbeDeposit {
     }
 }
 
-/// Standby role, waiting for shares: generate the next standby key with the current
-/// committee when that is due (key_attestation::standby_dkg_due). Each member decides from its
-/// own daemon, and all start at the same slot of the clock, whose number is the key
-/// generation: a failed attempt is retried at the next slot under fresh execution ids, which
-/// the execution ledger requires. The shares are written beside the share directory and moved
-/// in only once complete, so a failed ceremony never leaves half a set to serve.
+/// Standby role, waiting for shares: generate the next standby key when this node is on the
+/// committee of a standby round (key_attestation::standby_round_due). Consensus draws a round
+/// only while a standby is due, and every member starts on seeing the round's block. The round
+/// is the key generation, so each round has one attempt under fresh execution ids, which the
+/// execution ledger requires; a failed one costs only until the next round, whose committee
+/// is another. The shares are written beside the share directory and moved in only once
+/// complete, so a failed ceremony never leaves half a set to serve.
 #[cfg(feature = "serve-live")]
 struct AutoStandbyDkg {
-    slot_secs: u64,
-    last_slot: u64,
+    last_round: u64,
     last_reason: String,
 }
 
 #[cfg(feature = "serve-live")]
 impl AutoStandbyDkg {
-    /// How long into a slot a member may still start: members poll every 15 seconds.
-    const START_WINDOW_SECS: u64 = 30;
-
     fn maybe_run(&mut self, cfg: &Config, share_dir: &std::path::Path, beldexd_rpc: &str) {
         use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
         use beldex_bridge_signer::key_attestation as ka;
         let now = beldex_bridge_signer::release_outbox::now_secs();
-        let slot = now / self.slot_secs;
-        if slot == self.last_slot || now % self.slot_secs > Self::START_WINDOW_SECS {
-            return;
-        }
         let daemon = beldex_bridge_signer::evm_watcher::HttpJsonRpc::new(format!(
             "{}/json_rpc",
             beldexd_rpc.trim_end_matches('/')
@@ -2221,12 +2219,10 @@ impl AutoStandbyDkg {
         let due = daemon
             .call("bridge_get_standby", serde_json::json!({}))
             .map_err(|e| format!("bridge_get_standby: {e:?}"))
-            .and_then(|v| match (ka::parse_view(&v), ka::parse_records(&v)) {
-                (Some(view), Some(records)) => ka::standby_dkg_due(&view, &records).map(|()| view.committee_epoch),
-                _ => Err("bridge_get_standby: unexpected reply".to_string()),
-            });
-        let epoch = match due {
-            Ok(epoch) => epoch,
+            .and_then(|v| ka::parse_view(&v).ok_or_else(|| "bridge_get_standby: unexpected reply".to_string()))
+            .and_then(|view| ka::standby_round_due(&view));
+        let round = match due {
+            Ok(round) => round,
             Err(why) => {
                 if why != self.last_reason {
                     println!("  standby key generation not due: {why}");
@@ -2235,25 +2231,34 @@ impl AutoStandbyDkg {
                 return;
             }
         };
-        self.last_slot = slot;
+        if round == self.last_round {
+            return;
+        }
+        self.last_round = round;
         self.last_reason.clear();
-        match beldex_bridge_signer::omq_client::OmqCommitteeClient::new(cfg.oxenmq_endpoint.clone()).fetch_committee(None) {
+        let reply = beldex_bridge_signer::omq_client::OmqCommitteeClient::new(cfg.oxenmq_endpoint.clone())
+            .fetch_standby_round_json(round)
+            .map_err(|e| e.to_string())
+            .and_then(|json| {
+                beldex_bridge_signer::committee::CommitteeView::from_bridge_committee_json(&json).map_err(|e| e.to_string())
+            });
+        match reply {
             Ok(c) if c.daemon_self_index.is_some() || c.self_index(&cfg.self_mn_pubkey).is_some() => {}
-            Ok(c) => {
-                println!("  standby key generation due, but this node is not on committee epoch {}", c.epoch);
+            Ok(_) => {
+                println!("  standby round {round}: this node is not on its committee");
                 return;
             }
             Err(e) => {
-                eprintln!("  standby key generation: no committee ({e}); next slot");
+                eprintln!("  standby round {round}: no committee ({e}); next round");
                 return;
             }
         }
-        let Ok(keygen) = u32::try_from(slot) else { return };
+        let Ok(keygen) = u32::try_from(round) else { return };
         let staging = std::path::PathBuf::from(format!("{}.dkg-{keygen}", share_dir.display()));
         let _ = std::fs::remove_dir_all(&staging);
-        println!("NO STANDBY: generating the next standby key with committee epoch {epoch} (key generation {keygen})");
+        println!("NO STANDBY: generating the next standby key with the committee of standby round {round}");
         let result = match staging.to_str() {
-            Some(dir) => run_dkg_into(cfg, Some(dir), keygen),
+            Some(dir) => run_dkg_into(cfg, Some(dir), keygen, Some(round)),
             None => Err("the share directory's path is not UTF-8".into()),
         };
         match result {
@@ -2273,11 +2278,11 @@ impl AutoStandbyDkg {
                 }
             }
             Ok(()) => {
-                eprintln!("  standby key generation left no complete share set; next slot");
+                eprintln!("  standby key generation left no complete share set; next round");
                 let _ = std::fs::remove_dir_all(&staging);
             }
             Err(e) => {
-                eprintln!("  standby key generation failed ({e}); next slot");
+                eprintln!("  standby key generation failed ({e}); next round");
                 let _ = std::fs::remove_dir_all(&staging);
             }
         }
@@ -2350,19 +2355,14 @@ where
     );
     if beldex_bridge_signer::share_watch::fingerprint(&share_dir).is_none() {
         println!("serve: no share set in {} yet: waiting for one", share_dir.display());
-        // A standby signer with no key generates the next standby itself, with the rest of
-        // its committee, when that is due (BRIDGE_SIGNER_AUTO_DKG=0 turns this off).
+        // A standby signer with no key generates the next standby itself, when a standby round
+        // draws it (BRIDGE_SIGNER_AUTO_DKG=0 turns this off).
         let auto_dkg = std::env::var("BRIDGE_SIGNER_ROLE").is_ok_and(|r| r.trim() == "standby")
             && !std::env::var("BRIDGE_SIGNER_AUTO_DKG").is_ok_and(|v| v.trim() == "0");
-        let slot_secs: u64 = std::env::var("BRIDGE_SIGNER_AUTO_DKG_SLOT_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|s| *s >= 60)
-            .unwrap_or(600);
         if auto_dkg {
-            println!("  standby key generation: automatic, at {slot_secs}s slots, when due");
+            println!("  standby key generation: automatic, when a standby round draws this node");
         }
-        let mut auto = AutoStandbyDkg { slot_secs, last_slot: 0, last_reason: String::new() };
+        let mut auto = AutoStandbyDkg { last_round: 0, last_reason: String::new() };
         while beldex_bridge_signer::share_watch::fingerprint(&share_dir).is_none() {
             if auto_dkg {
                 auto.maybe_run(cfg, &share_dir, beldexd_rpc);
@@ -2764,11 +2764,11 @@ where
                     TakeoverStepKind::NameStandby => "name_standby",
                     TakeoverStepKind::StandbyAlive => "standby_alive",
                 };
-                // The key named: the candidate of the epoch this duty was for. If the daemon now
-                // gives another, the signature is for a key no longer wanted.
+                // The key named: the candidate of the committee this duty was for. If the daemon
+                // now gives another, the signature is for a key no longer wanted.
                 let named = if c.step == TakeoverStepKind::NameStandby {
                     match done_view.standby_target() {
-                        Some(cand) if cand.epoch == c.key_epoch => Some(cand.pgw_vk),
+                        Some(cand) if cand.committee_height == c.key_epoch => Some(cand.pgw_vk),
                         _ => {
                             eprintln!("  standby naming on the gateway: the candidate changed; not submitted");
                             return ExecOutcome::Retry;
@@ -3077,7 +3077,7 @@ where
     // RPC, signs the fact, and shares that signature over the mesh; once threshold-many
     // agree, any member may submit the evidence. Until L1 sees it, `observed_key_epoch`
     // never advances and a departed member's bond stays locked forever.
-    let mut ack_collector = beldex_bridge_signer::rotation_ack::RotationAckCollector::new();
+    let mut ack_collector = beldex_bridge_signer::rotation_ack::RotationAckCollector::for_round(ls.committee.round_height);
     if bus_genesis == [0u8; 32] {
         println!("  rotation acks DISABLED: BRIDGE_SIGNER_GENESIS_HASH is unset, and the \
                   acknowledgement is genesis-bound");
@@ -3555,7 +3555,7 @@ where
             // node can help generate the next standby.
             if standby_role && supervised {
                 let why = takeover.standby_view().and_then(|(view, records)| {
-                    beldex_bridge_signer::key_attestation::standby_set_retired(&view, &records, &ls.pgw_group_vk, ls.committee.epoch)
+                    beldex_bridge_signer::key_attestation::standby_set_retired(&view, &records, &ls.pgw_group_vk, ls.committee.height, ls.committee.round_height)
                 });
                 match (why, standby_retire_since) {
                     (None, _) => standby_retire_since = None,
@@ -3801,7 +3801,7 @@ where
                 .call("bridge_get_standby", serde_json::json!({}))
                 .map_err(|e| format!("{e:?}"))
                 .and_then(|v| ka::parse_records(&v).ok_or_else(|| "no attestations in the reply".to_string()));
-            match records.map(|r| ka::status(&r, ls.committee.epoch, &ls.pgw_group_vk, &ls.pevm_address, ls.self_index)) {
+            match records.map(|r| ka::status(&r, ls.committee.epoch, ls.committee.round_height, &ls.pgw_group_vk, &ls.pevm_address, ls.self_index)) {
                 Ok(ka::Status::Attested) => {
                     println!(
                         "key attested: committee epoch {} holds gateway key {}",
@@ -3812,13 +3812,14 @@ where
                 }
                 Ok(ka::Status::Counted) => {}
                 Ok(ka::Status::Missing) if now >= attest_next_at => {
-                    match ka::sign(&ls.ed25519_secret, &bus_genesis, ls.committee.epoch, &ls.pgw_group_vk, &ls.pevm_address) {
+                    match ka::sign(&ls.ed25519_secret, &bus_genesis, ls.committee.epoch, ls.committee.round_height, &ls.pgw_group_vk, &ls.pevm_address) {
                         Err(e) => eprintln!("  key attestation not signed: {e}"),
                         Ok(sig) => match &ack_wallet {
                             Some(w) => match w.call(
                                 "bridge_key_attestation",
                                 serde_json::json!({
                                     "epoch": ls.committee.epoch,
+                                    "round_height": ls.committee.round_height,
                                     "pgw_vk": hex(&ls.pgw_group_vk),
                                     "pevm_address": hex(&ls.pevm_address),
                                     "voter_index": ls.self_index,
@@ -3841,9 +3842,10 @@ where
                             },
                             None => {
                                 println!(
-                                    "KEY-ATTESTATION epoch={} pgw_vk={} pevm_address={} voter_index={} signature={} \
+                                    "KEY-ATTESTATION epoch={} round_height={} pgw_vk={} pevm_address={} voter_index={} signature={} \
                                      (no wallet RPC: submit with the wallet RPC bridge_key_attestation)",
                                     ls.committee.epoch,
+                                    ls.committee.round_height,
                                     hex(&ls.pgw_group_vk),
                                     hex(&ls.pevm_address),
                                     ls.self_index,

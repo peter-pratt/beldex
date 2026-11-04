@@ -96,6 +96,9 @@ pub struct SlashReport {
     pub accused_index: u16,
     pub epoch: u64,
     pub height: u64,
+    /// The standby round whose committee holds the key (its start): `accused_index` and the
+    /// accusers are indices in that committee. 0 for an epoch committee.
+    pub round_height: u64,
 }
 
 impl SlashReport {
@@ -103,7 +106,7 @@ impl SlashReport {
     /// `beldexd` verifies. Domain-separated (S6); the genesis binding prevents
     /// replay of a report across networks/forks (S14).
     pub fn canonical(&self, genesis: &[u8; 32]) -> Vec<u8> {
-        let mut v = Vec::with_capacity(SLASH_REPORT_DOMAIN.len() + 32 + 1 + 32 + 1 + 2 + 8 + 8);
+        let mut v = Vec::with_capacity(SLASH_REPORT_DOMAIN.len() + 32 + 1 + 32 + 1 + 2 + 8 + 8 + 8);
         v.extend_from_slice(SLASH_REPORT_DOMAIN);
         v.extend_from_slice(genesis);
         v.push(self.scheme.to_u8());
@@ -112,6 +115,9 @@ impl SlashReport {
         v.extend_from_slice(&self.accused_index.to_le_bytes());
         v.extend_from_slice(&self.epoch.to_le_bytes());
         v.extend_from_slice(&self.height.to_le_bytes());
+        if self.round_height != 0 {
+            v.extend_from_slice(&self.round_height.to_le_bytes());
+        }
         v
     }
 }
@@ -177,6 +183,7 @@ pub fn frost_slash_report(
         accused_index,
         epoch,
         height,
+        round_height: 0,
     })
 }
 
@@ -190,6 +197,7 @@ pub fn coarse_pevm_fault(transcript_root: [u8; 32], epoch: u64, height: u64) -> 
         accused_index: u16::MAX,
         epoch,
         height,
+        round_height: 0,
     }
 }
 
@@ -276,9 +284,12 @@ impl SignedSlashReport {
 
         format!(
             concat!(
-                r#"{{"version":0,"scheme":{},"failing_check":{},"accused_index":{},"#,
+                r#"{{"version":{},"round_height":{},"scheme":{},"failing_check":{},"accused_index":{},"#,
                 r#""epoch":{},"height":{},"transcript_root":"{}","accusers":[{}]}}"#
             ),
+            // Version 2 names a standby round; the daemon refuses any other pairing.
+            if self.report.round_height != 0 { 2 } else { 0 },
+            self.report.round_height,
             self.report.scheme.to_u8(),
             self.report.failing_check.to_u8(),
             self.report.accused_index,
@@ -293,6 +304,30 @@ impl SignedSlashReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_report_about_a_rounds_key_names_the_round() {
+        let report = SlashReport {
+            scheme: Scheme::Pgw,
+            transcript_root: [1; 32],
+            failing_check: FailingCheck::InvalidSignatureShare,
+            accused_index: 2,
+            epoch: 1,
+            height: 200,
+            round_height: 0,
+        };
+        let round = SlashReport { round_height: 130, ..report.clone() };
+        // An epoch committee's bytes are unchanged; the round is signed, at the end.
+        let (m0, m1) = (report.canonical(&[9; 32]), round.canonical(&[9; 32]));
+        assert_eq!(m1.len(), m0.len() + 8);
+        assert_eq!(&m1[..m0.len()], &m0[..]);
+        assert_eq!(&m1[m0.len()..], &130u64.to_le_bytes());
+
+        let v0 = SignedSlashReport::new(report).to_submission_json();
+        assert!(v0.contains(r#""version":0"#) && v0.contains(r#""round_height":0"#));
+        let v2 = SignedSlashReport::new(round).to_submission_json();
+        assert!(v2.contains(r#""version":2"#) && v2.contains(r#""round_height":130"#));
+    }
     use crate::ffi::{ed25519_keypair, ensure_init};
     use std::collections::BTreeMap;
 
@@ -314,6 +349,7 @@ mod tests {
             member_x25519: Vec::new(),
             daemon_self_index: None,
             threshold: t as usize,
+            round_height: 0,
         };
         (c, sks)
     }
@@ -398,6 +434,7 @@ mod tests {
             accused_index: 2,
             epoch: 2,
             height: 240,
+            round_height: 0,
         };
 
         // Fewer than `threshold` accusers → not admissible.
@@ -428,6 +465,7 @@ mod tests {
             accused_index: 1,
             epoch: 2,
             height: 240,
+            round_height: 0,
         };
         let mut signed = SignedSlashReport::new(report);
         for i in [0u16, 2, 3] {
@@ -464,6 +502,7 @@ mod tests {
             accused_index: 2,
             epoch: 42,
             height: 123456,
+            round_height: 0,
         });
         // Sign out of order; sign_as also ignores a repeat from the same member.
         for i in [4u16, 0, 3, 1, 3] {

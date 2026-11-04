@@ -4521,6 +4521,8 @@ namespace cryptonote::rpc {
                             {"members", std::move(members)}});
     }
     cmd.response["standby_rounds"] = std::move(rounds);
+    cmd.response["standby_round_window"] = cryptonote::bridge_standby_round_window_blocks(nettype);
+    cmd.response["height"] = top ? top - 1 : 0;
     if (owner_record)
       if (const auto waiting = mnl.first_waiting_standby_key(*owner_record))
         cmd.response["waiting_key"] = tools::type_to_hex(waiting->pgw_vk);

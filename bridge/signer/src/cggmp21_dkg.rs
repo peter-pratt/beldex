@@ -81,6 +81,7 @@ fn cggmp21_keygen_drives_orchestration_and_binds_wbdx_address() {
             member_x25519: Vec::new(),
             daemon_self_index: None,
             threshold: t as usize,
+            round_height: 0,
         };
         let mut sess = DkgSession::start(&committee, DkgLeg::Pevm, 0, 0).unwrap();
         for i in 0..n as usize {

@@ -3488,8 +3488,12 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
       std::vector<crypto::ed25519_public_key> signer_keys;
       size_t threshold = 0;
       std::string ack_reason;
-      if (!m_master_node_list.get_bridge_committee(epoch_height, members, signer_keys, threshold))
-        ack_reason = "no bridge committee for epoch " + std::to_string(ack.epoch);
+      const bool known = ack.version >= tx_extra_bridge_rotation_ack::ROUND_VERSION
+          ? m_master_node_list.get_bridge_round_committee(ack.round_height, members, signer_keys, threshold, /*attested_only=*/true)
+          : m_master_node_list.get_bridge_committee(epoch_height, members, signer_keys, threshold);
+      if (!known)
+        ack_reason = "no bridge committee for epoch " + std::to_string(ack.epoch) + " (standby round "
+                     + std::to_string(ack.round_height) + ")";
       else if (!cryptonote::verify_bridge_rotation_evidence(ack, signer_keys, threshold, m_nettype, ack_reason))
         { /* reason set by the verifier */ }
       else if (!m_master_node_list.check_bridge_rotation_ack(ack, ack_reason))

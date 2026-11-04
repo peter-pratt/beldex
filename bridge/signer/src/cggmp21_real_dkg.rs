@@ -98,6 +98,7 @@ fn real_cggmp21_dkg_no_dealer_agrees_on_wbdx_address() {
             member_x25519: Vec::new(),
             daemon_self_index: None,
             threshold: t as usize,
+            round_height: 0,
         };
         let mut sess = DkgSession::start(&committee, DkgLeg::Pevm, 0, 0).unwrap();
         for k in 0..n as usize {

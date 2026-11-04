@@ -393,6 +393,7 @@ mod tests {
             member_x25519: Vec::new(),
             daemon_self_index: None,
             threshold: 2,
+            round_height: 0,
         };
         let mut session =
             Session::start(&committee, Leg::Pgw, b"release".to_vec(), [7u8; 32], 0).unwrap();

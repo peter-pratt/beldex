@@ -8,25 +8,38 @@
 //! `bridge_registration` tx (`tx_extra_bridge_key_attestation`). The key is attested once the
 //! epoch's threshold have. No session is needed, so a member attests as soon as it holds a
 //! share, whichever role it serves.
+//!
+//! A standby key comes from a standby round: while the bridge has no working standby, consensus
+//! draws a committee every few blocks, from operators outside the owner's committee. Its
+//! members attest naming the round (`round_height`, its start), within the round's window.
 
 use crate::ffi::{ed25519_sign_detached, ed25519_verify_consensus};
 
 /// `hashkey::BRIDGE_KEY_ATTESTATION` in beldexd.
 pub const DOMAIN: &[u8] = b"bridge_key_attestation_v1";
-/// `tx_extra_bridge_key_attestation::version`; consensus accepts no other.
+/// `tx_extra_bridge_key_attestation::version` of an epoch committee's attestation.
 pub const VERSION: u8 = 0;
+/// The version of a standby round committee's attestation.
+pub const ROUND_VERSION: u8 = 1;
+/// How many blocks after a round's start a member may still join its DKG. Everyone starts on
+/// seeing the round's block; joining much later only makes the others wait out their timeout.
+pub const ROUND_JOIN_BLOCKS: u64 = 2;
 
 /// The bytes every member of committee `epoch` signs:
-/// `DOMAIN ‖ genesis(32) ‖ version(u8) ‖ epoch(u64 LE) ‖ pgw_vk(32) ‖ pevm_address(20)`.
+/// `DOMAIN ‖ genesis(32) ‖ version(u8) ‖ epoch(u64 LE) ‖ pgw_vk(32) ‖ pevm_address(20)`, and for
+/// a standby round (`round_height` != 0) `‖ round_height(u64 LE)`.
 /// The member is not in it: all sign the same statement.
-pub fn message(genesis: &[u8; 32], epoch: u64, pgw_vk: &[u8; 32], pevm_address: &[u8; 20]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(DOMAIN.len() + 32 + 1 + 8 + 32 + 20);
+pub fn message(genesis: &[u8; 32], epoch: u64, round_height: u64, pgw_vk: &[u8; 32], pevm_address: &[u8; 20]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(DOMAIN.len() + 32 + 1 + 8 + 32 + 20 + 8);
     v.extend_from_slice(DOMAIN);
     v.extend_from_slice(genesis);
-    v.push(VERSION);
+    v.push(if round_height != 0 { ROUND_VERSION } else { VERSION });
     v.extend_from_slice(&epoch.to_le_bytes());
     v.extend_from_slice(pgw_vk);
     v.extend_from_slice(pevm_address);
+    if round_height != 0 {
+        v.extend_from_slice(&round_height.to_le_bytes());
+    }
     v
 }
 
@@ -35,14 +48,16 @@ pub fn sign(
     sk64: &[u8; 64],
     genesis: &[u8; 32],
     epoch: u64,
+    round_height: u64,
     pgw_vk: &[u8; 32],
     pevm_address: &[u8; 20],
 ) -> Result<[u8; 64], String> {
-    let sig = ed25519_sign_detached(sk64, &message(genesis, epoch, pgw_vk, pevm_address)).map_err(str::to_string)?;
+    let msg = message(genesis, epoch, round_height, pgw_vk, pevm_address);
+    let sig = ed25519_sign_detached(sk64, &msg).map_err(str::to_string)?;
     // A key the daemon does not hold this member to would only be refused there; say so here.
     let mut pubkey = [0u8; 32];
     pubkey.copy_from_slice(&sk64[32..]);
-    if !ed25519_verify_consensus(&sig, &message(genesis, epoch, pgw_vk, pevm_address), &pubkey) {
+    if !ed25519_verify_consensus(&sig, &msg, &pubkey) {
         return Err("the key attestation does not verify under this node's signer key".into());
     }
     Ok(sig)
@@ -54,6 +69,10 @@ pub struct Record {
     pub pgw_vk: [u8; 32],
     pub pevm_address: [u8; 20],
     pub epoch: u64,
+    /// The standby round whose committee generated it (its start); 0 for an epoch committee.
+    pub round_height: u64,
+    /// The height whose committee generated it: later means a newer committee.
+    pub committee_height: u64,
     pub voters: Vec<u32>,
     /// 0 while still collecting.
     pub attested_height: u64,
@@ -73,11 +92,11 @@ pub enum Status {
     Missing,
 }
 
-/// Where the key (`epoch`, `pgw_vk`, `pevm_address`) stands for member `voter`.
-pub fn status(records: &[Record], epoch: u64, pgw_vk: &[u8; 32], pevm_address: &[u8; 20], voter: u16) -> Status {
+/// Where the key (`epoch`, `round_height`, `pgw_vk`, `pevm_address`) stands for member `voter`.
+pub fn status(records: &[Record], epoch: u64, round_height: u64, pgw_vk: &[u8; 32], pevm_address: &[u8; 20], voter: u16) -> Status {
     match records
         .iter()
-        .find(|r| r.epoch == epoch && r.pgw_vk == *pgw_vk && r.pevm_address == *pevm_address)
+        .find(|r| r.epoch == epoch && r.round_height == round_height && r.pgw_vk == *pgw_vk && r.pevm_address == *pevm_address)
     {
         Some(r) if r.attested_height != 0 => Status::Attested,
         Some(r) if r.voters.contains(&u32::from(voter)) => Status::Counted,
@@ -94,32 +113,16 @@ pub fn holder<'a>(records: &'a [Record], pgw_vk: &[u8; 32]) -> Option<&'a Record
         .min_by_key(|r| r.attested_height)
 }
 
-/// The key the live committee should name as its standby: attested, newer than the owner's
-/// (`owner_epoch`; an older key was generated before it and has served already, or never
-/// will), not the owner's own nor `exclude` (a standby gone stale), and from a committee that
-/// has at most `limit` members run by operators of the owner's. The newest such; consensus applies the
-/// same overlap rule, and every live member reads the same records, so they all pick the same
-/// one.
-pub fn pick_standby<'a>(
-    records: &'a [Record],
-    owner_vk: &[u8; 32],
-    owner_epoch: u64,
-    limit: u64,
-    exclude: Option<&[u8; 32]>,
-) -> Option<&'a Record> {
-    records
-        .iter()
-        .filter(|r| r.attested_height != 0 && r.pgw_vk != *owner_vk && r.epoch > owner_epoch)
-        .filter(|r| exclude != Some(&r.pgw_vk))
-        .filter(|r| r.overlap_with_owner.is_some_and(|o| o <= limit))
-        // The first committee to attest a key holds it; a later attestation of the same key by
-        // another committee says nothing new.
-        .filter(|r| holder(records, &r.pgw_vk).is_some_and(|h| h == *r))
-        .max_by_key(|r| (r.epoch, std::cmp::Reverse(r.attested_height)))
+/// A standby round still taking attestations, as `bridge_get_standby` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StandbyRound {
+    /// The round's start.
+    pub round_height: u64,
+    pub members: Vec<[u8; 32]>,
 }
 
-/// What the daemon's `bridge_get_standby` says about the bridge gateway and the current
-/// committee, beyond the attestation records.
+/// What the daemon's `bridge_get_standby` says about the bridge gateway and its standby, beyond
+/// the attestation records.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StandbyView {
     pub owner_key: Option<[u8; 32]>,
@@ -129,77 +132,82 @@ pub struct StandbyView {
     pub standby_key: Option<[u8; 32]>,
     /// It has neither been named nor proved it can sign for a day: treated as gone.
     pub standby_stale: bool,
-    pub committee_epoch: u64,
-    /// How many of the current committee's members are run by operators of the owner's
-    /// committee, when known.
-    pub committee_overlap: Option<u64>,
-    pub overlap_limit: u64,
+    /// The chain tip this view is for.
+    pub height: u64,
+    /// How many blocks from its start a standby round takes attestations.
+    pub round_window: u64,
+    /// The standby rounds still taking attestations.
+    pub rounds: Vec<StandbyRound>,
+    /// The attested key waiting to be named: the one consensus will accept. Consensus decides
+    /// this (first_waiting_bridge_key) and says so, so no member can come to another answer.
+    pub waiting_key: Option<[u8; 32]>,
 }
 
-/// Whether the current committee should generate the next standby key now: Ok, or why not.
-/// It should when no working standby is named (none, or one gone stale) and none is waiting
-/// to be, and it is a newer committee than the owner's with few enough members run by its operators
-/// to be a standby consensus accepts.
-pub fn standby_dkg_due(view: &StandbyView, records: &[Record]) -> Result<(), String> {
+/// The standby round whose committee should generate a key now: Ok with its start, or why none.
+/// Consensus draws a round only while a standby is due, so this only has to find the latest one
+/// and refuse to join it too late. Whether this node is on its committee is for the caller.
+pub fn standby_round_due(view: &StandbyView) -> Result<u64, String> {
     if view.standby_key.is_some() && !view.standby_stale {
         return Err("a standby is named".into());
     }
-    let (Some(owner), Some(owner_epoch)) = (view.owner_key, view.owner_epoch) else {
+    if view.owner_key.is_none() || view.owner_epoch.is_none() {
         return Err("the gateway owner's key is not attested yet".into());
-    };
-    if view.committee_epoch <= owner_epoch {
-        return Err(format!(
-            "the current committee (epoch {}) is not newer than the owner's ({owner_epoch})",
-            view.committee_epoch
-        ));
     }
-    match view.committee_overlap {
-        Some(o) if o <= view.overlap_limit => {}
-        Some(o) => {
-            return Err(format!(
-                "the current committee has {o} members run by operators of the owner's; at most {} may",
-                view.overlap_limit
-            ))
-        }
-        None => return Err("the current committee's overlap with the owner's is unknown".into()),
-    }
-    if pick_standby(records, &owner, owner_epoch, view.overlap_limit, view.standby_key.as_ref()).is_some() {
+    if view.waiting_key.is_some() {
         return Err("an attested key is waiting to be named".into());
     }
-    if records.iter().any(|r| r.epoch >= view.committee_epoch) {
-        return Err("a key of this committee is being attested".into());
+    let Some(round) = view.rounds.iter().map(|r| r.round_height).max() else {
+        return Err("no standby round is open".into());
+    };
+    if view.height > round + ROUND_JOIN_BLOCKS {
+        return Err(format!("standby round {round} started too long ago to join; waiting for the next"));
     }
-    Ok(())
+    Ok(round)
 }
 
-/// The standby the live committee should have now: the named one while it works, else the
-/// one to name in its place (see [`pick_standby`]). None if there is nothing to name.
+/// The standby the live committee should have now: the named one while it works, else the key
+/// consensus says is waiting to be named. None if there is nothing to name.
 pub fn standby_target<'a>(view: &StandbyView, records: &'a [Record]) -> Option<&'a Record> {
-    let (owner, owner_epoch) = (view.owner_key?, view.owner_epoch?);
+    view.owner_key?;
+    view.owner_epoch?;
     match view.standby_key {
         Some(k) if !view.standby_stale => holder(records, &k),
-        named => pick_standby(records, &owner, owner_epoch, view.overlap_limit, named.as_ref()),
+        _ => holder(records, view.waiting_key.as_ref()?),
     }
 }
 
-/// Whether a standby share set should step aside, and why: its key (held by committee
-/// `ours_epoch`) is the named standby but has gone stale (its holders can no longer sign
-/// together), or a newer committee's key is named in its place. Its members then archive it and
-/// rejoin the pool, so they can help generate the next one. Never for the owner's key: that
-/// set is promoted, not retired.
-pub fn standby_set_retired(view: &StandbyView, records: &[Record], ours: &[u8; 32], ours_epoch: u64) -> Option<String> {
+/// Whether a standby share set should step aside, and why, so its members rejoin the pool and
+/// can be drawn for the next standby. `ours_height` is the height whose committee holds it and
+/// `ours_round` its standby round (0 for an epoch committee's). It steps aside when its key is
+/// the named standby but has gone stale (its holders can no longer sign together), when a newer
+/// key is named in its place, or, for a round's key, when it lost: another key was named, or it
+/// was attested but consensus no longer has it waiting, or its round closed without attesting
+/// it. Never for the owner's key: that set is promoted, not retired.
+pub fn standby_set_retired(view: &StandbyView, records: &[Record], ours: &[u8; 32], ours_height: u64, ours_round: u64) -> Option<String> {
     if view.owner_key.as_ref() == Some(ours) {
         return None;
     }
-    match view.standby_key {
-        Some(k) if k == *ours && view.standby_stale => {
-            Some("this standby key has not proved it can sign for a day: its holders cannot sign together".into())
-        }
-        Some(k) if k != *ours => holder(records, &k)
-            .filter(|r| r.epoch > ours_epoch)
-            .map(|r| format!("a newer standby (committee epoch {}) is named in its place", r.epoch)),
-        _ => None,
+    if view.standby_key.as_ref() == Some(ours) {
+        return view
+            .standby_stale
+            .then(|| "this standby key has not proved it can sign for a day: its holders cannot sign together".to_string());
     }
+    if ours_round == 0 {
+        let named = holder(records, view.standby_key.as_ref()?)?;
+        return (named.committee_height > ours_height)
+            .then(|| format!("a newer standby (committee height {}) is named in its place", named.committee_height));
+    }
+    // What consensus has waiting cannot be judged without an attested owner.
+    if view.owner_epoch.is_none() || view.waiting_key.as_ref() == Some(ours) {
+        return None;
+    }
+    if view.standby_key.is_some() && !view.standby_stale {
+        return Some(format!("another key is named as the standby, not round {ours_round}'s"));
+    }
+    if holder(records, ours).is_some() {
+        return Some(format!("round {ours_round}'s key was attested, but is no longer the one waiting to be named"));
+    }
+    (view.height > ours_round + view.round_window).then(|| format!("standby round {ours_round} closed without attesting this key"))
 }
 
 /// The [`StandbyView`] of a `bridge_get_standby` JSON-RPC result.
@@ -216,14 +224,31 @@ pub fn parse_view(result: &serde_json::Value) -> Option<StandbyView> {
         }
         Some(out)
     };
+    let mut rounds = Vec::new();
+    for r in result.get("standby_rounds").and_then(serde_json::Value::as_array).into_iter().flatten() {
+        let mut members = Vec::new();
+        for m in r.get("members")?.as_array()? {
+            let s = m.as_str()?;
+            if s.len() != 64 || !s.is_ascii() {
+                return None;
+            }
+            let mut out = [0u8; 32];
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+            }
+            members.push(out);
+        }
+        rounds.push(StandbyRound { round_height: r.get("round_height")?.as_u64()?, members });
+    }
     Some(StandbyView {
         owner_key: key("owner_key"),
         owner_epoch: result.get("owner_epoch").and_then(serde_json::Value::as_u64),
         standby_key: key("standby_key"),
         standby_stale: result.get("standby_stale").and_then(serde_json::Value::as_bool).unwrap_or(false),
-        committee_epoch: result.get("committee_epoch")?.as_u64()?,
-        committee_overlap: result.get("committee_overlap").and_then(serde_json::Value::as_u64),
-        overlap_limit: result.get("overlap_limit")?.as_u64()?,
+        height: result.get("height")?.as_u64()?,
+        round_window: result.get("standby_round_window")?.as_u64()?,
+        rounds,
+        waiting_key: key("waiting_key"),
     })
 }
 
@@ -247,6 +272,8 @@ pub fn parse_records(result: &serde_json::Value) -> Option<Vec<Record>> {
             pgw_vk: bytes(r.get("pgw_vk")?)?,
             pevm_address: bytes(r.get("pevm_address")?)?,
             epoch: r.get("epoch")?.as_u64()?,
+            round_height: r.get("round_height").and_then(serde_json::Value::as_u64).unwrap_or(0),
+            committee_height: r.get("committee_height").and_then(serde_json::Value::as_u64).unwrap_or(0),
             voters: r
                 .get("voters")?
                 .as_array()?
@@ -266,7 +293,7 @@ mod tests {
 
     #[test]
     fn the_message_is_the_consensus_layout() {
-        let m = message(&[1; 32], 0x0102, &[2; 32], &[3; 20]);
+        let m = message(&[1; 32], 0x0102, 0, &[2; 32], &[3; 20]);
         assert_eq!(m.len(), DOMAIN.len() + 32 + 1 + 8 + 32 + 20);
         assert!(m.starts_with(b"bridge_key_attestation_v1"));
         let rest = &m[DOMAIN.len()..];
@@ -275,16 +302,26 @@ mod tests {
         assert_eq!(&rest[33..41], &[0x02, 0x01, 0, 0, 0, 0, 0, 0], "epoch, little-endian");
         assert_eq!(&rest[41..73], &[2; 32]);
         assert_eq!(&rest[73..], &[3; 20]);
-        assert_ne!(m, message(&[9; 32], 0x0102, &[2; 32], &[3; 20]), "bound to the network");
+        assert_ne!(m, message(&[9; 32], 0x0102, 0, &[2; 32], &[3; 20]), "bound to the network");
+
+        // A standby round's: version 1, the round's start at the end.
+        let r = message(&[1; 32], 0x0102, 0x0304, &[2; 32], &[3; 20]);
+        assert_eq!(r.len(), m.len() + 8);
+        assert_eq!(r[DOMAIN.len() + 32], 1, "version");
+        assert_eq!(&r[m.len()..], &[0x04, 0x03, 0, 0, 0, 0, 0, 0], "round, little-endian");
+        assert_ne!(r, message(&[1; 32], 0x0102, 0x0305, &[2; 32], &[3; 20]), "bound to the round");
     }
 
     #[test]
     fn a_signature_verifies_under_the_members_key() {
         crate::ffi::ensure_init().unwrap();
         let (pk, sk) = crate::ffi::ed25519_keypair().unwrap();
-        let sig = sign(&sk, &[1; 32], 4, &[2; 32], &[3; 20]).unwrap();
-        assert!(ed25519_verify_consensus(&sig, &message(&[1; 32], 4, &[2; 32], &[3; 20]), &pk));
-        assert!(!ed25519_verify_consensus(&sig, &message(&[1; 32], 5, &[2; 32], &[3; 20]), &pk));
+        let sig = sign(&sk, &[1; 32], 4, 0, &[2; 32], &[3; 20]).unwrap();
+        assert!(ed25519_verify_consensus(&sig, &message(&[1; 32], 4, 0, &[2; 32], &[3; 20]), &pk));
+        assert!(!ed25519_verify_consensus(&sig, &message(&[1; 32], 5, 0, &[2; 32], &[3; 20]), &pk));
+        let sig = sign(&sk, &[1; 32], 4, 130, &[2; 32], &[3; 20]).unwrap();
+        assert!(ed25519_verify_consensus(&sig, &message(&[1; 32], 4, 130, &[2; 32], &[3; 20]), &pk));
+        assert!(!ed25519_verify_consensus(&sig, &message(&[1; 32], 4, 140, &[2; 32], &[3; 20]), &pk));
     }
 
     #[test]
@@ -293,20 +330,24 @@ mod tests {
             pgw_vk: [2; 32],
             pevm_address: [3; 20],
             epoch,
+            round_height: 0,
+            committee_height: 0,
             voters,
             attested_height: h,
             overlap_with_owner: None,
         };
         let records = vec![rec(4, vec![0, 2], 0)];
-        assert_eq!(status(&records, 4, &[2; 32], &[3; 20], 1), Status::Missing);
-        assert_eq!(status(&records, 4, &[2; 32], &[3; 20], 2), Status::Counted);
-        assert_eq!(status(&records, 4, &[2; 32], &[4; 20], 2), Status::Missing, "another address");
-        assert_eq!(status(&[], 4, &[2; 32], &[3; 20], 0), Status::Missing);
+        assert_eq!(status(&records, 4, 0, &[2; 32], &[3; 20], 1), Status::Missing);
+        assert_eq!(status(&records, 4, 0, &[2; 32], &[3; 20], 2), Status::Counted);
+        assert_eq!(status(&records, 4, 0, &[2; 32], &[4; 20], 2), Status::Missing, "another address");
+        assert_eq!(status(&[], 4, 0, &[2; 32], &[3; 20], 0), Status::Missing);
         assert!(holder(&records, &[2; 32]).is_none(), "collecting is not attested");
 
         let records = vec![rec(5, vec![0, 1, 2, 3], 90), rec(4, vec![0, 1, 2, 3], 80)];
-        assert_eq!(status(&records, 4, &[2; 32], &[3; 20], 5), Status::Attested);
+        assert_eq!(status(&records, 4, 0, &[2; 32], &[3; 20], 5), Status::Attested);
         assert_eq!(holder(&records, &[2; 32]).unwrap().epoch, 4);
+        // A round's key is its own claim, apart from the epoch's.
+        assert_eq!(status(&records, 4, 130, &[2; 32], &[3; 20], 5), Status::Missing);
     }
 
     #[cfg(feature = "evm-watcher")]
@@ -317,7 +358,7 @@ mod tests {
                 { "pgw_vk": "02".repeat(32), "pevm_address": "03".repeat(20), "epoch": 4,
                   "voters": [0, 2], "attested_height": 0, "overlap_with_owner": 1 },
                 { "pgw_vk": "05".repeat(32), "pevm_address": "06".repeat(20), "epoch": 5,
-                  "voters": [], "attested_height": 7 }
+                  "round_height": 610, "committee_height": 610, "voters": [], "attested_height": 7 }
             ]
         });
         let r = parse_records(&v).unwrap();
@@ -326,131 +367,136 @@ mod tests {
         assert_eq!(r[0].overlap_with_owner, Some(1));
         assert_eq!(r[1].pgw_vk, [5; 32]);
         assert_eq!(r[1].overlap_with_owner, None);
+        assert_eq!((r[0].round_height, r[1].round_height, r[1].committee_height), (0, 610, 610));
         assert!(parse_records(&serde_json::json!({})).is_none());
         assert!(parse_records(&serde_json::json!({ "attestations": [{ "pgw_vk": "02" }] })).is_none());
     }
 
-    #[test]
-    fn the_standby_is_the_newest_attested_key_within_the_overlap_limit() {
-        let rec = |vk: u8, epoch, h, overlap| Record {
+    fn rec(vk: u8, epoch: u64, round_height: u64, committee_height: u64, h: u64) -> Record {
+        Record {
             pgw_vk: [vk; 32],
             pevm_address: [vk; 20],
             epoch,
+            round_height,
+            committee_height,
             voters: vec![],
             attested_height: h,
-            overlap_with_owner: overlap,
-        };
-        let owner = [1; 32];
-        let records = vec![
-            rec(1, 4, 10, Some(20)), // the owner itself
-            rec(2, 3, 11, Some(0)),  // older than the owner
-            rec(3, 6, 30, Some(2)),
-            rec(4, 7, 40, Some(9)),  // too much in common
-            rec(5, 8, 0, Some(0)),   // still collecting
-            rec(6, 5, 20, None),     // committee unknown
-        ];
-        assert_eq!(pick_standby(&records, &owner, 4, 6, None).unwrap().pgw_vk, [3; 32]);
-        assert_eq!(pick_standby(&records, &owner, 4, 9, None).unwrap().pgw_vk, [4; 32]);
-        assert_eq!(pick_standby(&records, &owner, 4, 9, Some(&[4; 32])).unwrap().pgw_vk, [3; 32], "not the stale one");
-        assert!(pick_standby(&records, &owner, 6, 6, None).is_none(), "nothing newer than the owner");
+            overlap_with_owner: None,
+        }
+    }
 
-        // A key a second committee attested later still belongs to the first.
-        let mut records = vec![rec(3, 6, 30, Some(2))];
-        records.push(Record { epoch: 7, attested_height: 25, ..rec(3, 7, 25, Some(1)) });
-        let pick = pick_standby(&records, &owner, 4, 6, None).unwrap();
-        assert_eq!((pick.epoch, pick.attested_height), (7, 25), "epoch 7 reached its threshold first");
+    fn view() -> StandbyView {
+        StandbyView {
+            owner_key: Some([1; 32]),
+            owner_epoch: Some(4),
+            height: 131,
+            round_window: 10,
+            rounds: vec![StandbyRound { round_height: 130, members: vec![[7; 32]] }],
+            ..StandbyView::default()
+        }
     }
 
     #[test]
-    fn the_next_standby_is_generated_by_a_newer_committee_that_barely_overlaps_and_only_once() {
-        let view = StandbyView {
-            owner_key: Some([1; 32]),
-            owner_epoch: Some(4),
-            standby_key: None,
-            standby_stale: false,
-            committee_epoch: 6,
-            committee_overlap: Some(2),
-            overlap_limit: 6,
-        };
-        assert_eq!(standby_dkg_due(&view, &[]), Ok(()));
-        let no = |v: &StandbyView, r: &[Record]| standby_dkg_due(v, r).unwrap_err();
-        assert!(no(&StandbyView { standby_key: Some([8; 32]), ..view.clone() }, &[]).contains("named"));
-        assert_eq!(
-            standby_dkg_due(&StandbyView { standby_key: Some([8; 32]), standby_stale: true, ..view.clone() }, &[]),
-            Ok(()),
-            "a stale standby is no standby"
-        );
-        assert!(no(&StandbyView { owner_epoch: None, ..view.clone() }, &[]).contains("not attested"));
-        assert!(no(&StandbyView { committee_epoch: 4, ..view.clone() }, &[]).contains("not newer"));
-        assert!(no(&StandbyView { committee_overlap: Some(7), ..view.clone() }, &[]).contains("at most 6"));
-        assert!(no(&StandbyView { committee_overlap: None, ..view.clone() }, &[]).contains("unknown"));
+    fn a_member_joins_the_latest_round_only_while_it_is_new() {
+        assert_eq!(standby_round_due(&view()), Ok(130));
+        let no = |v: &StandbyView| standby_round_due(v).unwrap_err();
+        assert!(no(&StandbyView { standby_key: Some([8; 32]), ..view() }).contains("named"));
+        assert_eq!(standby_round_due(&StandbyView { standby_key: Some([8; 32]), standby_stale: true, ..view() }), Ok(130), "a stale standby is no standby");
+        assert!(no(&StandbyView { owner_epoch: None, ..view() }).contains("not attested"));
+        assert!(no(&StandbyView { waiting_key: Some([5; 32]), ..view() }).contains("waiting to be named"));
+        assert!(no(&StandbyView { rounds: vec![], ..view() }).contains("no standby round"));
 
-        let rec = |epoch, h, overlap| Record {
-            pgw_vk: [9; 32],
-            pevm_address: [9; 20],
-            epoch,
-            voters: vec![],
-            attested_height: h,
-            overlap_with_owner: overlap,
+        // Rounds overlap by their windows: the latest is the one to join.
+        let two = StandbyView {
+            rounds: vec![StandbyRound { round_height: 130, members: vec![] }, StandbyRound { round_height: 140, members: vec![] }],
+            height: 140,
+            ..view()
         };
-        assert!(no(&view, &[rec(5, 50, Some(1))]).contains("waiting to be named"));
-        assert!(no(&view, &[rec(6, 0, None)]).contains("being attested"));
-        // An older committee's key that cannot be a standby does not hold this one back.
-        assert_eq!(standby_dkg_due(&view, &[rec(5, 50, Some(9))]), Ok(()));
+        assert_eq!(standby_round_due(&two), Ok(140));
+
+        // A node that comes up late does not make the others wait out their timeout.
+        assert_eq!(standby_round_due(&StandbyView { height: 130 + ROUND_JOIN_BLOCKS, ..view() }), Ok(130));
+        assert!(no(&StandbyView { height: 131 + ROUND_JOIN_BLOCKS, ..view() }).contains("too long ago"));
+    }
+
+    #[test]
+    fn the_target_is_the_working_standby_else_what_consensus_has_waiting() {
+        let records = vec![rec(1, 4, 0, 480, 10), rec(5, 5, 610, 610, 620), rec(6, 5, 620, 620, 630)];
+        let named = StandbyView { standby_key: Some([6; 32]), ..view() };
+        assert_eq!(standby_target(&named, &records).unwrap().pgw_vk, [6; 32]);
+        // Consensus's choice, not the newest: a later round's key can lose to an earlier one.
+        let waiting = StandbyView { waiting_key: Some([5; 32]), ..view() };
+        assert_eq!(standby_target(&waiting, &records).unwrap().pgw_vk, [5; 32]);
+        let stale = StandbyView { standby_key: Some([6; 32]), standby_stale: true, waiting_key: Some([5; 32]), ..view() };
+        assert_eq!(standby_target(&stale, &records).unwrap().pgw_vk, [5; 32], "replaced, never by itself");
+        assert!(standby_target(&StandbyView { standby_key: Some([6; 32]), standby_stale: true, ..view() }, &records).is_none());
+        assert!(standby_target(&view(), &records).is_none(), "nothing to name");
+        assert!(standby_target(&StandbyView { owner_epoch: None, ..waiting }, &records).is_none(), "the owner must be attested");
     }
 
     #[cfg(feature = "evm-watcher")]
     #[test]
     fn the_daemons_view_parses() {
         let v = serde_json::json!({
-            "owner_key": "01".repeat(32), "owner_epoch": 4, "committee_epoch": 6,
-            "committee_overlap": 2, "overlap_limit": 6, "threshold": 14, "attestations": []
+            "owner_key": "01".repeat(32), "owner_epoch": 4, "height": 131, "standby_round_window": 10,
+            "standby_rounds": [{ "round": 1, "round_height": 130, "window_end": 140, "members": ["07".repeat(32)] }],
+            "attestations": []
         });
-        let view = parse_view(&v).unwrap();
-        assert_eq!(view.owner_key, Some([1; 32]));
-        assert_eq!((view.standby_key, view.standby_stale), (None, false));
-        assert_eq!((view.committee_epoch, view.committee_overlap, view.overlap_limit), (6, Some(2), 6));
+        let got = parse_view(&v).unwrap();
+        assert_eq!(got.owner_key, Some([1; 32]));
+        assert_eq!((got.standby_key, got.standby_stale, got.waiting_key), (None, false, None));
+        assert_eq!((got.height, got.round_window), (131, 10));
+        assert_eq!(got.rounds, vec![StandbyRound { round_height: 130, members: vec![[7; 32]] }]);
         let mut named = v.clone();
         named["standby_key"] = serde_json::json!("02".repeat(32));
         named["standby_stale"] = serde_json::json!(true);
+        named["waiting_key"] = serde_json::json!("03".repeat(32));
         let named = parse_view(&named).unwrap();
-        assert_eq!((named.standby_key, named.standby_stale), (Some([2; 32]), true));
+        assert_eq!((named.standby_key, named.standby_stale, named.waiting_key), (Some([2; 32]), true, Some([3; 32])));
+        assert!(parse_view(&serde_json::json!({ "height": 1 })).is_none(), "no window");
     }
 
     #[test]
-    fn a_stale_standby_is_replaced_and_its_holders_step_aside() {
-        let rec = |vk: u8, epoch, h, overlap| Record {
-            pgw_vk: [vk; 32],
-            pevm_address: [vk; 20],
-            epoch,
-            voters: vec![],
-            attested_height: h,
-            overlap_with_owner: overlap,
-        };
-        let records = vec![rec(1, 4, 10, Some(20)), rec(5, 5, 50, Some(2)), rec(6, 6, 60, Some(3))];
-        let view = StandbyView {
-            owner_key: Some([1; 32]),
-            owner_epoch: Some(4),
-            standby_key: Some([6; 32]),
-            standby_stale: false,
-            committee_epoch: 7,
-            committee_overlap: Some(1),
-            overlap_limit: 6,
-        };
-        // A working standby stays the target; a stale one is replaced, never by itself.
-        assert_eq!(standby_target(&view, &records).unwrap().pgw_vk, [6; 32]);
-        let stale = StandbyView { standby_stale: true, ..view.clone() };
-        assert_eq!(standby_target(&stale, &records).unwrap().pgw_vk, [5; 32]);
-        let none = StandbyView { standby_key: None, ..view.clone() };
-        assert_eq!(standby_target(&none, &records).unwrap().pgw_vk, [6; 32]);
-
-        // Its holders step aside once it is stale, or once a newer key replaces it.
-        assert!(standby_set_retired(&view, &records, &[6; 32], 6).is_none(), "working");
-        assert!(standby_set_retired(&stale, &records, &[6; 32], 6).unwrap().contains("not proved"));
-        assert!(standby_set_retired(&view, &records, &[5; 32], 5).unwrap().contains("newer standby"));
-        // A newer key waiting to be named does not step aside for an older named one.
-        assert!(standby_set_retired(&StandbyView { standby_key: Some([5; 32]), ..view.clone() }, &records, &[6; 32], 6).is_none());
+    fn an_epoch_committees_standby_steps_aside_when_stale_or_replaced() {
+        let records = vec![rec(1, 4, 0, 480, 10), rec(5, 5, 0, 600, 50), rec(6, 6, 0, 720, 60)];
+        let named = StandbyView { standby_key: Some([6; 32]), ..view() };
+        let stale = StandbyView { standby_stale: true, ..named.clone() };
+        assert!(standby_set_retired(&named, &records, &[6; 32], 720, 0).is_none(), "working");
+        assert!(standby_set_retired(&stale, &records, &[6; 32], 720, 0).unwrap().contains("not proved"));
+        assert!(standby_set_retired(&named, &records, &[5; 32], 600, 0).unwrap().contains("newer standby"));
+        // A newer key does not step aside for an older named one, nor with none named.
+        assert!(standby_set_retired(&StandbyView { standby_key: Some([5; 32]), ..view() }, &records, &[6; 32], 720, 0).is_none());
+        assert!(standby_set_retired(&view(), &records, &[6; 32], 720, 0).is_none());
         // Nor does the owner's set.
-        assert!(standby_set_retired(&stale, &records, &[1; 32], 4).is_none());
+        assert!(standby_set_retired(&stale, &records, &[1; 32], 480, 0).is_none());
+    }
+
+    #[test]
+    fn a_rounds_set_steps_aside_once_it_has_lost() {
+        let records = vec![rec(1, 4, 0, 480, 10), rec(5, 5, 610, 610, 620), rec(6, 5, 620, 620, 630)];
+        let ours = |v: &StandbyView, vk: u8, round: u64| standby_set_retired(v, &records, &[vk; 32], round, round);
+
+        // Still in the running: waiting, named, or collecting within its window.
+        let waiting = StandbyView { waiting_key: Some([5; 32]), height: 640, ..view() };
+        assert!(ours(&waiting, 5, 610).is_none());
+        assert!(ours(&StandbyView { standby_key: Some([5; 32]), ..view() }, 5, 610).is_none());
+        assert!(ours(&StandbyView { height: 650, ..view() }, 9, 650).is_none());
+        assert!(ours(&StandbyView { height: 660, ..view() }, 9, 650).is_none(), "the window's last block");
+
+        // Lost: another key is waiting, or named; never attested in time; left too long.
+        assert!(ours(&waiting, 6, 620).unwrap().contains("no longer the one waiting"));
+        assert!(ours(&StandbyView { standby_key: Some([5; 32]), ..view() }, 6, 620).unwrap().contains("another key is named"));
+        assert!(ours(&StandbyView { height: 661, ..view() }, 9, 650).unwrap().contains("closed without attesting"));
+        assert!(ours(&view(), 5, 610).unwrap().contains("no longer the one waiting"));
+
+        // A stale named standby's holders go; another round's holders may be next, so stay put
+        // while their key is the waiting one.
+        let stale = StandbyView { standby_key: Some([6; 32]), standby_stale: true, waiting_key: Some([5; 32]), ..view() };
+        assert!(ours(&stale, 6, 620).unwrap().contains("not proved"));
+        assert!(ours(&stale, 5, 610).is_none());
+
+        // Without an attested owner consensus has nothing waiting: not a loss. Nor is the owner's.
+        assert!(ours(&StandbyView { owner_epoch: None, ..view() }, 5, 610).is_none());
+        assert!(ours(&StandbyView { owner_key: Some([5; 32]), ..view() }, 5, 610).is_none());
     }
 }

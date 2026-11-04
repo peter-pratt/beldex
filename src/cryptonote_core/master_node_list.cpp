@@ -2822,11 +2822,12 @@ namespace master_nodes
   bool master_node_list::get_bridge_round_committee(uint64_t round_height,
                                                     std::vector<crypto::public_key> &members,
                                                     std::vector<crypto::ed25519_public_key> &signer_keys,
-                                                    size_t &threshold) const
+                                                    size_t &threshold,
+                                                    bool attested_only) const
   {
     std::lock_guard lock(m_mn_mutex);
     threshold = cryptonote::bridge_committee_threshold(m_blockchain.nettype());
-    return m_state.bridge_round_committee(round_height, members, signer_keys);
+    return m_state.bridge_round_committee(round_height, members, signer_keys, attested_only);
   }
 
   size_t bridge_committee_operator_overlap(const std::vector<crypto::public_key> &a,
@@ -3104,14 +3105,16 @@ namespace master_nodes
   }
 
   bool master_node_list::state_t::bridge_round_committee(uint64_t round_height, std::vector<crypto::public_key> &members,
-                                                         std::vector<crypto::ed25519_public_key> &signer_keys) const
+                                                         std::vector<crypto::ed25519_public_key> &signer_keys,
+                                                         bool attested_only) const
   {
     if (round_height == 0)
       return false;
     members.clear();
-    for (const auto &r : bridge_standby_rounds)
-      if (r.round_height == round_height)
-        members = r.members;
+    if (!attested_only)
+      for (const auto &r : bridge_standby_rounds)
+        if (r.round_height == round_height)
+          members = r.members;
     if (members.empty())
       for (const auto &r : bridge_key_attestations)
         if (r.round_height == round_height && r.attested_height != 0)
@@ -3196,11 +3199,16 @@ namespace master_nodes
     std::vector<crypto::public_key> members;
     std::vector<crypto::ed25519_public_key> signer_keys;
     size_t threshold = 0;
-    if (!resolve_committee(epoch_height, members, signer_keys, threshold) || members.empty()
-        || members.size() != signer_keys.size())
+    // The holders of a standby round's key observed it: that round's committee.
+    const bool resolved = op.version >= cryptonote::tx_extra_bridge_rotation_ack::ROUND_VERSION
+        ? bridge_round_committee(op.round_height, members, signer_keys, /*attested_only=*/true)
+        : resolve_committee(epoch_height, members, signer_keys, threshold);
+    if (op.version >= cryptonote::tx_extra_bridge_rotation_ack::ROUND_VERSION)
+      threshold = cryptonote::bridge_committee_threshold(nettype);
+    if (!resolved || members.empty() || members.size() != signer_keys.size())
     {
       LOG_PRINT_L1("Bridge rotation-ack TX: no bridge committee for epoch " << op.epoch
-                   << " (height " << epoch_height << ")");
+                   << " (height " << epoch_height << ", standby round " << op.round_height << ")");
       return false;
     }
 

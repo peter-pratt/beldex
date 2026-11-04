@@ -126,6 +126,9 @@ pub struct CommitteeView {
     pub daemon_self_index: Option<usize>,
     /// Threshold `t + 1` required to produce a signature.
     pub threshold: usize,
+    /// The standby round this committee was drawn for (its start, then also `height`); 0 for
+    /// an epoch committee. Round 0 starts on the epoch's first block, so `height` cannot tell.
+    pub round_height: u64,
 }
 
 impl CommitteeView {
@@ -221,6 +224,7 @@ impl CommitteeView {
             member_x25519,
             daemon_self_index,
             threshold,
+            round_height: json_u64(s, "round_height").unwrap_or(0),
         })
     }
 
@@ -348,6 +352,7 @@ mod tests {
             member_x25519: Vec::new(),
             daemon_self_index: None,
             threshold,
+            round_height: 0,
         }
     }
 
@@ -389,6 +394,16 @@ mod tests {
         "\"41203ed56ba121fa0ebc632997ad81adcdec9f18ad98b8d4ef9c9cbb9bfdb366\"],",
         "\"self_index\":2,\"size\":6,\"threshold\":4}"
     );
+
+    #[test]
+    fn a_standby_rounds_reply_says_which_round_and_keeps_its_height() {
+        let plain = CommitteeView::from_bridge_committee_json(DEVNET_REPLY).unwrap();
+        assert_eq!(plain.round_height, 0, "an epoch committee's, even from before the field");
+        let reply = DEVNET_REPLY.replacen('{', r#"{"round_height":130,"#, 1);
+        let c = CommitteeView::from_bridge_committee_json(&reply).expect("parse");
+        assert_eq!(c.round_height, 130);
+        assert_eq!(c.height, plain.height, "not misread as the height");
+    }
 
     #[test]
     fn parses_the_live_devnet_reply() {
@@ -614,6 +629,7 @@ mod execution_id_tests {
             member_ips: Vec::new(),
             member_x25519: Vec::new(),
             daemon_self_index: None,
+            round_height: 0,
         }
     }
 
@@ -663,6 +679,7 @@ mod membership_tests {
             member_x25519: Vec::new(),
             daemon_self_index: None,
             threshold: t,
+            round_height: 0,
         }
     }
 

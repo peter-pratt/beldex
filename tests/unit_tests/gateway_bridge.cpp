@@ -886,7 +886,7 @@ TEST(GatewayBridgeRotation, only_the_current_ack_version_with_a_contract_verifie
   };
   std::string reason;
   EXPECT_TRUE(verify_bridge_rotation_evidence(signed_ack(1, addr20(0x22)), pubs, t_plus_1, NET_R, reason)) << reason;
-  for (uint8_t v : {0, 2, 255})
+  for (uint8_t v : {0, 3, 255})
   {
     EXPECT_FALSE(verify_bridge_rotation_evidence(signed_ack(v, addr20(0x22)), pubs, t_plus_1, NET_R, reason));
     EXPECT_NE(reason.find("unsupported version"), std::string::npos) << reason;
@@ -3910,4 +3910,65 @@ TEST(GatewayStandbyRounds, a_reorg_across_a_rounds_start_draws_another_committee
   const auto att = sign_round_attestation(a, static_cast<uint16_t>(differs_at), 130, new_vk());
   EXPECT_TRUE(run_round_attestation(chain_a, att, 131));
   EXPECT_FALSE(run_round_attestation(chain_b, att, 131)) << "another member holds that place on this chain";
+}
+
+// Once a round's key is live, its holders are who observe the rotation away from it: their ack is
+// judged against that round's committee, while what they sign stays the same fact.
+TEST(GatewayStandbyRounds, a_rotation_ack_is_judged_against_the_rounds_committee)
+{
+  const size_t threshold = bridge_committee_threshold(NET_FC);
+  const committee_keys c = make_committee(bridge_committee_size(NET_FC));
+  master_node_list::state_t cur(nullptr);
+  for (size_t i = 0; i < c.mn.size(); ++i)
+    seat_member(cur, c.mn[i], c.ed_pub[i], 1);
+  auto ack_of = [&](uint8_t version, uint64_t round_height) {
+    tx_extra_bridge_rotation_ack ack{};
+    ack.version = version; ack.chain_id = 31337; ack.key_epoch = 1; ack.epoch = 1;
+    ack.round_height = round_height;
+    ack.new_signer = addr20(0x11); ack.contract = addr20(0x22);
+    const std::string msg = bridge_rotation_ack_message(NET_FC, ack);
+    for (uint16_t i = 0; i < threshold; ++i)
+    {
+      bridge_rotation_signature s{}; s.voter_index = i;
+      crypto_sign_detached(s.signature.data, nullptr, reinterpret_cast<const unsigned char*>(msg.data()), msg.size(),
+                           c.ed_sec[i].data);
+      ack.observers.push_back(s);
+    }
+    return ack;
+  };
+  auto run = [&](const tx_extra_bridge_rotation_ack& ack) {
+    const master_nodes::bridge_committee_resolver none = [](uint64_t, std::vector<crypto::public_key>&,
+                                                            std::vector<crypto::ed25519_public_key>&, size_t&) { return false; };
+    block blk{};
+    blk.major_version = hf::hf23_bridge;
+    blk.miner_tx.vin.push_back(txin_gen{uint64_t{200}});
+    transaction tx{};
+    tx.type = txtype::bridge_registration;
+    EXPECT_TRUE(add_bridge_rotation_ack_to_tx_extra(tx.extra, ack));
+    return cur.process_bridge_rotation_ack_tx(NET_FC, blk, tx, none);
+  };
+
+  // The format carries the round; the signed bytes do not change with who observed it.
+  const auto v2 = ack_of(2, 130);
+  transaction tx{};
+  ASSERT_TRUE(add_bridge_rotation_ack_to_tx_extra(tx.extra, v2));
+  tx_extra_bridge_rotation_ack got{};
+  ASSERT_TRUE(get_field_from_tx_extra(tx.extra, got));
+  EXPECT_EQ(got.round_height, 130u);
+  EXPECT_EQ(bridge_rotation_ack_message(NET_FC, v2), bridge_rotation_ack_message(NET_FC, ack_of(1, 0)));
+
+  std::string reason;
+  EXPECT_TRUE(verify_bridge_rotation_evidence(v2, c.ed_pub, threshold, NET_FC, reason)) << reason;
+  EXPECT_FALSE(verify_bridge_rotation_evidence(ack_of(2, 0), c.ed_pub, threshold, NET_FC, reason));
+  EXPECT_NE(reason.find("disagree"), std::string::npos) << reason;
+  EXPECT_FALSE(verify_bridge_rotation_evidence(ack_of(3, 130), c.ed_pub, threshold, NET_FC, reason));
+
+  // A round merely open holds no key, so it vouches for nothing; an attested key's holders do.
+  cur.bridge_standby_rounds.push_back(master_nodes::bridge_standby_round{130, c.mn});
+  EXPECT_FALSE(run(v2));
+  EXPECT_TRUE(cur.observed_key_epoch.empty());
+  cur.bridge_key_attestations.push_back(attested(new_vk(), 130, c.mn, 135));
+  ASSERT_TRUE(run(v2));
+  ASSERT_EQ(cur.observed_key_epoch.size(), 1u);
+  EXPECT_EQ(cur.observed_key_epoch[0].key_epoch, 1u);
 }

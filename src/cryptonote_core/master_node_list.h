@@ -798,11 +798,13 @@ namespace master_nodes
                                           std::vector<crypto::public_key>& members,
                                           std::vector<crypto::ed25519_public_key>& signer_keys,
                                           std::string& reason) const;
-    /// HF23: the committee of a standby round, open or behind an attested key, for a slash report.
+    /// HF23: the committee of a standby round: an open round's or an attested key's, or with
+    /// `attested_only` just the latter: only a key's holders may vouch for what they observed.
     bool get_bridge_round_committee(uint64_t round_height,
                                     std::vector<crypto::public_key>& members,
                                     std::vector<crypto::ed25519_public_key>& signer_keys,
-                                    size_t& threshold) const;
+                                    size_t& threshold,
+                                    bool attested_only = false) const;
     /// Whether a rotation ack (whose signatures have already been verified) may advance the
     /// current state: see state_t::check_bridge_rotation_ack.
     bool check_bridge_rotation_ack(const cryptonote::tx_extra_bridge_rotation_ack& ack, std::string& reason) const;
@@ -1173,9 +1175,11 @@ namespace master_nodes
                                             std::vector<crypto::public_key>& members,
                                             std::vector<crypto::ed25519_public_key>& signer_keys,
                                             std::string& reason) const;
-      // HF23: a standby round's committee: the open round's, or that kept by a key's record.
+      // HF23: a standby round's committee: the open round's (unless `attested_only`), or that
+      // kept by an attested key's record.
       bool bridge_round_committee(uint64_t round_height, std::vector<crypto::public_key>& members,
-                                  std::vector<crypto::ed25519_public_key>& signer_keys) const;
+                                  std::vector<crypto::ed25519_public_key>& signer_keys,
+                                  bool attested_only = false) const;
       // HF23: drop standby rounds whose window has closed and, at a round's start while a
       // standby is due, draw that round's committee from this state's seats.
       void update_bridge_standby_rounds(cryptonote::network_type nettype, cryptonote::hf hf_version,

@@ -935,6 +935,10 @@ namespace cryptonote
   struct tx_extra_bridge_rotation_ack
   {
     static constexpr uint8_t CURRENT_VERSION = 1;
+    // The same ack from the holders of a standby round's key: `round_height` then says whose
+    // indices `observers` are, alongside `epoch` and likewise unsigned (a wrong one simply
+    // gives the wrong keys). What they sign is the same fact: the signed version byte stays 1.
+    static constexpr uint8_t ROUND_VERSION = 2;
 
     uint8_t              version = CURRENT_VERSION;
     uint64_t             chain_id = 0;      // EVM chain id (E.3 registry key)
@@ -946,6 +950,7 @@ namespace cryptonote
     std::vector<uint8_t> contract;          // the wBDX proxy that emitted it (exactly 20 bytes)
     crypto::hash         evm_txid{};        // the EVM transaction carrying the Rotated log
     uint32_t             log_index = 0;     // that log's index within its block
+    uint64_t             round_height = 0;  // version >= 2: the standby round whose committee observed it
 
     BEGIN_SERIALIZE()
       FIELD(version)
@@ -960,6 +965,8 @@ namespace cryptonote
         FIELD(evm_txid)
         VARINT_FIELD(log_index)
       }
+      if (version >= 2)
+        VARINT_FIELD(round_height)
     END_SERIALIZE()
   };
 

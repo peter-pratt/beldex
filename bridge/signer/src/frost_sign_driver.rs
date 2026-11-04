@@ -420,6 +420,7 @@ mod tests {
             member_x25519: Vec::new(),
             daemon_self_index: None,
             threshold: t as usize,
+            round_height: 0,
         }
     }
 

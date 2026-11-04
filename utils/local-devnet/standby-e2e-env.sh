@@ -39,7 +39,7 @@ start_live() { envb; cd $L && RELAY_CMD="$(relay_cmd)" RELAY_NODES=all RELAY_STA
 start_standby() { envb; cd $L && ROLE=standby SHARE_SUBDIR=shares-standby MESH_PORT_BASE=7000 \
   RELAY_CMD="$(relay_cmd)" RELAY_NODES=all RELAY_STAGGER_MS=3000 \
   GATEWAY_ID=$GATEWAY_ID VIEW_SECRET=$VIEW_SECRET WBDX=$WBDX SUPERVISE=1 RETIRE_AFTER_SECS=60 \
-  OUTAGE_WINDOW_SECS=60 AUTO_DKG_SLOT_SECS=120 \
+  OUTAGE_WINDOW_SECS=60 \
   ACK_WALLET_RPC=http://127.0.0.1:$(wport Mike)/json_rpc ./serve-live.sh 2>&1 | grep -E 'start |serving|!!'; }
 # Which nodes hold which key now.
 holders() { cd $L/testdata && for d in beldex-127.0.0.1-*/devnet; do p=${d#beldex-127.0.0.1-}; p=${p%/devnet}

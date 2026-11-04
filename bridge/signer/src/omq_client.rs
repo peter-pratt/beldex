@@ -53,6 +53,16 @@ impl OmqCommitteeClient {
     /// beside the shares it writes, so the committee that holds a key can still be read
     /// after consensus has selected a different one.
     pub fn fetch_committee_json(&self, height: Option<u64>) -> Result<String, CommitteeError> {
+        self.committee_request(height, false)
+    }
+
+    /// The `bridge.committee` reply for the standby round starting at `round_height`: that
+    /// round's committee, in the same shape, so `dkg` saves it beside the shares the same way.
+    pub fn fetch_standby_round_json(&self, round_height: u64) -> Result<String, CommitteeError> {
+        self.committee_request(Some(round_height), true)
+    }
+
+    fn committee_request(&self, height: Option<u64>, standby_round: bool) -> Result<String, CommitteeError> {
         let tx = |e: String| CommitteeError::Transport(e);
 
         let sock = self
@@ -64,12 +74,15 @@ impl OmqCommitteeClient {
         sock.connect(&self.endpoint)
             .map_err(|e| tx(format!("connect {}: {e}", self.endpoint)))?;
 
-        // request parts: command, correlation tag, [optional height as ASCII]
+        // request parts: command, correlation tag, [optional height as ASCII], ["standby"]
         let height_str;
         let mut parts: Vec<&[u8]> = vec![b"bridge.committee", b"bridgesig-committee"];
         if let Some(h) = height {
             height_str = h.to_string();
             parts.push(height_str.as_bytes());
+            if standby_round {
+                parts.push(b"standby");
+            }
         }
         sock.send_multipart(parts, 0)
             .map_err(|e| tx(format!("send: {e}")))?;
@@ -388,6 +401,16 @@ mod omq_request_shape_tests {
         let mut v = vec![cmd.to_vec(), tag.to_vec()];
         v.extend(data.iter().map(|d| d.to_vec()));
         v
+    }
+
+    /// The daemon reads the round's start from the first data part and takes "standby" in the
+    /// second to mean it: swapped, or with no height, it would answer about an epoch instead.
+    #[test]
+    fn a_standby_round_request_is_the_height_then_standby() {
+        let p = parts(b"bridge.committee", b"bridgesig-committee", &[b"130", b"standby"]);
+        assert_eq!(p.len(), 4);
+        assert_eq!(&p[2], b"130");
+        assert_eq!(&p[3], b"standby");
     }
 
     /// Replies are [ REPLY, tag, status, data… ]. Two separate mistakes hide in that shape:

@@ -650,6 +650,7 @@ void omq_rpc::on_bridge_committee(oxenmq::Message& m)
   nlohmann::json resp{
       {"epoch", epoch},
       {"height", standby_round ? height : epoch_start},
+      {"round_height", standby_round ? height : uint64_t{0}},
       {"members", std::move(members)},
       {"signer_keys", std::move(signer_keys)},
       {"ips", std::move(ips)},
@@ -798,6 +799,7 @@ void omq_rpc::on_bridge_rotation_ack(oxenmq::Message& m)
     ack.key_epoch = req.at("key_epoch").get<uint64_t>();
     ack.epoch     = req.at("epoch").get<uint64_t>();
     ack.log_index = req.at("log_index").get<uint32_t>();
+    ack.round_height = req.value("round_height", uint64_t{0});
 
     auto hex_bytes = [&](const char* field, size_t len, std::vector<uint8_t>& out) {
       const std::string h = req.at(field).get<std::string>();
@@ -842,7 +844,10 @@ void omq_rpc::on_bridge_rotation_ack(oxenmq::Message& m)
   std::vector<crypto::public_key> members;
   std::vector<crypto::ed25519_public_key> signer_keys;
   size_t threshold = 0;
-  if (!core_.get_master_node_list().get_bridge_committee(epoch_height, members, signer_keys, threshold))
+  const auto& mnl = core_.get_master_node_list();
+  if (!(ack.version >= tx_extra_bridge_rotation_ack::ROUND_VERSION
+            ? mnl.get_bridge_round_committee(ack.round_height, members, signer_keys, threshold, /*attested_only=*/true)
+            : mnl.get_bridge_committee(epoch_height, members, signer_keys, threshold)))
   {
     m.send_reply(OMQ_BAD_REQUEST,
                  "bridge.rotation_ack: no bridge committee for epoch " + std::to_string(ack.epoch));
