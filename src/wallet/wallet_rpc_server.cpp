@@ -3259,6 +3259,8 @@ namespace {
     require_open();
     BRIDGE_KEY_ATTESTATION::response res{};
     cryptonote::tx_extra_bridge_key_attestation att{};
+    att.version = req.round_height ? 1 : 0;
+    att.round_height = req.round_height;
     att.epoch = req.epoch;
     att.voter_index = req.voter_index;
     if (!tools::hex_to_type(req.pgw_vk, att.pgw_vk))

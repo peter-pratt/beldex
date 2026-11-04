@@ -554,9 +554,11 @@ void omq_rpc::on_get_blocks(oxenmq::Message& m)
 
 void omq_rpc::on_bridge_committee(oxenmq::Message& m)
 {
-  // Optional single data part: a bare ASCII decimal height to resolve the epoch
+  // Optional first data part: a bare ASCII decimal height to resolve the epoch
   // for (default: current tip). No data => current committee. This is the shape
   // the Rust signer consumes to key its session engine (Phase B.9 / C.4).
+  // Optional second data part "standby": the height is a standby round's start, and the
+  // committee is that round's (height = the round's start), in the same shape.
   const auto nettype = core_.get_nettype();
   const uint64_t top = core_.get_current_blockchain_height();
   uint64_t height = top ? top - 1 : 0;
@@ -573,11 +575,27 @@ void omq_rpc::on_bridge_committee(oxenmq::Message& m)
     }
   }
 
+  const bool standby_round = m.data.size() > 1;
+  if (standby_round && m.data[1] != "standby")
+  {
+    m.send_reply(OMQ_BAD_REQUEST, "bridge.committee: the second part must be \"standby\"");
+    return;
+  }
+
   const uint64_t epoch_blocks = cryptonote::bridge_epoch_blocks(nettype);
   const uint64_t epoch = height / epoch_blocks;
   const uint64_t epoch_start = epoch * epoch_blocks;
 
-  auto q = core_.get_quorum(master_nodes::quorum_type::bridge, epoch_start, true /*include_old*/);
+  std::vector<crypto::public_key> committee;
+  if (standby_round)
+  {
+    std::vector<crypto::ed25519_public_key> round_signer_keys;
+    size_t round_threshold = 0;
+    if (!core_.get_master_node_list().get_bridge_round_committee(height, committee, round_signer_keys, round_threshold))
+      committee.clear();
+  }
+  else if (auto q = core_.get_quorum(master_nodes::quorum_type::bridge, epoch_start, true /*include_old*/))
+    committee = q->validators;
 
   // self_index: this daemon's own position in the committee (or -1 if it is not
   // seated this epoch / not running as a master node). The signer uses this to
@@ -616,25 +634,22 @@ void omq_rpc::on_bridge_committee(oxenmq::Message& m)
   nlohmann::json ips         = nlohmann::json::array();
   nlohmann::json x25519_keys = nlohmann::json::array();
   int self_index = -1;
-  if (q)
+  int idx = 0;
+  for (const auto& pk : committee)
   {
-    int idx = 0;
-    for (const auto& pk : q->validators)
-    {
-      members.push_back(tools::type_to_hex(pk));
-      signer_keys.push_back(signer_hex_for(pk));
-      auto [ip, x25519] = net_for(pk);
-      ips.push_back(std::move(ip));
-      x25519_keys.push_back(std::move(x25519));
-      if (keys.pub && pk == keys.pub)
-        self_index = idx;
-      ++idx;
-    }
+    members.push_back(tools::type_to_hex(pk));
+    signer_keys.push_back(signer_hex_for(pk));
+    auto [ip, x25519] = net_for(pk);
+    ips.push_back(std::move(ip));
+    x25519_keys.push_back(std::move(x25519));
+    if (keys.pub && pk == keys.pub)
+      self_index = idx;
+    ++idx;
   }
 
   nlohmann::json resp{
       {"epoch", epoch},
-      {"height", epoch_start},
+      {"height", standby_round ? height : epoch_start},
       {"members", std::move(members)},
       {"signer_keys", std::move(signer_keys)},
       {"ips", std::move(ips)},
@@ -642,7 +657,7 @@ void omq_rpc::on_bridge_committee(oxenmq::Message& m)
       {"self_index", self_index},
       {"threshold", cryptonote::bridge_committee_threshold(nettype)},
       {"size", cryptonote::bridge_committee_size(nettype)},
-      {"active", (q && !q->validators.empty())},
+      {"active", !committee.empty()},
       // Which network this is, so a signer can refuse its test-network-only settings
       // anywhere but a devnet (bridge/signer network_policy).
       {"nettype", nettype == cryptonote::network_type::MAINNET   ? "mainnet"

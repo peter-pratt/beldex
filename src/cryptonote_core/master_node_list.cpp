@@ -2796,6 +2796,20 @@ namespace master_nodes
     });
   }
 
+  std::optional<bridge_key_attestation_record> master_node_list::first_waiting_standby_key(const bridge_key_attestation_record &owner) const
+  {
+    uint64_t height;
+    {
+      std::lock_guard lock(m_mn_mutex);
+      height = m_state.height + 1;
+    }
+    return first_waiting_bridge_key(get_bridge_key_attestations(), owner, get_bridge_standby_liveness(), height,
+                                    m_blockchain.nettype(),
+                                    [this](const bridge_key_attestation_record &a, const bridge_key_attestation_record &b) {
+                                      return bridge_committee_overlap(a, b);
+                                    });
+  }
+
   bool master_node_list::check_bridge_standby_attestation(const cryptonote::tx_extra_bridge_key_attestation &att,
                                                           std::vector<crypto::public_key> &members,
                                                           std::vector<crypto::ed25519_public_key> &signer_keys,

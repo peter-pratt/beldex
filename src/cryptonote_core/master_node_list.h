@@ -790,6 +790,8 @@ namespace master_nodes
     /// The same for the committees that generated two attested keys, whichever kind they are.
     std::optional<size_t> bridge_committee_overlap(const bridge_key_attestation_record& a,
                                                    const bridge_key_attestation_record& b) const;
+    /// HF23: the key waiting to be named under owner record `owner` (first_waiting_bridge_key).
+    std::optional<bridge_key_attestation_record> first_waiting_standby_key(const bridge_key_attestation_record& owner) const;
     /// HF23: may this standby round's attestation land on the next block? On success, the round's
     /// committee. See state_t::check_bridge_standby_attestation.
     bool check_bridge_standby_attestation(const cryptonote::tx_extra_bridge_key_attestation& att,

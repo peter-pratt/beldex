@@ -3097,7 +3097,14 @@ namespace cryptonote::rpc {
   /// - `standby_key`, `standby_last_seen_height`, `standby_stale` -- the named standby and
   ///   its liveness.
   /// - `attestations` -- every key committees have attested or are attesting:
-  ///   {pgw_vk, pevm_address, epoch, voters, threshold, attested_height, overlap_with_owner}.
+  ///   {pgw_vk, pevm_address, epoch, round_height, committee_height, voters, threshold,
+  ///   attested_height, overlap_with_owner}. `round_height` is 0 for an epoch committee's key.
+  /// - `owner_committee_height` -- the height whose committee generated the owner key.
+  /// - `standby_rounds` -- standby rounds still taking attestations (consensus draws one each
+  ///   round while no standby works): {round, round_height, window_end, members}.
+  /// - `waiting_key` -- the attested key waiting to be named, the one naming will accept if
+  ///   several (absent if none): the first attested, from a committee newer than the owner's and
+  ///   than the last named standby's, within the overlap limit.
   struct BRIDGE_GET_STANDBY : PUBLIC
   {
     static constexpr auto names() { return NAMES("bridge_get_standby"); }

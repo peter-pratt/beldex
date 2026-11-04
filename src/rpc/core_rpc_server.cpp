@@ -4465,6 +4465,7 @@ namespace cryptonote::rpc {
           owner_epoch = r->epoch;
           owner_record = r;
           cmd.response["owner_epoch"] = r->epoch;
+          cmd.response["owner_committee_height"] = r->committee_height(nettype);
         }
       }
       if (d.has_standby)
@@ -4498,6 +4499,8 @@ namespace cryptonote::rpc {
       json j{{"pgw_vk", tools::type_to_hex(r.pgw_vk)},
              {"pevm_address", tools::type_to_hex(r.pevm_address)},
              {"epoch", r.epoch},
+             {"round_height", r.round_height},
+             {"committee_height", r.committee_height(nettype)},
              {"voters", r.voters},
              {"attested_height", r.attested_height}};
       if (owner_record)
@@ -4506,6 +4509,21 @@ namespace cryptonote::rpc {
       list.push_back(std::move(j));
     }
     cmd.response["attestations"] = std::move(list);
+    auto rounds = json::array();
+    for (const auto& r : mnl.get_bridge_standby_rounds())
+    {
+      auto members = json::array();
+      for (const auto& pk : r.members)
+        members.push_back(tools::type_to_hex(pk));
+      rounds.push_back(json{{"round", master_nodes::bridge_standby_round_at(nettype, r.round_height).value_or(0)},
+                            {"round_height", r.round_height},
+                            {"window_end", r.round_height + cryptonote::bridge_standby_round_window_blocks(nettype)},
+                            {"members", std::move(members)}});
+    }
+    cmd.response["standby_rounds"] = std::move(rounds);
+    if (owner_record)
+      if (const auto waiting = mnl.first_waiting_standby_key(*owner_record))
+        cmd.response["waiting_key"] = tools::type_to_hex(waiting->pgw_vk);
     cmd.response["status"] = STATUS_OK;
   }
 
