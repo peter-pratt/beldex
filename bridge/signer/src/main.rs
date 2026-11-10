@@ -1853,6 +1853,12 @@ impl TakeoverReader {
         })
     }
 
+    /// This node's daemon's tip.
+    fn tip_height(&self) -> Option<u64> {
+        use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
+        self.gateway_rpc.call("get_info", serde_json::json!({})).ok()?.get("height")?.as_u64()
+    }
+
     fn gateway_state(&self) -> Result<GatewayTakeoverState, String> {
         use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
         let info = self
@@ -1862,12 +1868,7 @@ impl TakeoverReader {
         let s = |k: &str| info.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_lowercase();
         let n = |k: &str| info.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
         let m = |k: &str| info.get(k).and_then(|v| v.as_str()).and_then(config::parse_hex32);
-        let height = self
-            .gateway_rpc
-            .call("get_info", serde_json::json!({}))
-            .ok()
-            .and_then(|i| i.get("height").and_then(|h| h.as_u64()))
-            .ok_or("get_info: no height")?;
+        let height = self.tip_height().ok_or("get_info: no height")?;
         Ok(GatewayTakeoverState {
             owner: s("owner_key"),
             standby: s("standby_owner_key"),
@@ -1999,6 +2000,7 @@ impl TakeoverReader {
         let all_ready = evm.iter().all(|(_, _, _, st)| st.as_ref().is_ok_and(|st| evm_settled(st)))
             && gw.as_ref().is_ok_and(|g| g.owner == ours_vk || (g.standby == ours_vk && g.ready()));
         let outage = self.outage.get();
+        let steps_before = out.len();
         for (chain_id, client, contract, st) in &evm {
             let Ok(st) = st else { continue };
             if st.standby != self.pevm_address || st.signer == self.pevm_address {
@@ -2039,7 +2041,9 @@ impl TakeoverReader {
                     }
                 }
                 // Prove this standby can still sign, once per slot: one that stops is replaced.
-                if g.started == 0 && g.alive_height != 0 && g.last_seen.is_none_or(|seen| seen < g.alive_height) {
+                // A running takeover is no reason to stop, since its delay can outlast the proof's
+                // limit, but a takeover step that is due goes first: rounds run one at a time.
+                if out.len() == steps_before && g.alive_height != 0 && g.last_seen.is_none_or(|seen| seen < g.alive_height) {
                     if let Some(m) = g.alive_message {
                         out.push((
                             TakeoverStep { chain_id: TakeoverStep::GATEWAY, step: TakeoverStepKind::StandbyAlive, takeover_id: g.alive_height, key_epoch: 0 },
@@ -2050,6 +2054,15 @@ impl TakeoverReader {
             }
         }
         out
+    }
+
+    /// Whether a takeover by this node's key is running on any chain. Its holders are what
+    /// completes it, so they do not step aside while it runs, however stale the key reads.
+    fn own_takeover_running(&self) -> bool {
+        self.gateway_state().is_ok_and(|g| g.standby == hex(&self.pgw_group_vk) && g.started != 0)
+            || self.evm.iter().any(|(_, client, contract)| {
+                Self::evm_state(client, contract).is_ok_and(|st| st.standby == self.pevm_address && st.running())
+            })
     }
 
     /// Whether every chain answers to this node's key: each wBDX signer and the gateway owner.
@@ -2234,24 +2247,30 @@ impl AutoStandbyDkg {
         if round == self.last_round {
             return;
         }
-        self.last_round = round;
-        self.last_reason.clear();
         let reply = beldex_bridge_signer::omq_client::OmqCommitteeClient::new(cfg.oxenmq_endpoint.clone())
             .fetch_standby_round_json(round)
             .map_err(|e| e.to_string())
             .and_then(|json| {
                 beldex_bridge_signer::committee::CommitteeView::from_bridge_committee_json(&json).map_err(|e| e.to_string())
             });
-        match reply {
-            Ok(c) if c.daemon_self_index.is_some() || c.self_index(&cfg.self_mn_pubkey).is_some() => {}
-            Ok(_) => {
-                println!("  standby round {round}: this node is not on its committee");
-                return;
-            }
+        // A lookup that fails has not used the round's attempt: the key needs every member, so
+        // one member giving up on a passing error would cost the whole committee its round.
+        let reply = match reply {
+            Ok(c) => c,
             Err(e) => {
-                eprintln!("  standby round {round}: no committee ({e}); next round");
+                let why = format!("standby round {round}: no committee yet ({e}); retrying");
+                if why != self.last_reason {
+                    eprintln!("  {why}");
+                    self.last_reason = why;
+                }
                 return;
             }
+        };
+        self.last_round = round;
+        self.last_reason.clear();
+        if reply.daemon_self_index.is_none() && reply.self_index(&cfg.self_mn_pubkey).is_none() {
+            println!("  standby round {round}: this node is not on its committee");
+            return;
         }
         let Ok(keygen) = u32::try_from(round) else { return };
         let staging = std::path::PathBuf::from(format!("{}.dkg-{keygen}", share_dir.display()));
@@ -3554,9 +3573,13 @@ where
             // newer standby replaced, serves nothing: archive it and wait in the pool, where the
             // node can help generate the next standby.
             if standby_role && supervised {
-                let why = takeover.standby_view().and_then(|(view, records)| {
-                    beldex_bridge_signer::key_attestation::standby_set_retired(&view, &records, &ls.pgw_group_vk, ls.committee.height, ls.committee.round_height)
-                });
+                let why = if takeover.own_takeover_running() {
+                    None
+                } else {
+                    takeover.standby_view().and_then(|(view, records)| {
+                        beldex_bridge_signer::key_attestation::standby_set_retired(&view, &records, &ls.pgw_group_vk, ls.committee.height, ls.committee.round_height)
+                    })
+                };
                 match (why, standby_retire_since) {
                     (None, _) => standby_retire_since = None,
                     (Some(why), None) => {

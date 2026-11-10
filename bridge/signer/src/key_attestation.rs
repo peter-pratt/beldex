@@ -156,7 +156,9 @@ pub fn standby_round_due(view: &StandbyView) -> Result<u64, String> {
     if view.waiting_key.is_some() {
         return Err("an attested key is waiting to be named".into());
     }
-    let Some(round) = view.rounds.iter().map(|r| r.round_height).max() else {
+    // A round above the tip is the mark of a block still being checked: the daemon applies a
+    // block to its state before deciding whether to keep it, and it may yet refuse this one.
+    let Some(round) = view.rounds.iter().map(|r| r.round_height).filter(|&r| r <= view.height).max() else {
         return Err("no standby round is open".into());
     };
     if view.height > round + ROUND_JOIN_BLOCKS {
@@ -413,6 +415,11 @@ mod tests {
             ..view()
         };
         assert_eq!(standby_round_due(&two), Ok(140));
+
+        // A round from a block the daemon has not kept yet is not joined, whether or not an
+        // older one is still in the state beside it.
+        assert!(no(&StandbyView { height: 129, ..view() }).contains("no standby round"));
+        assert_eq!(standby_round_due(&StandbyView { height: 131, ..two.clone() }), Ok(130));
 
         // A node that comes up late does not make the others wait out their timeout.
         assert_eq!(standby_round_due(&StandbyView { height: 130 + ROUND_JOIN_BLOCKS, ..view() }), Ok(130));

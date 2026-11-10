@@ -148,10 +148,12 @@ SIGN_SIGNERS="${SIGN_SIGNERS:-0,1,2,3,4,5}"
 # operators' bonds stay locked until they do.
 # Caps gate resolve_mint, not the contract — adjust to taste.
 #
-# depth_only_finality: anvil has no finality of its own (its `finalized` tag always names
-# genesis), so burns settle on `confirmations` alone. Signers refuse a dev chain without
-# it. Never set it for a real chain: a reorg deeper than the depth reverses a burn after
-# its BDX was released.
+# depth_only_finality: anvil has no finality of its own. Its `finalized` tag names genesis
+# until the chain is 64 blocks long, and burns settle on `confirmations` alone until then;
+# after that the tag trails the tip by 64 blocks and signers wait for it, so with the 12 s
+# blocks of bridge-contract/devnet/01-deploy.sh a release waits about 13 minutes. Signers
+# refuse a dev chain without it. Never set it for a real chain: a reorg deeper than the
+# depth reverses a burn after its BDX was released.
 EVM_START_BLOCK="${EVM_START_BLOCK:-0}"
 # The caps the signers pre-check sessions against. They must be the contract's own
 # perTxMax / windowMintCap: signers refuse to start otherwise, since a pre-check that
@@ -210,6 +212,8 @@ started=0
 PIDS=()
 for d in beldex-127.0.0.1-*/; do
   sock="$SOCKBASE/${d}devnet/beldexd.sock"; key="$SOCKBASE/${d}devnet/key_ed25519"
+  # Each signer reads its own daemon, as on a real network. The node's directory names its RPC port.
+  rpc_port="${d%/}"; rpc_port="${rpc_port##*-}"
   # SHARE_SUBDIR: which per-node share tree the signer loads from (default `shares`).
   # `shares-pool` is the devnet-only workaround for EPOCH_RESHUFFLE_ORPHANS_SHARES.md —
   # a symlinked pool holding every node's share, so a node whose live committee index no
@@ -266,7 +270,7 @@ for d in beldex-127.0.0.1-*/; do
   BRIDGE_SIGNER_RELAY_CMD="$node_relay" \
   BRIDGE_SIGNER_RELAY_STAGGER_MS="$RELAY_STAGGER_MS" \
   BRIDGE_SIGNER_SERVE_LIVE=1 \
-  BRIDGE_SIGNER_BELDEXD_RPC_URL="http://127.0.0.1:19191" \
+  BRIDGE_SIGNER_BELDEXD_RPC_URL="http://127.0.0.1:$rpc_port" \
   BRIDGE_SIGNER_OXENMQ_ENDPOINT="ipc://$sock" \
   BRIDGE_SIGNER_SELF_MN_PUBKEY="$ANY32" \
   BRIDGE_SIGNER_BRIDGE_EPOCH_BLOCKS=120 BRIDGE_SIGNER_COMMITTEE_THRESHOLD=4 \
