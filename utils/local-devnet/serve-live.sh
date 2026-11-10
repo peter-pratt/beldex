@@ -37,8 +37,11 @@
 # signer names the newest attested key whose committee shares at most 2 members with its own
 # as the standby, on both chains. A standby signer with no share set generates that key when
 # a standby round draws it: while no standby works, consensus draws a committee every 10 blocks
-# here (60 on mainnet), and its DKG has DKG_TIMEOUT_SECS (default 300 here, 900 by default) to
-# finish inside the round's window. AUTO_DKG=0 turns that off.
+# here (60 on mainnet), and its DKG has DKG_TIMEOUT_SECS (default 240 here, 900 by default) to
+# finish inside the round's window. The timeout must stay below a round's length (10 blocks of
+# about 30 s here, 60 on mainnet): a failed attempt that outlasts its round makes its members
+# join the next one late, that round fails for want of them, and the rounds never line up
+# again. A key takes about 2 to 3 minutes here. AUTO_DKG=0 turns that off.
 # Attestations and namings are paid for by ACK_WALLET_RPC. Standby signers prove on L1, every
 # 10 blocks here (120 on mainnet), that their key can still sign; a standby that has not for
 # 120 blocks here (a day on mainnet) is stale. The live signers then name another, and with
@@ -197,8 +200,9 @@ ANY32=$(printf '11%.0s' {1..32})
 if [ "$ROLE" = standby ]; then
   # Only this script's earlier standby signers (each a restart loop and its signer): the
   # live ones keep running.
+  # (A loop already gone is fine: under errexit a failed kill would end this script silently.)
   if [ -s serve-standby.pids ]; then
-    for p in $(cat serve-standby.pids); do pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; done
+    for p in $(cat serve-standby.pids); do pkill -P "$p" 2>/dev/null || true; kill "$p" 2>/dev/null || true; done
   fi
   sleep 1
   rm -f serve-standby-*.log serve-standby.pids
@@ -291,7 +295,7 @@ for d in beldex-127.0.0.1-*/; do
   BRIDGE_SIGNER_SUPERVISED="${SUPERVISE:-0}" BRIDGE_SIGNER_RETIRE_AFTER_SECS="${RETIRE_AFTER_SECS:-60}" \
   BRIDGE_SIGNER_PROMOTE_TO="$( [ "$ROLE" = standby ] && [ "${SUPERVISE:-0}" = 1 ] && echo "$SOCKBASE/${d}devnet/shares" )" \
   BRIDGE_SIGNER_OUTAGE_WINDOW_SECS="${OUTAGE_WINDOW_SECS:-60}" \
-  BRIDGE_SIGNER_AUTO_DKG="${AUTO_DKG:-1}" BRIDGE_SIGNER_DKG_TIMEOUT_SECS="${DKG_TIMEOUT_SECS:-300}" \
+  BRIDGE_SIGNER_AUTO_DKG="${AUTO_DKG:-1}" BRIDGE_SIGNER_DKG_TIMEOUT_SECS="${DKG_TIMEOUT_SECS:-240}" \
   BRIDGE_SIGNER_PROBE_WALLET_RPC="${PROBE_WALLET_RPC:-}" BRIDGE_SIGNER_PROBE_EVERY_SECS="${PROBE_EVERY_SECS:-}" \
   BRIDGE_SIGNER_PROBE_CHAIN_ID="${PROBE_CHAIN_ID:-}" BRIDGE_SIGNER_PROBE_EVM_ADDRESS="${PROBE_EVM_ADDRESS:-}" \
   BRIDGE_SIGNER_ACK_WALLET_RPC="${ACK_WALLET_RPC:-}" \
