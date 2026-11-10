@@ -261,6 +261,53 @@ where
     /// and proceed once the hold is lifted. Messages still flow, so a session already open
     /// keeps its place and simply times out and requeues if the hold outlasts it.
     pub hold: Option<String>,
+    /// When new sessions may open (see [`OpenGate`]). `None` opens them on any step.
+    pub open_gate: Option<OpenGate>,
+}
+
+/// Holds new sessions back until the chain crosses a block boundary every node shares.
+///
+/// A session's attempts run on its node's own step count, and an attempt only hears proposals
+/// and ACKs for itself. Nodes that open a duty at different moments stay that far apart through
+/// every requeue, because each cycle is the same length, and nothing pulls them back together:
+/// six holders settled three, two and one attempts apart, none reached the threshold of four,
+/// and a mint looped for half an hour. Opening only on a boundary starts every node's cycle
+/// together, each time. A boundary must come less often than a whole cycle, or a node that
+/// opened one boundary late would still be running at the next and stay late.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenGate {
+    every_blocks: u64,
+    height: Option<u64>,
+    boundary: Option<u64>,
+}
+
+impl OpenGate {
+    pub fn new(every_blocks: u64) -> Self {
+        OpenGate { every_blocks: every_blocks.max(1), height: None, boundary: None }
+    }
+
+    /// Blocks between boundaries for a committee: a whole cycle of attempts, plus a third so
+    /// that a cycle ending a little late still ends before the next boundary.
+    pub fn blocks_for(committee_size: usize, threshold: usize, stage_timeout_ticks: u32, poll_secs: u64, block_secs: u64) -> u64 {
+        let attempts = committee_size.saturating_sub(threshold) as u64 + 1;
+        let cycle_secs = attempts * u64::from(stage_timeout_ticks) * poll_secs;
+        (cycle_secs * 4 / 3).div_ceil(block_secs.max(1)).max(2)
+    }
+
+    /// The tip as this node's daemon reports it. A height lower than one already seen is ignored.
+    pub fn observe(&mut self, height: u64) {
+        self.height = Some(self.height.map_or(height, |h| h.max(height)));
+    }
+
+    /// True once per boundary crossed. The first height seen only sets the starting point:
+    /// a node that has just started waits for the next boundary like everyone else.
+    fn crossed(&mut self) -> bool {
+        let Some(height) = self.height else { return false };
+        let boundary = height / self.every_blocks;
+        let crossed = self.boundary.is_some_and(|b| boundary > b);
+        self.boundary = Some(boundary);
+        crossed
+    }
 }
 
 /// A session frame sent once (an ACK/NACK, the aggregate, a DistributeAck) that did not
@@ -326,6 +373,7 @@ where
             live: BTreeMap::new(),
             resend: Vec::new(),
             hold: None,
+            open_gate: None,
         }
     }
 
@@ -502,6 +550,9 @@ where
     // ---- 2) open sessions for ready duties ---------------------------------
 
     fn open_ready(&mut self, orch: &mut Orchestrator, report: &mut StepReport) {
+        if self.open_gate.as_mut().is_some_and(|g| !g.crossed()) {
+            return;
+        }
         let ready: Vec<Duty> = orch.ready().into_iter().cloned().collect();
         for duty in ready {
             // Held: mints and releases wait in the orchestrator. A takeover cancel never
@@ -524,7 +575,7 @@ where
                     report.abandoned += 1;
                     continue;
                 }
-                Err(BuildError::Transient(_)) => continue, // stay Pending, retry next tick
+                Err(BuildError::Transient(_)) => continue, // stay Pending, retry when next allowed
             }
             // payload is filled by the leader at propose time; the engine only needs the
             // coordination key (payload_hash = sk) to agree on identity + leader.
@@ -1385,6 +1436,115 @@ mod tests {
             assert_eq!(nodes[i].orch.counts(), (0, 0, 1));
         }
         assert_eq!(nodes[dead].completions.borrow().len(), 0);
+    }
+
+    /// Six holders that saw a duty three, two and one attempts apart, as on the devnet.
+    fn staggered_holders(timeout: u32, bus: &Bus, n: usize, t: usize) -> Vec<Node> {
+        (0..n)
+            .map(|i| {
+                let mut node = make_node(n, t, i, bus);
+                node.coord.stage_timeout_ticks = timeout;
+                node
+            })
+            .collect()
+    }
+
+    /// One step per tick for each node, each seeing the duty at `seen[i]`; `height` gives the tip.
+    fn run_staggered(nodes: &mut [Node], seen: &[usize], live: &[usize], ticks: usize, height: impl Fn(usize) -> u64) {
+        for tick in 0..ticks {
+            for &i in live {
+                let node = &mut nodes[i];
+                if tick == seen[i] {
+                    node.orch.observe(Duty::Mint(mint_ev(1000)));
+                }
+                if let Some(g) = node.coord.open_gate.as_mut() {
+                    g.observe(height(tick));
+                }
+                node.coord.step(&mut node.orch, &mut node.net);
+            }
+        }
+    }
+
+    #[test]
+    fn holders_one_attempt_apart_never_reach_the_threshold_on_their_own() {
+        // What the gate is for. Each group is an attempt ahead of the next, so at most three of
+        // the six ever answer the same proposal, and every cycle ends as the last one did.
+        let (n, t, timeout) = (6, 4, 4);
+        let bus = Bus::new(n);
+        let mut nodes = staggered_holders(timeout, &bus, n, t);
+        let seen = [0, 0, 0, 4, 4, 8];
+        let all: Vec<usize> = (0..n).collect();
+        run_staggered(&mut nodes, &seen, &all, 600, |_| 0);
+        for node in &nodes {
+            assert!(node.completions.borrow().is_empty(), "the split never heals by itself");
+        }
+    }
+
+    #[test]
+    fn a_shared_block_boundary_brings_split_holders_together() {
+        let (n, t, timeout) = (6, 4, 4);
+        let bus = Bus::new(n);
+        let mut nodes = staggered_holders(timeout, &bus, n, t);
+        let every = OpenGate::blocks_for(n, t, timeout, 5, 30);
+        assert_eq!(every, 3, "60s of attempts and a third, in 30s blocks");
+        for node in &mut nodes {
+            node.coord.open_gate = Some(OpenGate::new(every));
+        }
+        let seen = [0, 0, 0, 4, 4, 8];
+        let all: Vec<usize> = (0..n).collect();
+        // 5s ticks, 30s blocks: the third block is the first boundary.
+        run_staggered(&mut nodes, &seen, &all, 30, |tick| tick as u64 / 6);
+        for (i, node) in nodes.iter().enumerate() {
+            assert_eq!(node.completions.borrow().len(), 1, "node {i} completed");
+            assert_eq!(node.orch.counts(), (0, 0, 1));
+        }
+    }
+
+    #[test]
+    fn the_gate_recovers_with_a_dead_holder_and_a_late_one() {
+        // A holder down, whichever it is, and two that saw the duty just after a boundary: the
+        // three on time cannot reach four, and all five meet at the next boundary.
+        let (n, t, timeout) = (6, 4, 4);
+        for dead in 0..n {
+            let bus = Bus::new(n);
+            let mut nodes = staggered_holders(timeout, &bus, n, t);
+            for node in &mut nodes {
+                node.coord.open_gate = Some(OpenGate::new(3));
+            }
+            let mut seen = [0; 6];
+            seen[(dead + 1) % n] = 19;
+            seen[(dead + 2) % n] = 19;
+            let live: Vec<usize> = (0..n).filter(|&i| i != dead).collect();
+            run_staggered(&mut nodes, &seen, &live, 90, |tick| tick as u64 / 6);
+            for &i in &live {
+                assert_eq!(nodes[i].orch.counts().2, 1, "node {i} finished with holder {dead} down");
+            }
+        }
+    }
+
+    #[test]
+    fn the_gate_opens_once_per_boundary_and_never_on_the_first_height() {
+        let mut g = OpenGate::new(3);
+        assert!(!g.crossed(), "no height yet");
+        g.observe(100);
+        assert!(!g.crossed(), "a node that just started waits for the next boundary");
+        g.observe(101);
+        assert!(!g.crossed());
+        g.observe(102);
+        assert!(g.crossed(), "102 is a boundary");
+        assert!(!g.crossed(), "only once");
+        g.observe(101);
+        assert!(!g.crossed(), "a lower reading changes nothing");
+        g.observe(109);
+        assert!(g.crossed(), "boundaries skipped while busy still count");
+    }
+
+    #[test]
+    fn the_boundary_is_longer_than_a_cycle_at_every_committee_size() {
+        // Devnet: 6 of 4, 4 ticks of 5s. Mainnet: 20 of 14, the default 10 ticks of 5s.
+        assert_eq!(OpenGate::blocks_for(6, 4, 4, 5, 30), 3);
+        assert_eq!(OpenGate::blocks_for(20, 14, 10, 5, 30), 16);
+        assert_eq!(OpenGate::blocks_for(1, 1, 1, 1, 30), 2, "never every block");
     }
 
     #[test]

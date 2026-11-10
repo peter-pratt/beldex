@@ -2326,7 +2326,7 @@ where
     B: beldex_bridge_signer::beldex_watcher::BeldexRpc,
     C: beldex_bridge_signer::evm_watcher::JsonRpcClient,
 {
-    use beldex_bridge_signer::coordinator::{BuildError, Coordinator, MintPolicy};
+    use beldex_bridge_signer::coordinator::{BuildError, Coordinator, MintPolicy, OpenGate};
     use beldex_bridge_signer::live_backend::{mint_relay_payload_json, GatewayRpc, HttpGatewayRpc};
     use beldex_bridge_signer::omq_mesh::{MeshAuth, OmqMeshConfig, OmqPeerTransport, PeerAddr};
     use beldex_bridge_signer::evm_watcher::HttpJsonRpc;
@@ -3022,10 +3022,15 @@ where
         coord.stage_timeout_ticks = t;
     }
     coord.hold = solvency_guard.hold().map(str::to_string);
+    // TARGET_BLOCK_TIME in the daemon's cryptonote_config.h.
+    const BLOCK_SECS: u64 = 30;
+    let open_every_blocks = OpenGate::blocks_for(coord.committee.size(), coord.committee.threshold, coord.stage_timeout_ticks, poll_secs, BLOCK_SECS);
+    coord.open_gate = Some(OpenGate::new(open_every_blocks));
 
     println!("serve: LIVE COORDINATED mode — per-duty sessions over the authenticated mesh");
     println!("  committee epoch {} size {} threshold {}; self_index {self_index}", coord.committee.epoch, coord.committee.size(), coord.committee.threshold);
     println!("  coordinator mesh on port base {base}; polling every {poll_secs}s across {} EVM chain(s)", configs.len());
+    println!("  sessions open together, every {open_every_blocks} blocks");
 
     // On-chain reconciliation: a restarted signer must not re-work settled duties. Each
     // newly observed duty is checked once (mints: processedDeposits; releases: the daemon's
@@ -4085,6 +4090,9 @@ where
             coord.hold = solvency_guard.hold().map(str::to_string);
         }
 
+        if let (Some(gate), Some(height)) = (coord.open_gate.as_mut(), takeover.tip_height()) {
+            gate.observe(height);
+        }
         let rep = coord.step(orch, &mut net);
         if rep != Default::default() {
             let (pending, in_flight, done) = orch.counts();
