@@ -3317,9 +3317,11 @@ TEST(GatewayStandbyRounds, a_round_draws_a_committee_only_while_a_standby_is_due
   std::vector<crypto::public_key> owner_committee, others;
   for (uint8_t who = 1; who <= 6; ++who)
     owner_committee.push_back(seat_run_by(cur, who));
-  for (uint8_t who = 11; who <= 18; ++who)
+  // Thirty operators outside the owner's committee: with only a few more than a committee, two
+  // different seeds can rightly draw the same members, and the check below would fail now and then.
+  for (uint8_t who = 11; who <= 40; ++who)
     others.push_back(seat_run_by(cur, who));
-  const crypto::public_key leaving = seat_run_by(cur, 30, /*leaving=*/true);
+  const crypto::public_key leaving = seat_run_by(cur, 50, /*leaving=*/true);
 
   const crypto::eddsa_public_key owner = new_vk();
   track_gateway(cur, owner);
