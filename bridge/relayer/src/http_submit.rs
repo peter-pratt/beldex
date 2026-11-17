@@ -99,6 +99,24 @@ impl HttpSubmitter {
             .ok_or_else(|| SubmitError::Transport(format!("{method}: missing result")))
     }
 
+    /// The contract's `keyEpoch()`: how far the key hand-offs on `chain_id` have got, so a
+    /// rotation payload for an epoch already live is recognised as done, not retried.
+    pub fn key_epoch(&self, chain_id: u64, contract: &[u8; 20]) -> Result<u64, SubmitError> {
+        let ep = self.endpoint(chain_id)?;
+        let v = self.rpc(
+            &ep.rpc_url,
+            "eth_call",
+            json!([{ "to": format!("0x{}", hexs(contract)), "data": "0x6fdf657e" }, "latest"]),
+        )?;
+        // A 32-byte ABI word, wider than `hex_quantity` reads: a uint64 in its low 8 bytes.
+        let word = v.as_str().and_then(|s| s.strip_prefix("0x")).unwrap_or_default();
+        match word.len().checked_sub(16).map(|i| word.split_at(i)) {
+            Some((high, low)) if high.bytes().all(|b| b == b'0') => u64::from_str_radix(low, 16)
+                .map_err(|e| SubmitError::Transport(format!("keyEpoch: {e}"))),
+            _ => Err(SubmitError::Transport(format!("keyEpoch: not a uint64 word: {v}"))),
+        }
+    }
+
     fn hex_quantity(v: &Value, what: &str) -> Result<u128, SubmitError> {
         let s = v
             .as_str()

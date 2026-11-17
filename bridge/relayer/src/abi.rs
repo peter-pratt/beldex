@@ -1,4 +1,4 @@
-//! Minimal, self-contained ABI encoding for the two **already-signed** wBDX calls a
+//! Minimal, self-contained ABI encoding for the three **already-signed** wBDX calls a
 //! relayer carries (Phase I). No external ABI/EVM crate — the encoding is small, fixed,
 //! and must match `bridge-contract/src/WrappedBDX.sol` **byte-for-byte** (a wrong selector
 //! or offset makes the call revert), so it is spelled out and pinned by tests.
@@ -27,6 +27,9 @@ pub const COMPLETE_TAKEOVER_SELECTOR: [u8; 4] = [0x42, 0x9d, 0x05, 0xe2];
 
 /// `setStandby(address,uint64,uint256,bytes)` selector: the live committee names its standby.
 pub const SET_STANDBY_SELECTOR: [u8; 4] = [0xbe, 0x88, 0x7a, 0x32];
+/// `activateRotation(bytes)` selector: the incoming committee's signature completes the
+/// hand-off once the challenge window has passed.
+pub const ACTIVATE_SELECTOR: [u8; 4] = [0x25, 0x09, 0x92, 0x04];
 
 /// The canonical function signatures (used only by the drift-guard tests).
 pub const MINT_SIG: &[u8] = b"mint(address,uint256,bytes32,uint32,bytes)";
@@ -35,6 +38,7 @@ pub const CANCEL_TAKEOVER_SIG: &[u8] = b"cancelStandbyTakeover(bytes)";
 pub const BEGIN_TAKEOVER_SIG: &[u8] = b"beginStandbyTakeover(bytes)";
 pub const COMPLETE_TAKEOVER_SIG: &[u8] = b"completeStandbyTakeover(bytes)";
 pub const SET_STANDBY_SIG: &[u8] = b"setStandby(address,uint64,uint256,bytes)";
+pub const ACTIVATE_SIG: &[u8] = b"activateRotation(bytes)";
 
 /// `keccak256(fn_sig)[..4]` — the 4-byte selector for a function signature.
 pub fn selector_of(fn_sig: &[u8]) -> [u8; 4] {
@@ -149,6 +153,18 @@ pub fn build_set_standby_calldata(standby: [u8; 20], nonce: u64, deadline: u128,
     out
 }
 
+/// Build the calldata for `activateRotation(bytes incomingSig)`.
+///
+/// Head is the single offset word (=0x20); tail is the encoded `incomingSig`. The epoch and
+/// signer it activates are the pending ones already on chain, so nothing else is passed.
+pub fn build_activate_calldata(sig: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 32 * 2 + sig.len() + 32);
+    out.extend_from_slice(&ACTIVATE_SELECTOR);
+    out.extend_from_slice(&word_u256(0x20)); // offset to `incomingSig`: 1 head word
+    push_dynamic_bytes(&mut out, sig);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,9 +177,24 @@ mod tests {
         assert_eq!(BEGIN_TAKEOVER_SELECTOR, selector_of(BEGIN_TAKEOVER_SIG));
         assert_eq!(COMPLETE_TAKEOVER_SELECTOR, selector_of(COMPLETE_TAKEOVER_SIG));
         assert_eq!(SET_STANDBY_SELECTOR, selector_of(SET_STANDBY_SIG));
+        assert_eq!(ACTIVATE_SELECTOR, selector_of(ACTIVATE_SIG));
         // Pin the exact bytes so a drift is caught even if the signature string changed.
         assert_eq!(MINT_SELECTOR, [0x7f, 0x00, 0x00, 0x0a]);
         assert_eq!(ROTATE_SELECTOR, [0x95, 0x0c, 0x57, 0xf3]);
+        assert_eq!(ACTIVATE_SELECTOR, [0x25, 0x09, 0x92, 0x04]);
+    }
+
+    #[test]
+    fn activate_calldata_is_abi_shaped() {
+        let sig = vec![0xEE; 65];
+        let cd = build_activate_calldata(&sig);
+
+        assert_eq!(&cd[0..4], &ACTIVATE_SELECTOR);
+        // selector + 1 head word + (length word + 65 bytes padded to 96)
+        assert_eq!(cd.len(), 4 + 32 + 32 + 96);
+        assert_eq!(cd[4 + 31], 0x20);                          // offset to `incomingSig`
+        assert_eq!(cd[4 + 32 + 31], 65);                       // sig length
+        assert_eq!(&cd[4 + 64..4 + 64 + 65], &sig[..]);
     }
 
     /// Byte-for-byte what `cast calldata "cancelStandbyTakeover(bytes)" 0xabab…` (65 bytes)

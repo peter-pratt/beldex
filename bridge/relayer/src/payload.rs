@@ -6,8 +6,8 @@
 //! it. If every relayer vanishes, any user can build the same [`PreparedCall`] and broadcast.
 
 use crate::abi::{
-    build_mint_calldata, build_rotate_calldata, build_set_standby_calldata, build_takeover_calldata, BEGIN_TAKEOVER_SELECTOR,
-    CANCEL_TAKEOVER_SELECTOR, COMPLETE_TAKEOVER_SELECTOR,
+    build_activate_calldata, build_mint_calldata, build_rotate_calldata, build_set_standby_calldata,
+    build_takeover_calldata, BEGIN_TAKEOVER_SELECTOR, CANCEL_TAKEOVER_SELECTOR, COMPLETE_TAKEOVER_SELECTOR,
 };
 
 /// Which step of a standby takeover a [`RelayPayload::TakeoverStep`] carries.
@@ -87,6 +87,17 @@ pub enum RelayPayload {
         deadline: u128,
         sig: Vec<u8>,
     },
+    /// An incoming-committee-signed `activateRotation`, sendable once the challenge window
+    /// of the pending rotation has passed (before that the gas estimate reverts and nothing
+    /// is spent). Only `sig` goes on chain; the pending signer and epoch it was signed for
+    /// say which rotation it completes.
+    Activate {
+        contract: [u8; 20],
+        chain_id: u64,
+        pending_signer: [u8; 20],
+        pending_key_epoch: u64,
+        sig: Vec<u8>,
+    },
 }
 
 impl RelayPayload {
@@ -95,7 +106,8 @@ impl RelayPayload {
             RelayPayload::Mint { chain_id, .. }
             | RelayPayload::Rotate { chain_id, .. }
             | RelayPayload::TakeoverStep { chain_id, .. }
-            | RelayPayload::SetStandby { chain_id, .. } => *chain_id,
+            | RelayPayload::SetStandby { chain_id, .. }
+            | RelayPayload::Activate { chain_id, .. } => *chain_id,
         }
     }
 
@@ -104,7 +116,8 @@ impl RelayPayload {
             RelayPayload::Mint { contract, .. }
             | RelayPayload::Rotate { contract, .. }
             | RelayPayload::TakeoverStep { contract, .. }
-            | RelayPayload::SetStandby { contract, .. } => *contract,
+            | RelayPayload::SetStandby { contract, .. }
+            | RelayPayload::Activate { contract, .. } => *contract,
         }
     }
 
@@ -121,6 +134,7 @@ impl RelayPayload {
             RelayPayload::SetStandby { standby, nonce, deadline, sig, .. } => {
                 build_set_standby_calldata(*standby, *nonce, *deadline, sig)
             }
+            RelayPayload::Activate { sig, .. } => build_activate_calldata(sig),
         }
     }
 
@@ -181,6 +195,8 @@ mod json {
         ///   "contract": "<40hex>", "chain_id": 1, "sig": "<130hex>" }
         /// { "kind": "set_standby", "contract": "<40hex>", "chain_id": 1,
         ///   "standby": "<40hex>", "nonce": 3, "deadline": "<decimal>", "sig": "<130hex>" }
+        /// { "kind": "activate", "contract": "<40hex>", "chain_id": 1,
+        ///   "pending_signer": "<40hex>", "pending_key_epoch": 7, "sig": "<130hex>" }
         /// ```
         ///
         /// `amount` is a decimal **string** (a wBDX unit is 1 atomic BDX; u128 to be safe).
@@ -195,7 +211,7 @@ mod json {
                 "takeover_cancel" => Some(TakeoverStepKind::Cancel),
                 _ => None,
             };
-            if kind != "mint" && kind != "rotate" && kind != "set_standby" && step.is_none() {
+            if kind != "mint" && kind != "rotate" && kind != "set_standby" && kind != "activate" && step.is_none() {
                 return Err(PayloadError::UnknownKind(kind.to_string()));
             }
             let chain_id = v.get("chain_id").and_then(Value::as_u64).ok_or(PayloadError::MissingField("chain_id"))?;
@@ -248,6 +264,14 @@ mod json {
                         .map_err(|_| PayloadError::MissingField("deadline"))?;
                     Ok(RelayPayload::SetStandby { contract, chain_id, standby, nonce, deadline, sig })
                 }
+                "activate" => {
+                    let pending_signer = hex_fixed::<20>(get_str(&v, "pending_signer")?, "pending_signer")?;
+                    let pending_key_epoch = v
+                        .get("pending_key_epoch")
+                        .and_then(Value::as_u64)
+                        .ok_or(PayloadError::MissingField("pending_key_epoch"))?;
+                    Ok(RelayPayload::Activate { contract, chain_id, pending_signer, pending_key_epoch, sig })
+                }
                 _ if step.is_some() => Ok(RelayPayload::TakeoverStep {
                     step: step.expect("checked"), contract, chain_id, sig,
                 }),
@@ -290,6 +314,13 @@ mod json {
                         r#""nonce":{},"deadline":"{}","sig":"{}"}}"#
                     ),
                     hexs(contract), chain_id, hexs(standby), nonce, deadline, hexs(sig),
+                ),
+                RelayPayload::Activate { contract, chain_id, pending_signer, pending_key_epoch, sig } => format!(
+                    concat!(
+                        r#"{{"kind":"activate","contract":"{}","chain_id":{},"#,
+                        r#""pending_signer":"{}","pending_key_epoch":{},"sig":"{}"}}"#
+                    ),
+                    hexs(contract), chain_id, hexs(pending_signer), pending_key_epoch, hexs(sig),
                 ),
             }
         }
@@ -387,6 +418,16 @@ mod tests {
             sig: vec![0xee; 65],
         };
         assert_eq!(RelayPayload::from_json(&r.to_json()).unwrap(), r);
+
+        let a = RelayPayload::Activate {
+            contract: [0x22; 20],
+            chain_id: 42,
+            pending_signer: [0x33; 20],
+            pending_key_epoch: 7,
+            sig: vec![0xee; 65],
+        };
+        assert_eq!(RelayPayload::from_json(&a.to_json()).unwrap(), a);
+        assert_eq!(&a.calldata()[0..4], &crate::abi::ACTIVATE_SELECTOR);
     }
 
     #[cfg(feature = "json")]

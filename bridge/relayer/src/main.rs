@@ -188,6 +188,24 @@ fn run_relay(src: &str) -> Result<String, String> {
         .unwrap_or_else(|| "relayer-state".to_string());
 
     let submitter = HttpSubmitter::new(&key, chains).map_err(|e| format!("gas key: {e}"))?;
+    // A hand-off whose key epoch is already live was completed — by this relayer, another, or
+    // by hand — and can only revert now. Done, not failed, so a caller holding it stops.
+    let target_epoch = match &payload {
+        RelayPayload::Rotate { new_key_epoch, .. } => Some(*new_key_epoch),
+        RelayPayload::Activate { pending_key_epoch, .. } => Some(*pending_key_epoch),
+        RelayPayload::Mint { .. } | RelayPayload::TakeoverStep { .. } | RelayPayload::SetStandby { .. } => None,
+    };
+    if let Some(target) = target_epoch {
+        let live = submitter
+            .key_epoch(payload.chain_id(), &payload.contract())
+            .map_err(|e| format!("read keyEpoch: {e:?}"))?;
+        if live >= target {
+            return Ok(format!(
+                "already done: chain_id {} is at key epoch {live}, this hand-off was for {target}\n",
+                payload.chain_id()
+            ));
+        }
+    }
     let call = payload.to_prepared();
     let mut log = Vec::new();
     let result = submitter.relay(&call, &state_dir, &mut log);
