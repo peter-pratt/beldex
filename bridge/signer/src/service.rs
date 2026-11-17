@@ -39,6 +39,8 @@ impl<B: DutyBackend> DutyExecutor for B {
             Duty::Mint(e) => self.handle_mint(e),
             Duty::Release(e) => self.handle_release(e),
             Duty::Takeover(c) => self.handle_takeover(c),
+            // The oneshot backends sign no hand-offs: that is `serve --live`'s coordinator.
+            Duty::Rotate(_) | Duty::Handover(_) => ExecOutcome::Abandon,
         }
     }
 }

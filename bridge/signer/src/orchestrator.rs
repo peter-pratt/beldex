@@ -39,6 +39,8 @@ pub enum DutyKind {
     Takeover,
     Mint,
     Release,
+    Rotate,
+    Handover,
 }
 
 /// The unique identity of a duty: `(kind, 32-byte on-chain id, index within that id)`.
@@ -61,6 +63,55 @@ pub enum Duty {
     Release(ReleaseEvent),
     /// A standby takeover step: `Pevm` on an EVM chain, `Pgw` on the gateway.
     Takeover(TakeoverStep),
+    /// The hand-off of the wBDX signer on one chain to the incoming committee's key, signed
+    /// by the outgoing one (`Pevm`): `rotateSigner`. Raised only for a key whose certificate
+    /// and activation every member checked itself.
+    Rotate(RotationRequest),
+    /// The hand-over of the bridge gateway to the incoming committee's `Pgw`, signed by the
+    /// outgoing one (`Pgw`): the owner signature on a descriptor update. Raised with the
+    /// rotation, from the same checked certificate.
+    Handover(HandoverRequest),
+}
+
+/// The gateway hand-over to `new_owner`, the `Pgw` of the epoch-`key_epoch` committee's key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoverRequest {
+    pub gateway_id: [u8; 32],
+    pub new_owner: [u8; 32],
+    pub key_epoch: u64,
+}
+
+impl HandoverRequest {
+    pub fn id(&self) -> [u8; 32] {
+        let mut buf = b"beldex-bridge-handover-duty-v1".to_vec();
+        buf.extend_from_slice(&self.gateway_id);
+        buf.extend_from_slice(&self.new_owner);
+        buf.extend_from_slice(&self.key_epoch.to_le_bytes());
+        crate::coordinator::sha256(&buf)
+    }
+}
+
+/// A rotation to hand the wBDX signer on `chain_id` to `new_signer` as key epoch
+/// `new_key_epoch` — the incoming committee's key, whose certificate shows its whole
+/// committee made it, and whose activation for that epoch recovers to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotationRequest {
+    pub chain_id: u64,
+    pub contract: [u8; 20],
+    pub new_signer: [u8; 20],
+    pub new_key_epoch: u64,
+}
+
+impl RotationRequest {
+    /// Names the duty: one hand-off per (chain, contract, key epoch, new key).
+    pub fn id(&self) -> [u8; 32] {
+        let mut buf = b"beldex-bridge-rotate-duty-v1".to_vec();
+        buf.extend_from_slice(&self.chain_id.to_le_bytes());
+        buf.extend_from_slice(&self.contract);
+        buf.extend_from_slice(&self.new_signer);
+        buf.extend_from_slice(&self.new_key_epoch.to_le_bytes());
+        crate::coordinator::sha256(&buf)
+    }
 }
 
 impl Duty {
@@ -74,14 +125,16 @@ impl Duty {
                 DutyKey { kind: DutyKind::Release, id: e.evm_txid, sub: e.log_index }
             }
             Duty::Takeover(c) => DutyKey { kind: DutyKind::Takeover, id: c.id(), sub: 0 },
+            Duty::Rotate(r) => DutyKey { kind: DutyKind::Rotate, id: r.id(), sub: r.new_key_epoch as u32 },
+            Duty::Handover(h) => DutyKey { kind: DutyKind::Handover, id: h.id(), sub: h.key_epoch as u32 },
         }
     }
 
     /// Which committee key signs this duty.
     pub fn leg(&self) -> Leg {
         match self {
-            Duty::Mint(_) => Leg::Pevm,
-            Duty::Release(_) => Leg::Pgw,
+            Duty::Mint(_) | Duty::Rotate(_) => Leg::Pevm,
+            Duty::Release(_) | Duty::Handover(_) => Leg::Pgw,
             Duty::Takeover(c) if c.on_gateway() => Leg::Pgw,
             Duty::Takeover(_) => Leg::Pevm,
         }
@@ -203,6 +256,19 @@ impl Orchestrator {
                         beldex_recipient: Vec::new(),
                     }),
                     DutyKind::Takeover => Duty::Takeover(TakeoverStep::from_id(&key.id)),
+                    // Never seeded in practice (a settled rotation is not re-observed), but
+                    // the key alone is enough for a tombstone.
+                    DutyKind::Rotate => Duty::Rotate(RotationRequest {
+                        chain_id: 0,
+                        contract: [0u8; 20],
+                        new_signer: [0u8; 20],
+                        new_key_epoch: key.sub as u64,
+                    }),
+                    DutyKind::Handover => Duty::Handover(HandoverRequest {
+                        gateway_id: [0u8; 32],
+                        new_owner: [0u8; 32],
+                        key_epoch: key.sub as u64,
+                    }),
                 },
                 status: DutyStatus::Done,
             });

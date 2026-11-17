@@ -399,20 +399,26 @@ where
 // DualPolicy — the production composition (mints + releases in one Coordinator)
 // ============================================================================
 
-/// Dispatches by duty kind: mints to `M`, releases to `R`, takeover cancels to `C`. This is
-/// what `serve --live` runs.
-pub struct DualPolicy<M: ProposalPolicy, R: ProposalPolicy, C: ProposalPolicy> {
+/// Dispatches by duty kind: mints to `M`, releases to `R`, takeover cancels to `C`, the wBDX
+/// key hand-off to `T` and the gateway's to `H`. This is what `serve --live` runs.
+pub struct DualPolicy<M: ProposalPolicy, R: ProposalPolicy, C: ProposalPolicy, T: ProposalPolicy, H: ProposalPolicy> {
     pub mint: M,
     pub release: R,
     pub cancel: C,
+    pub rotate: T,
+    pub handover: H,
 }
 
-impl<M: ProposalPolicy, R: ProposalPolicy, C: ProposalPolicy> ProposalPolicy for DualPolicy<M, R, C> {
+impl<M: ProposalPolicy, R: ProposalPolicy, C: ProposalPolicy, T: ProposalPolicy, H: ProposalPolicy> ProposalPolicy
+    for DualPolicy<M, R, C, T, H>
+{
     fn actionable(&self, duty: &Duty) -> Result<(), BuildError> {
         match duty {
             Duty::Mint(_) => self.mint.actionable(duty),
             Duty::Release(_) => self.release.actionable(duty),
             Duty::Takeover(_) => self.cancel.actionable(duty),
+            Duty::Rotate(_) => self.rotate.actionable(duty),
+            Duty::Handover(_) => self.handover.actionable(duty),
         }
     }
     fn build(&mut self, duty: &Duty) -> Result<Vec<u8>, BuildError> {
@@ -420,6 +426,8 @@ impl<M: ProposalPolicy, R: ProposalPolicy, C: ProposalPolicy> ProposalPolicy for
             Duty::Mint(_) => self.mint.build(duty),
             Duty::Release(_) => self.release.build(duty),
             Duty::Takeover(_) => self.cancel.build(duty),
+            Duty::Rotate(_) => self.rotate.build(duty),
+            Duty::Handover(_) => self.handover.build(duty),
         }
     }
     fn verify(&mut self, duty: &Duty, proposal: &[u8]) -> ProposalVerdict {
@@ -427,6 +435,8 @@ impl<M: ProposalPolicy, R: ProposalPolicy, C: ProposalPolicy> ProposalPolicy for
             Duty::Mint(_) => self.mint.verify(duty, proposal),
             Duty::Release(_) => self.release.verify(duty, proposal),
             Duty::Takeover(_) => self.cancel.verify(duty, proposal),
+            Duty::Rotate(_) => self.rotate.verify(duty, proposal),
+            Duty::Handover(_) => self.handover.verify(duty, proposal),
         }
     }
     fn signing_message(&self, duty: &Duty, proposal: &[u8]) -> Vec<u8> {
@@ -434,7 +444,233 @@ impl<M: ProposalPolicy, R: ProposalPolicy, C: ProposalPolicy> ProposalPolicy for
             Duty::Mint(_) => self.mint.signing_message(duty, proposal),
             Duty::Release(_) => self.release.signing_message(duty, proposal),
             Duty::Takeover(_) => self.cancel.signing_message(duty, proposal),
+            Duty::Rotate(_) => self.rotate.signing_message(duty, proposal),
+            Duty::Handover(_) => self.handover.signing_message(duty, proposal),
         }
+    }
+}
+
+// ============================================================================
+// HandoverPolicy — the outgoing committee's Pgw signature on the gateway hand-over
+// ============================================================================
+
+/// What a member's own daemon says an unsigned descriptor update does
+/// (`gateway_decode_descriptor_update`): the daemon refuses anything but one update of one
+/// gateway, with no gateway input riding along.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescriptorUpdateView {
+    pub gateway_id: [u8; 32],
+    pub owner_key_type: String,
+    pub owner_key: Vec<u8>,
+    pub bridge_reserve: bool,
+    /// Whether the update names a standby. A hand-over never does: the standby is named by the
+    /// committee that will own the gateway, through consensus' own naming rule.
+    pub has_standby: bool,
+    pub hash_to_sign: [u8; 32],
+}
+
+/// The gateway hand-over to a [`crate::orchestrator::HandoverRequest`]'s new owner, raised
+/// only for a `Pgw` whose certificate every member checked. The transaction is built by the
+/// wallet that pays its fee — the hand-over submitter's, so the leader `fetch`es it from the
+/// submitter for the request's new owner. The submitter is not trusted: the proposal is
+/// `hash_to_sign ‖ tx_blob`, and each member `decode`s the blob on its own daemon and signs
+/// only an update of this gateway to exactly that owner, keeping the reserve flag, whose
+/// recomputed hash is the one proposed.
+pub struct HandoverPolicy<Fetch, Decode>
+where
+    Fetch: FnMut(&[u8; 32]) -> Result<Vec<u8>, String>,
+    Decode: FnMut(&[u8]) -> Result<DescriptorUpdateView, String>,
+{
+    pub fetch: Fetch,
+    pub decode: Decode,
+    /// The bridge reserve gateway this committee owns.
+    pub gateway_id: [u8; 32],
+}
+
+impl<Fetch, Decode> HandoverPolicy<Fetch, Decode>
+where
+    Fetch: FnMut(&[u8; 32]) -> Result<Vec<u8>, String>,
+    Decode: FnMut(&[u8]) -> Result<DescriptorUpdateView, String>,
+{
+    fn request<'d>(&self, duty: &'d Duty) -> Result<&'d crate::orchestrator::HandoverRequest, BuildError> {
+        match duty {
+            Duty::Handover(h) if h.gateway_id == self.gateway_id => Ok(h),
+            Duty::Handover(_) => Err(BuildError::Unactionable("not this committee's gateway".into())),
+            _ => Err(BuildError::Unactionable("not a gateway hand-over".into())),
+        }
+    }
+
+    fn hands_over(&self, view: &DescriptorUpdateView, h: &crate::orchestrator::HandoverRequest) -> bool {
+        view.gateway_id == self.gateway_id
+            && view.owner_key_type == "eddsa"
+            && view.owner_key[..] == h.new_owner[..]
+            && view.bridge_reserve
+            && !view.has_standby
+    }
+}
+
+impl<Fetch, Decode> ProposalPolicy for HandoverPolicy<Fetch, Decode>
+where
+    Fetch: FnMut(&[u8; 32]) -> Result<Vec<u8>, String>,
+    Decode: FnMut(&[u8]) -> Result<DescriptorUpdateView, String>,
+{
+    fn actionable(&self, duty: &Duty) -> Result<(), BuildError> {
+        self.request(duty).map(|_| ())
+    }
+
+    fn build(&mut self, duty: &Duty) -> Result<Vec<u8>, BuildError> {
+        let h = self.request(duty)?.clone();
+        let blob = (self.fetch)(&h.new_owner).map_err(|e| BuildError::Transient(format!("hand-over builder: {e}")))?;
+        let view = (self.decode)(&blob).map_err(|e| BuildError::Transient(format!("decode the built hand-over: {e}")))?;
+        if !self.hands_over(&view, &h) {
+            return Err(BuildError::Transient("the builder returned something other than this hand-over".into()));
+        }
+        Ok([&view.hash_to_sign[..], &blob[..]].concat())
+    }
+
+    fn verify(&mut self, duty: &Duty, proposal: &[u8]) -> ProposalVerdict {
+        let Ok(h) = self.request(duty).cloned() else { return ProposalVerdict::Reject(NackReason::PayloadMismatch) };
+        if proposal.len() <= 32 {
+            return ProposalVerdict::Reject(NackReason::PayloadMismatch);
+        }
+        let Ok(view) = (self.decode)(&proposal[32..]) else { return ProposalVerdict::Abstain };
+        if self.hands_over(&view, &h) && view.hash_to_sign[..] == proposal[..32] {
+            ProposalVerdict::Accept
+        } else {
+            ProposalVerdict::Reject(NackReason::PayloadMismatch)
+        }
+    }
+
+    fn signing_message(&self, _duty: &Duty, proposal: &[u8]) -> Vec<u8> {
+        proposal[..32].to_vec()
+    }
+}
+
+// ============================================================================
+// RotatePolicy — the outgoing committee's rotateSigner
+// ============================================================================
+
+/// What the wBDX contract on one chain says about key hand-offs, read by each member from its
+/// own RPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RotationState {
+    pub key_epoch: u64,
+    pub rotation_nonce: u64,
+    /// 0 when no rotation is pending.
+    pub pending_activate_at: u64,
+    /// The chain's latest block time: the clock the authorization's deadline is checked on.
+    pub now: u64,
+}
+
+/// `keccak256("BELDEX_BRIDGE_ROTATE_V1")`, `WrappedBDX.ROTATE_TAG`.
+pub const ROTATE_TAG: [u8; 32] = [
+    0x1f, 0x16, 0x84, 0x94, 0xb9, 0xc1, 0x65, 0xfd, 0xb7, 0x61, 0x7d, 0x54, 0xf9, 0x47, 0x4d, 0x57,
+    0xca, 0x55, 0xd8, 0xbb, 0x4d, 0x3f, 0x59, 0x60, 0xfa, 0x2e, 0x09, 0xa8, 0x1a, 0xba, 0x1f, 0xbd,
+];
+
+/// `abi.encode(ROTATE_TAG, chainid, contract, newKeyEpoch, newSigner, nonce, deadline)`, the
+/// preimage `rotateSigner` recovers the outgoing key from.
+pub fn rotate_preimage(chain_id: u64, contract: [u8; 20], new_key_epoch: u64, new_signer: [u8; 20], nonce: u64, deadline: u64) -> Vec<u8> {
+    let word = |tail: &[u8]| {
+        let mut w = [0u8; 32];
+        w[32 - tail.len()..].copy_from_slice(tail);
+        w
+    };
+    [
+        ROTATE_TAG,
+        word(&chain_id.to_be_bytes()),
+        word(&contract),
+        word(&new_key_epoch.to_be_bytes()),
+        word(&new_signer),
+        word(&nonce.to_be_bytes()),
+        word(&deadline.to_be_bytes()),
+    ]
+    .concat()
+}
+
+/// `keccak256("BELDEX_BRIDGE_ACTIVATE_V1")`, `WrappedBDX.ACTIVATE_TAG`.
+pub const ACTIVATE_TAG: [u8; 32] = [
+    0xdd, 0xe1, 0xd7, 0x51, 0x43, 0xfa, 0xf5, 0x92, 0x91, 0xdd, 0x47, 0x2b, 0xa9, 0x22, 0x6a, 0x06,
+    0x04, 0xd9, 0xeb, 0x61, 0x3b, 0x71, 0x94, 0x5f, 0x05, 0x9f, 0xbc, 0x93, 0x65, 0xd5, 0x68, 0x04,
+];
+
+/// `abi.encode(ACTIVATE_TAG, chainid, contract, pendingKeyEpoch, pendingSigner)`, the preimage
+/// `activateRotation` recovers the incoming key from.
+pub fn activate_preimage(chain_id: u64, contract: [u8; 20], pending_key_epoch: u64, pending_signer: [u8; 20]) -> Vec<u8> {
+    let word = |tail: &[u8]| {
+        let mut w = [0u8; 32];
+        w[32 - tail.len()..].copy_from_slice(tail);
+        w
+    };
+    [ACTIVATE_TAG, word(&chain_id.to_be_bytes()), word(&contract), word(&pending_key_epoch.to_be_bytes()), word(&pending_signer)]
+        .concat()
+}
+
+/// The outgoing committee's `rotateSigner` to a [`crate::orchestrator::RotationRequest`]: a
+/// request is raised only for a key whose certificate and activation each member checked, so
+/// what is left to agree is the contract's side. The leader proposes the exact preimage from
+/// its own reading; each member re-reads the contract and accepts only the next key epoch, the
+/// next nonce, this request's signer, and a deadline `valid_secs` after the chain's clock —
+/// within half to twice that, since members read the clock moments apart.
+pub struct RotatePolicy<Read: FnMut(u64) -> Result<RotationState, String>> {
+    pub read: Read,
+    /// `chain_id` → wBDX contract, as for mints.
+    pub contracts: BTreeMap<u64, [u8; 20]>,
+    pub valid_secs: u64,
+}
+
+impl<Read: FnMut(u64) -> Result<RotationState, String>> RotatePolicy<Read> {
+    fn request<'d>(&self, duty: &'d Duty) -> Result<&'d crate::orchestrator::RotationRequest, BuildError> {
+        match duty {
+            Duty::Rotate(r) if self.contracts.get(&r.chain_id) == Some(&r.contract) => Ok(r),
+            Duty::Rotate(r) => Err(BuildError::Unactionable(format!("no such wBDX on chain {}", r.chain_id))),
+            _ => Err(BuildError::Unactionable("not a rotation".into())),
+        }
+    }
+}
+
+impl<Read: FnMut(u64) -> Result<RotationState, String>> ProposalPolicy for RotatePolicy<Read> {
+    fn actionable(&self, duty: &Duty) -> Result<(), BuildError> {
+        self.request(duty).map(|_| ())
+    }
+
+    fn build(&mut self, duty: &Duty) -> Result<Vec<u8>, BuildError> {
+        let r = self.request(duty)?.clone();
+        let st = (self.read)(r.chain_id).map_err(BuildError::Transient)?;
+        if st.key_epoch + 1 != r.new_key_epoch {
+            return Err(BuildError::Unactionable(format!(
+                "for key epoch {}, and the contract is at {}",
+                r.new_key_epoch, st.key_epoch
+            )));
+        }
+        if st.pending_activate_at != 0 {
+            return Err(BuildError::Unactionable("a rotation is already pending".into()));
+        }
+        Ok(rotate_preimage(r.chain_id, r.contract, r.new_key_epoch, r.new_signer, st.rotation_nonce + 1, st.now + self.valid_secs))
+    }
+
+    fn verify(&mut self, duty: &Duty, proposal: &[u8]) -> ProposalVerdict {
+        let Ok(r) = self.request(duty).cloned() else { return ProposalVerdict::Reject(NackReason::PayloadMismatch) };
+        let Ok(st) = (self.read)(r.chain_id) else { return ProposalVerdict::Abstain };
+        if proposal.len() != 7 * 32 || st.pending_activate_at != 0 {
+            return ProposalVerdict::Reject(NackReason::PayloadMismatch);
+        }
+        let deadline_word = &proposal[6 * 32..];
+        if deadline_word[..24].iter().any(|b| *b != 0) {
+            return ProposalVerdict::Reject(NackReason::PayloadMismatch);
+        }
+        let deadline = u64::from_be_bytes(deadline_word[24..].try_into().expect("8 bytes"));
+        let fresh = deadline >= st.now + self.valid_secs / 2 && deadline <= st.now + 2 * self.valid_secs;
+        let expected = rotate_preimage(r.chain_id, r.contract, r.new_key_epoch, r.new_signer, st.rotation_nonce + 1, deadline);
+        if fresh && st.key_epoch + 1 == r.new_key_epoch && expected == proposal {
+            ProposalVerdict::Accept
+        } else {
+            ProposalVerdict::Reject(NackReason::PayloadMismatch)
+        }
+    }
+
+    fn signing_message(&self, _duty: &Duty, proposal: &[u8]) -> Vec<u8> {
+        proposal.to_vec()
     }
 }
 
@@ -754,6 +990,12 @@ mod tests {
             cancel: crate::takeover_guard::TakeoverPolicy {
                 read: |_: &crate::watch::TakeoverStep| Ok(crate::takeover_guard::TakeoverView::Ended),
             },
+            rotate: RotatePolicy { read: |_| Err("no chain".to_string()), contracts: BTreeMap::new(), valid_secs: 3600 },
+            handover: HandoverPolicy {
+                fetch: |_: &[u8; 32]| Err("no builder".to_string()),
+                decode: |_: &[u8]| Err("no daemon".to_string()),
+                gateway_id: [0; 32],
+            },
         };
         let release = Duty::Release(burn(1000));
         assert!(dual.actionable(&release).is_ok(), "release routed to the release policy");
@@ -888,5 +1130,143 @@ mod recipient_shape_tests {
         }
         assert!(!has_valid_address_checksum(b"bxRecipient"));
         assert!(!has_valid_address_checksum(b""));
+    }
+}
+
+#[cfg(test)]
+mod rotate_policy_tests {
+    use super::*;
+    use crate::orchestrator::RotationRequest;
+
+    const C: [u8; 20] = [0xC0; 20];
+    const NEW: [u8; 20] = [0x5E; 20];
+
+    fn duty() -> Duty {
+        Duty::Rotate(RotationRequest { chain_id: 56, contract: C, new_signer: NEW, new_key_epoch: 4 })
+    }
+
+    fn policy(st: RotationState) -> RotatePolicy<impl FnMut(u64) -> Result<RotationState, String>> {
+        RotatePolicy { read: move |_| Ok(st), contracts: [(56, C)].into(), valid_secs: 3600 }
+    }
+
+    const LIVE: RotationState = RotationState { key_epoch: 3, rotation_nonce: 7, pending_activate_at: 0, now: 1_000_000 };
+
+    #[test]
+    fn a_member_signs_the_leaders_hand_off_only_as_it_reads_the_contract() {
+        let mut leader = policy(LIVE);
+        let p = leader.build(&duty()).unwrap();
+        assert_eq!(p, rotate_preimage(56, C, 4, NEW, 8, 1_000_000 + 3600));
+        // Read a few seconds later: the same proposal is still the right one.
+        let mut member = policy(RotationState { now: 1_000_010, ..LIVE });
+        assert_eq!(member.verify(&duty(), &p), ProposalVerdict::Accept);
+        assert_eq!(member.signing_message(&duty(), &p), p);
+
+        // Anything else is refused: another signer, a nonce that is not the next, a stale or
+        // far-off deadline, another key epoch.
+        let reject = ProposalVerdict::Reject(NackReason::PayloadMismatch);
+        for bad in [
+            rotate_preimage(56, C, 4, [0xBA; 20], 8, 1_003_600),
+            rotate_preimage(56, C, 4, NEW, 9, 1_003_600),
+            rotate_preimage(56, C, 4, NEW, 8, 1_000_100),
+            rotate_preimage(56, C, 4, NEW, 8, 1_000_000 + 3 * 3600),
+            rotate_preimage(56, C, 5, NEW, 8, 1_003_600),
+        ] {
+            assert_eq!(member.verify(&duty(), &bad), reject);
+        }
+    }
+
+    #[test]
+    fn both_preimages_are_the_contracts_abi_encoding() {
+        // `cast abi-encode` of the same values: what WrappedBDX keccaks and recovers from.
+        let hex = |b: Vec<u8>| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        assert_eq!(hex(rotate_preimage(56, C, 4, NEW, 8, 1_003_600)), "1f168494b9c165fdb7617d54f9474d57ca55d8bb4d3f5960fa2e09a81aba1fbd0000000000000000000000000000000000000000000000000000000000000038000000000000000000000000c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c000000000000000000000000000000000000000000000000000000000000000040000000000000000000000005e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e000000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000f5050");
+        assert_eq!(hex(activate_preimage(56, C, 4, NEW)), "dde1d75143faf59291dd472ba9226a0604d9eb613b71945f059fbc9365d568040000000000000000000000000000000000000000000000000000000000000038000000000000000000000000c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c000000000000000000000000000000000000000000000000000000000000000040000000000000000000000005e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e");
+    }
+
+    #[test]
+    fn no_hand_off_while_the_contract_is_not_ready_for_it() {
+        // Already at that epoch, or another rotation pending: nothing to build or sign.
+        let done = RotationState { key_epoch: 4, ..LIVE };
+        assert!(matches!(policy(done).build(&duty()), Err(BuildError::Unactionable(_))));
+        let pending = RotationState { pending_activate_at: 1_000_500, ..LIVE };
+        assert!(matches!(policy(pending).build(&duty()), Err(BuildError::Unactionable(_))));
+        let p = rotate_preimage(56, C, 4, NEW, 8, 1_003_600);
+        assert_eq!(policy(pending).verify(&duty(), &p), ProposalVerdict::Reject(NackReason::PayloadMismatch));
+        // A wBDX this node does not serve is never actionable.
+        let other = Duty::Rotate(RotationRequest { chain_id: 1, contract: C, new_signer: NEW, new_key_epoch: 4 });
+        assert!(policy(LIVE).actionable(&other).is_err());
+        // A member that cannot read its own RPC neither signs nor objects.
+        let mut blind = RotatePolicy { read: |_| Err("rpc down".to_string()), contracts: [(56, C)].into(), valid_secs: 3600 };
+        assert_eq!(blind.verify(&duty(), &p), ProposalVerdict::Abstain);
+    }
+}
+
+#[cfg(test)]
+mod handover_policy_tests {
+    use super::*;
+    use crate::orchestrator::HandoverRequest;
+
+    const GW: [u8; 32] = [0x6A; 32];
+    const NEW: [u8; 32] = [0x9E; 32];
+
+    fn duty() -> Duty {
+        Duty::Handover(HandoverRequest { gateway_id: GW, new_owner: NEW, key_epoch: 7 })
+    }
+
+    /// The daemon's reading of a blob: here the blob's first byte picks what it says.
+    fn view(blob: &[u8]) -> Result<DescriptorUpdateView, String> {
+        let honest = DescriptorUpdateView {
+            gateway_id: GW,
+            owner_key_type: "eddsa".into(),
+            owner_key: NEW.to_vec(),
+            bridge_reserve: true,
+            has_standby: false,
+            hash_to_sign: [0x11; 32],
+        };
+        match blob.first() {
+            Some(0) => Ok(honest),
+            Some(1) => Ok(DescriptorUpdateView { owner_key: vec![0xBA; 32], ..honest }),
+            Some(2) => Ok(DescriptorUpdateView { bridge_reserve: false, ..honest }),
+            Some(3) => Ok(DescriptorUpdateView { gateway_id: [0x01; 32], ..honest }),
+            Some(4) => Ok(DescriptorUpdateView { owner_key_type: "beldex".into(), ..honest }),
+            Some(5) => Ok(DescriptorUpdateView { has_standby: true, ..honest }),
+            _ => Err("not a gateway descriptor update".into()),
+        }
+    }
+
+    fn policy(built: u8) -> HandoverPolicy<impl FnMut(&[u8; 32]) -> Result<Vec<u8>, String>, impl FnMut(&[u8]) -> Result<DescriptorUpdateView, String>> {
+        HandoverPolicy { fetch: move |_: &[u8; 32]| Ok(vec![built, 0xAA, 0xBB]), decode: view, gateway_id: GW }
+    }
+
+    #[test]
+    fn members_sign_only_the_hand_over_their_own_daemon_reads() {
+        let mut leader = policy(0);
+        let p = leader.build(&duty()).unwrap();
+        assert_eq!(&p[..32], &[0x11; 32]);
+        assert_eq!(&p[32..], &[0, 0xAA, 0xBB]);
+        assert_eq!(policy(0).verify(&duty(), &p), ProposalVerdict::Accept);
+        assert_eq!(policy(0).signing_message(&duty(), &p), vec![0x11; 32]);
+
+        let reject = ProposalVerdict::Reject(NackReason::PayloadMismatch);
+        // Another owner, the reserve flag dropped, another gateway, another key type, a standby named.
+        for bad in 1u8..=5 {
+            let blob = [&[0x11u8; 32][..], &[bad, 0xAA, 0xBB][..]].concat();
+            assert_eq!(policy(0).verify(&duty(), &blob), reject, "case {bad}");
+        }
+        // The right update, but a hash that is not the blob's.
+        let wrong_hash = [&[0x22u8; 32][..], &[0, 0xAA, 0xBB][..]].concat();
+        assert_eq!(policy(0).verify(&duty(), &wrong_hash), reject);
+        // A blob this member's daemon cannot read: no judgement either way.
+        let unreadable = [&[0x11u8; 32][..], &[9][..]].concat();
+        assert_eq!(policy(0).verify(&duty(), &unreadable), ProposalVerdict::Abstain);
+    }
+
+    #[test]
+    fn a_leader_does_not_propose_what_the_builder_got_wrong() {
+        assert!(matches!(policy(1).build(&duty()), Err(BuildError::Transient(_))));
+        assert!(matches!(policy(2).build(&duty()), Err(BuildError::Transient(_))));
+        // Another committee's gateway is not this policy's to hand over.
+        let other = Duty::Handover(HandoverRequest { gateway_id: [0x01; 32], new_owner: NEW, key_epoch: 7 });
+        assert!(policy(0).actionable(&other).is_err());
     }
 }

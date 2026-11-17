@@ -104,6 +104,8 @@ impl<M: DutyReconciler, R: DutyReconciler, C: DutyReconciler> DutyReconciler for
             Duty::Mint(_) => self.mint.is_settled(duty),
             Duty::Release(_) => self.release.is_settled(duty),
             Duty::Takeover(_) => self.cancel.is_settled(duty),
+            Duty::Rotate(_) => self.mint.is_settled(duty),
+            Duty::Handover(_) => self.release.is_settled(duty),
         }
     }
 }
@@ -183,6 +185,16 @@ pub fn deposit_id(beldex_txid: &[u8; 32], output_index: u32) -> [u8; 32] {
 #[cfg(all(feature = "evm-watcher", feature = "tss-integration"))]
 impl<C: crate::evm_watcher::JsonRpcClient> DutyReconciler for EvmMintReconciler<C> {
     fn is_settled(&mut self, duty: &Duty) -> Option<bool> {
+        // A hand-off is settled once the contract's key epoch has reached it: then it was
+        // proposed and activated, or a later one was, and either way it can only revert.
+        if let Duty::Rotate(r) = duty {
+            let (client, contract) = self.chains.get(&r.chain_id)?;
+            let to = format!("0x{}", contract.iter().map(|x| format!("{x:02x}")).collect::<String>());
+            let raw = client.call("eth_call", serde_json::json!([{ "to": to, "data": "0x6fdf657e" }, "latest"])).ok()?;
+            let w = raw.as_str()?.strip_prefix("0x")?;
+            let key_epoch = u64::from_str_radix(w.get(w.len().checked_sub(16)?..)?, 16).ok()?;
+            return Some(key_epoch >= r.new_key_epoch);
+        }
         let Duty::Mint(ev) = duty else { return None };
         let (client, contract) = self.chains.get(&ev.dst_chain.0)?;
         let hexs = |b: &[u8]| -> String { b.iter().map(|x| format!("{x:02x}")).collect() };
@@ -244,6 +256,19 @@ impl GatewayReleaseReconciler {
 #[cfg(feature = "autonomy")]
 impl DutyReconciler for GatewayReleaseReconciler {
     fn is_settled(&mut self, duty: &Duty) -> Option<bool> {
+        // A gateway hand-over is settled once the gateway's owner key is the new one.
+        if let Duty::Handover(h) = duty {
+            if h.gateway_id.iter().map(|b| format!("{b:02x}")).collect::<String>() != self.gateway_id.to_ascii_lowercase() {
+                return None;
+            }
+            let req = serde_json::json!({
+                "jsonrpc": "2.0", "id": 0, "method": "get_gateway_info",
+                "params": { "gateway_address": self.gateway_id }
+            });
+            let v: serde_json::Value = crate::http_agent().post(&self.rpc_url).send_json(req).ok()?.into_json().ok()?;
+            let owner = v.get("result")?.get("owner_key")?.as_str()?.to_ascii_lowercase();
+            return Some(owner == h.new_owner.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        }
         let Duty::Release(ev) = duty else { return None };
         let txid_hex: String = ev.evm_txid.iter().map(|b| format!("{b:02x}")).collect();
         let id = self.id.get();

@@ -778,7 +778,7 @@ impl JsonRpcClient for HttpJsonRpc {
         }
         let resp = post
             .send_json(req)
-            .map_err(|e| RpcError::Transport(e.to_string()))?;
+        .map_err(|e| RpcError::Transport(e.to_string()))?;
         let v: Value = resp.into_json().map_err(|e| RpcError::BadResponse(e.to_string()))?;
         if let Some(err) = v.get("error") {
             return Err(RpcError::Rpc {
@@ -963,6 +963,18 @@ impl EvmChainConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Against a real wallet RPC run with `--rpc-login`:
+    ///   BRIDGE_TEST_WALLET_RPC=http://127.0.0.1:PORT/json_rpc BRIDGE_TEST_WALLET_LOGIN=user:pass cargo test --features evm-watcher-http -- --ignored wallet_rpc_login
+    #[cfg(feature = "evm-watcher-http")]
+    #[test]
+    #[ignore = "needs a running wallet RPC (BRIDGE_TEST_WALLET_RPC, BRIDGE_TEST_WALLET_LOGIN)"]
+    fn wallet_rpc_login() {
+        let url = std::env::var("BRIDGE_TEST_WALLET_RPC").expect("set BRIDGE_TEST_WALLET_RPC");
+        let login = std::env::var("BRIDGE_TEST_WALLET_LOGIN").expect("set BRIDGE_TEST_WALLET_LOGIN");
+        let v = super::HttpJsonRpc::new(url).with_basic_auth(&login).call("get_version", serde_json::json!({})).unwrap();
+        assert!(v.get("version").is_some(), "{v}");
+    }
     use std::cell::{Cell, RefCell};
 
     /// abi.encode(uint256 amount, bytes recipient) as a 0x-hex string.

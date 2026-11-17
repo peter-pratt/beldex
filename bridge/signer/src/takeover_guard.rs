@@ -282,6 +282,8 @@ mod tests {
                 mint: MintPolicy { contracts: BTreeMap::from([(1u64, [0x22u8; 20])]) },
                 release: MintPolicy { contracts: BTreeMap::new() },
                 cancel: TakeoverPolicy { read: |_: &TakeoverStep| Ok(TakeoverView::Running(vec![0x42; 32])) },
+                rotate: MintPolicy { contracts: BTreeMap::new() },
+                handover: MintPolicy { contracts: BTreeMap::new() },
             };
             let mut coord = Coordinator::new(
                 committee(n, t),

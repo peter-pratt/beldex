@@ -57,6 +57,8 @@ pub fn session_key(leg: Leg, epoch: u64, key: &DutyKey) -> [u8; 32] {
         DutyKind::Mint => 0,
         DutyKind::Release => 1,
         DutyKind::Takeover => 2,
+        DutyKind::Rotate => 3,
+        DutyKind::Handover => 4,
     });
     buf.extend_from_slice(&key.id);
     // One transaction can carry several duties; without `sub` they share a session key.
