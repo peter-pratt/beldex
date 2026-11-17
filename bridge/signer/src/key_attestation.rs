@@ -178,6 +178,18 @@ pub fn standby_target<'a>(view: &StandbyView, records: &'a [Record]) -> Option<&
     }
 }
 
+/// Whether the named standby should prove it can still sign now: a proof slot is open
+/// (`alive_height`, 0 for none) that no accepted proof covers yet (`last_seen`). A key that
+/// reads stale is being replaced and proves nothing more: its holders step aside, and a proof
+/// from holders that happen to come back in that wait would revive it or not depending only on
+/// when a slot falls. Its own running takeover is the exception: only its holders can finish it.
+pub fn standby_should_prove(alive_height: u64, last_seen: Option<u64>, stale: bool, own_takeover_running: bool) -> bool {
+    if stale && !own_takeover_running {
+        return false;
+    }
+    alive_height != 0 && last_seen.is_none_or(|seen| seen < alive_height)
+}
+
 /// Whether a standby share set should step aside, and why, so its members rejoin the pool and
 /// can be drawn for the next standby. `ours_height` is the height whose committee holds it and
 /// `ours_round` its standby round (0 for an epoch committee's). It steps aside when its key is
@@ -505,5 +517,19 @@ mod tests {
         // Without an attested owner consensus has nothing waiting: not a loss. Nor is the owner's.
         assert!(ours(&StandbyView { owner_epoch: None, ..view() }, 5, 610).is_none());
         assert!(ours(&StandbyView { owner_key: Some([5; 32]), ..view() }, 5, 610).is_none());
+    }
+
+    #[test]
+    fn a_stale_standby_proves_nothing_more_unless_its_takeover_runs() {
+        // A slot is open and not yet proved: prove.
+        assert!(standby_should_prove(120, Some(0), false, false));
+        assert!(standby_should_prove(120, None, false, false));
+        // Already proved for this slot, or no slot open: nothing to do.
+        assert!(!standby_should_prove(120, Some(120), false, false));
+        assert!(!standby_should_prove(0, None, false, false));
+        // Stale: the key is being replaced, so returning holders do not revive it.
+        assert!(!standby_should_prove(120, Some(0), true, false));
+        // ...unless its own takeover runs: only its holders can complete that.
+        assert!(standby_should_prove(120, Some(0), true, true));
     }
 }

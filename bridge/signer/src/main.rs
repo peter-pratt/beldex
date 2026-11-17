@@ -3339,7 +3339,12 @@ impl TakeoverReader {
                 // Prove this standby can still sign, once per slot: one that stops is replaced.
                 // A running takeover is no reason to stop, since its delay can outlast the proof's
                 // limit, but a takeover step that is due goes first: rounds run one at a time.
-                if out.len() == steps_before && g.alive_height != 0 && g.last_seen.is_none_or(|seen| seen < g.alive_height) {
+                // A stale key proves nothing more unless its own takeover runs (standby_should_prove).
+                let takeover_running = g.started != 0
+                    || evm.iter().any(|(_, _, _, st)| st.as_ref().is_ok_and(|st| st.standby == self.pevm_address && st.running()));
+                if out.len() == steps_before
+                    && beldex_bridge_signer::key_attestation::standby_should_prove(g.alive_height, g.last_seen, g.stale, takeover_running)
+                {
                     if let Some(m) = g.alive_message {
                         out.push((
                             TakeoverStep { chain_id: TakeoverStep::GATEWAY, step: TakeoverStepKind::StandbyAlive, takeover_id: g.alive_height, key_epoch: 0 },
