@@ -63,6 +63,37 @@ impl OmqCommitteeClient {
     }
 
     fn committee_request(&self, height: Option<u64>, standby_round: bool) -> Result<String, CommitteeError> {
+        // data parts: [optional height as ASCII], ["standby"]
+        let height_str = height.map(|h| h.to_string());
+        let mut data: Vec<&[u8]> = Vec::new();
+        if let Some(h) = &height_str {
+            data.push(h.as_bytes());
+            if standby_round {
+                data.push(b"standby");
+            }
+        }
+        self.request(b"bridge.committee", &data)
+    }
+
+    /// The daemon's current chain height (`rpc.get_height`).
+    pub fn fetch_height(&self) -> Result<u64, CommitteeError> {
+        let json = self.request(b"rpc.get_height", &[])?;
+        // `{"height":N,...}`: read the number directly rather than pull in a JSON parser.
+        let digits: String = json
+            .split("\"height\":")
+            .nth(1)
+            .unwrap_or("")
+            .trim_start()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits
+            .parse()
+            .map_err(|_| CommitteeError::Transport(format!("get_height reply has no height: {json}")))
+    }
+
+    /// One request/reply exchange: `command`, a correlation tag, and the data parts.
+    fn request(&self, command: &[u8], data: &[&[u8]]) -> Result<String, CommitteeError> {
         let tx = |e: String| CommitteeError::Transport(e);
 
         let sock = self
@@ -74,16 +105,9 @@ impl OmqCommitteeClient {
         sock.connect(&self.endpoint)
             .map_err(|e| tx(format!("connect {}: {e}", self.endpoint)))?;
 
-        // request parts: command, correlation tag, [optional height as ASCII], ["standby"]
-        let height_str;
-        let mut parts: Vec<&[u8]> = vec![b"bridge.committee", b"bridgesig-committee"];
-        if let Some(h) = height {
-            height_str = h.to_string();
-            parts.push(height_str.as_bytes());
-            if standby_round {
-                parts.push(b"standby");
-            }
-        }
+        // request parts: command, correlation tag, [data parts, e.g. a height as ASCII, "standby"]
+        let mut parts: Vec<&[u8]> = vec![command, b"bridgesig-committee"];
+        parts.extend_from_slice(data);
         sock.send_multipart(parts, 0)
             .map_err(|e| tx(format!("send: {e}")))?;
 

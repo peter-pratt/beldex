@@ -138,6 +138,9 @@ pub enum DkgError {
 /// `SessionMsg::Round`, so DKG rides the exact same signed mesh as signing).
 pub const DKG_ROUND1: u8 = 1;
 pub const DKG_ROUND2: u8 = 2;
+/// "I am here": exchanged before round 1 so no round package goes to a peer whose
+/// listener is not up yet.
+pub const DKG_HELLO: u8 = 0;
 
 /// Encode a DKG package for the wire: `[round][package…]`. Rides inside a
 /// `SessionMsg::Round` so it inherits the mesh's per-message authentication (S4)
@@ -383,6 +386,38 @@ impl DualDkg {
     }
 }
 
+/// When an automatic DKG may start, worked out from the chain height alone.
+///
+/// Every member of a committee must run the same attempt at the same time, and they
+/// have no way to agree on that except the chain. So attempt `k` of an epoch opens
+/// `settle + k * retry` blocks after the epoch starts and stays open for `join` blocks;
+/// a member that is late misses it and waits for the next one rather than starting an
+/// attempt the others have already left. No attempt opens within `cutoff` blocks of the
+/// next epoch, whose committee takes over. The attempt number is the key generation:
+/// the execution ids already name the epoch, so it only has to be unique within one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttemptSchedule {
+    pub settle: u64,
+    pub retry: u64,
+    pub join: u64,
+    pub cutoff: u64,
+}
+
+impl AttemptSchedule {
+    /// The attempt open at `tip` in the epoch starting at `epoch_start`, if any.
+    pub fn attempt_at(&self, epoch_start: u64, epoch_blocks: u64, tip: u64) -> Option<u32> {
+        let first = epoch_start.checked_add(self.settle)?;
+        if self.retry == 0 || tip < first || tip.saturating_add(self.cutoff) >= epoch_start + epoch_blocks {
+            return None;
+        }
+        let since = tip - first;
+        if since % self.retry >= self.join.max(1) {
+            return None;
+        }
+        u32::try_from(since / self.retry).ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,5 +587,28 @@ mod tests {
         }
         assert_eq!(d.pgw.stage(), DkgStage::Round2);
         assert_eq!(d.pevm.stage(), DkgStage::Round1); // untouched
+    }
+
+    #[test]
+    fn attempts_open_at_the_same_heights_for_every_member() {
+        let s = AttemptSchedule { settle: 2, retry: 40, join: 3, cutoff: 40 };
+        // Epoch 5 of a 120-block devnet epoch starts at 600.
+        assert_eq!(s.attempt_at(600, 120, 600), None); // still settling
+        assert_eq!(s.attempt_at(600, 120, 602), Some(0));
+        assert_eq!(s.attempt_at(600, 120, 604), Some(0)); // last join block
+        assert_eq!(s.attempt_at(600, 120, 605), None); // too late to join attempt 0
+        assert_eq!(s.attempt_at(600, 120, 642), Some(1));
+        // 682 + 40 reaches the next epoch at 720: its committee takes over.
+        assert_eq!(s.attempt_at(600, 120, 682), None);
+        assert_eq!(s.attempt_at(600, 120, 720), None); // a tip in the next epoch
+    }
+
+    #[test]
+    fn a_degenerate_schedule_never_opens() {
+        let s = AttemptSchedule { settle: 2, retry: 0, join: 3, cutoff: 0 };
+        assert_eq!(s.attempt_at(600, 120, 602), None);
+        // A cutoff as long as the epoch leaves no room for any attempt.
+        let s = AttemptSchedule { settle: 2, retry: 40, join: 3, cutoff: 120 };
+        assert_eq!(s.attempt_at(600, 120, 602), None);
     }
 }

@@ -33,13 +33,13 @@
 //! feature, exactly like `frost_dkg` / `cggmp21_interop`.
 
 use crate::committee::CommitteeView;
-use crate::dkg::{decode_dkg_payload, encode_dkg_payload, DkgLeg, DkgSession, DKG_ROUND1, DKG_ROUND2};
+use crate::dkg::{decode_dkg_payload, encode_dkg_payload, DkgLeg, DkgSession, DKG_HELLO, DKG_ROUND1, DKG_ROUND2};
 use crate::share_store::ShareStore;
 use crate::transport::Leg;
 use crate::wire::{SessionMsg, SessionTransport, WireMsg};
 use frost_ed25519 as frost;
 use rand_core::{CryptoRng, RngCore};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 type Id = frost::Identifier;
@@ -494,7 +494,12 @@ where
 {
     let (mut driver, first) = FrostDkgDriver::begin(committee, self_index, key_generation, rng)?;
     let deadline = Instant::now() + timeout;
+    let early = connection_barrier(&driver, transport, timeout)?;
     send_all(transport, first, deadline)?;
+    for msg in early {
+        let outs = driver.on_wire(&msg, rng)?;
+        send_all(transport, outs, deadline)?;
+    }
 
     while !driver.is_complete() {
         if Instant::now() >= deadline {
@@ -511,6 +516,275 @@ where
         }
     }
     Ok(driver)
+}
+
+/// Wait until every peer has been heard from before round 1 goes out. Each round package
+/// is sent once, so one sent to a peer whose listener is not up yet is lost and the run can
+/// only time out; members started a few seconds apart would fail that way. Any frame of
+/// this run proves its sender is up, and round frames that arrive meanwhile are returned
+/// for the driver rather than dropped.
+fn connection_barrier<T: SessionTransport>(
+    driver: &FrostDkgDriver,
+    transport: &mut T,
+    timeout: Duration,
+) -> Result<Vec<WireMsg>, DriverError> {
+    let hello = driver.wire(DKG_HELLO, &[]);
+    let mut failures = crate::wire::BarrierSendFailures::default();
+    let mut seen: BTreeSet<u16> = BTreeSet::new();
+    let mut early = Vec::new();
+    let take = |msg: WireMsg, seen: &mut BTreeSet<u16>, early: &mut Vec<WireMsg>| {
+        if msg.leg != Leg::Pgw || msg.epoch != driver.epoch || msg.payload_hash != driver.payload_hash {
+            return;
+        }
+        if msg.from != driver.self_index {
+            seen.insert(msg.from);
+        }
+        let is_hello = match &msg.body {
+            SessionMsg::Round(p) => decode_dkg_payload(p).map(|(round, _)| round) == Some(DKG_HELLO),
+            _ => false,
+        };
+        if !is_hello {
+            early.push(msg);
+        }
+    };
+    let barrier_deadline = Instant::now() + timeout.min(Duration::from_secs(60));
+    loop {
+        crate::wire::note_barrier_send(&mut failures, transport.broadcast(&hello));
+        while let Ok(Some(msg)) = transport.poll() {
+            take(msg, &mut seen, &mut early);
+        }
+        if seen.len() as u16 >= driver.n - 1 {
+            break;
+        }
+        if Instant::now() >= barrier_deadline {
+            let missing: Vec<u16> = (0..driver.n).filter(|i| *i != driver.self_index && !seen.contains(i)).collect();
+            return Err(DriverError::Protocol(format!(
+                "connection barrier timed out: nothing from peers {missing:?}{}",
+                failures.describe()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    // A peer still in its own barrier needs our HELLO too (our round 1 also counts).
+    for _ in 0..3 {
+        crate::wire::note_barrier_send(&mut failures, transport.broadcast(&hello));
+        while let Ok(Some(msg)) = transport.poll() {
+            take(msg, &mut seen, &mut early);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(early)
+}
+
+/// The last step of a dual DKG: every member says which key it finished with, and nobody
+/// keeps the result unless all `n` finished with the same one. The protocols themselves
+/// only tell a member about its own outcome — Pgw round 1 is a plain send-to-each, so one
+/// member can leave others with different Pgw keys — and a key held by fewer than all `n`
+/// has no member to spare.
+///
+/// Each claim is signed with the member's transport key ([`key_cert_message`]), so the
+/// claims together are a [`KeyCertificate`]: proof, checkable by anyone holding the
+/// committee consensus selected, that this committee and no one else made this key.
+///
+/// Each member re-broadcasts its claim until it has every peer's: a peer still finishing
+/// the protocol drops frames that are not its own, so a claim sent once could be lost.
+#[allow(clippy::too_many_arguments)]
+pub fn confirm_key<T: SessionTransport>(
+    committee: &CommitteeView,
+    self_index: u16,
+    key_generation: u32,
+    pgw: &[u8; 32],
+    pevm: &[u8; 33],
+    signer: &dyn crate::wire_auth::MsgSigner,
+    ed: &dyn crate::wire_auth::Ed25519,
+    transport: &mut T,
+    timeout: Duration,
+) -> Result<KeyCertificate, DriverError> {
+    let n = committee.members.len() as u16;
+    let tag = crate::committee::execution_id(
+        b"beldex-dkg-confirm-v1",
+        &[&committee.identity_bytes(), &key_generation.to_le_bytes()],
+    );
+    let message = key_cert_message(committee, key_generation, pgw, pevm);
+    let mine = crate::coordinator::sha256(&message);
+    let own_sig = signer.sign(&message).map_err(|e| DriverError::Protocol(format!("sign the key confirmation: {e}")))?;
+    let mut body = mine.to_vec();
+    body.extend_from_slice(&own_sig);
+    let claim = WireMsg {
+        leg: Leg::Pevm,
+        epoch: committee.epoch,
+        payload_hash: tag,
+        attempt: 0,
+        from: self_index,
+        body: SessionMsg::Round(body),
+    };
+    let mut failures = crate::wire::BarrierSendFailures::default();
+    let mut sigs: BTreeMap<u16, [u8; 64]> = BTreeMap::new();
+    sigs.insert(self_index, own_sig);
+    let take = |msg: WireMsg, sigs: &mut BTreeMap<u16, [u8; 64]>| -> Result<(), DriverError> {
+        if msg.leg != Leg::Pevm || msg.epoch != committee.epoch || msg.payload_hash != tag || msg.from == self_index {
+            return Ok(());
+        }
+        match &msg.body {
+            SessionMsg::Round(p) if p.len() == 96 && p[..32] == mine[..] => {
+                let sig: [u8; 64] = p[32..].try_into().expect("checked length");
+                let signed = committee.signer_key(msg.from as usize).is_some_and(|k| ed.verify(&sig, &message, &k));
+                if !signed {
+                    return Err(DriverError::Protocol(format!(
+                        "member {}'s confirmation is not signed with its committee key",
+                        msg.from
+                    )));
+                }
+                sigs.insert(msg.from, sig);
+                Ok(())
+            }
+            SessionMsg::Round(_) => Err(DriverError::Protocol(format!(
+                "member {} finished with a different key — not one key",
+                msg.from
+            ))),
+            _ => Ok(()),
+        }
+    };
+    let deadline = Instant::now() + timeout.min(Duration::from_secs(120));
+    loop {
+        crate::wire::note_barrier_send(&mut failures, transport.broadcast(&claim));
+        while let Ok(Some(msg)) = transport.poll() {
+            take(msg, &mut sigs)?;
+        }
+        if sigs.len() as u16 >= n {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let missing: Vec<u16> = (0..n).filter(|i| !sigs.contains_key(i)).collect();
+            return Err(DriverError::Protocol(format!(
+                "key confirmation timed out: no confirmation from members {missing:?}{}",
+                failures.describe()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    // A peer still waiting needs our claim too; ours may have been dropped while it finished.
+    for _ in 0..20 {
+        crate::wire::note_barrier_send(&mut failures, transport.broadcast(&claim));
+        while let Ok(Some(msg)) = transport.poll() {
+            take(msg, &mut sigs)?;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(KeyCertificate {
+        epoch: committee.epoch,
+        height: committee.height,
+        key_generation,
+        pgw: *pgw,
+        pevm: *pevm,
+        sigs: sigs.into_iter().collect(),
+    })
+}
+
+/// What every member of a committee signs for the key it made: the committee (its epoch
+/// and members), the run, and both group keys.
+pub fn key_cert_message(committee: &CommitteeView, key_generation: u32, pgw: &[u8; 32], pevm: &[u8; 33]) -> Vec<u8> {
+    let mut m = b"beldex-bridge-keycert-v1".to_vec();
+    m.extend_from_slice(&committee.identity_bytes());
+    m.extend_from_slice(&key_generation.to_le_bytes());
+    m.extend_from_slice(pgw);
+    m.extend_from_slice(pevm);
+    m
+}
+
+/// A committee's key with every member's signature on it ([`key_cert_message`]), made by
+/// [`confirm_key`]. Each signature is checked against that member's `signer_ed25519`,
+/// which consensus publishes, so the outgoing committee can tell the key it is asked to
+/// hand the bridge to is the one the selected committee made — not one someone else did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyCertificate {
+    pub epoch: u64,
+    /// The committee's selection height, to fetch it again (`bridge.committee` at it).
+    pub height: u64,
+    pub key_generation: u32,
+    pub pgw: [u8; 32],
+    pub pevm: [u8; 33],
+    /// One per member, by committee index.
+    pub sigs: Vec<(u16, [u8; 64])>,
+}
+
+impl KeyCertificate {
+    const HEADER: &'static str = "beldex-bridge-keycert-v1";
+
+    /// One `name value` per line; a `sig <index> <hex>` line per member.
+    pub fn to_text(&self) -> String {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let mut s = format!(
+            "{}\nepoch {}\nheight {}\nkey_generation {}\npgw {}\npevm {}\n",
+            Self::HEADER, self.epoch, self.height, self.key_generation, hex(&self.pgw), hex(&self.pevm)
+        );
+        for (i, sig) in &self.sigs {
+            s.push_str(&format!("sig {i} {}\n", hex(sig)));
+        }
+        s
+    }
+
+    pub fn from_text(text: &str) -> Result<KeyCertificate, String> {
+        fn unhex<const N: usize>(s: &str, what: &str) -> Result<[u8; N], String> {
+            let b: Option<Vec<u8>> =
+                (0..s.len()).step_by(2).map(|i| s.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok())).collect();
+            b.filter(|b| b.len() == N && s.len() == 2 * N)
+                .and_then(|b| b.try_into().ok())
+                .ok_or_else(|| format!("{what}: not {N} bytes of hex"))
+        }
+        let mut lines = text.lines();
+        if lines.next() != Some(Self::HEADER) {
+            return Err(format!("not a key certificate (no {} line)", Self::HEADER));
+        }
+        let (mut epoch, mut height, mut generation, mut pgw, mut pevm) = (None, None, None, None, None);
+        let mut sigs = Vec::new();
+        for line in lines.filter(|l| !l.trim().is_empty()) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            let num = |v: &str| v.parse::<u64>().map_err(|_| format!("bad number in `{line}`"));
+            match parts.as_slice() {
+                ["epoch", v] => epoch = Some(num(v)?),
+                ["height", v] => height = Some(num(v)?),
+                ["key_generation", v] => generation = Some(num(v)? as u32),
+                ["pgw", v] => pgw = Some(unhex::<32>(v, "pgw")?),
+                ["pevm", v] => pevm = Some(unhex::<33>(v, "pevm")?),
+                ["sig", i, v] => sigs.push((num(i)? as u16, unhex::<64>(v, "sig")?)),
+                _ => return Err(format!("unexpected line `{line}`")),
+            }
+        }
+        Ok(KeyCertificate {
+            epoch: epoch.ok_or("no epoch")?,
+            height: height.ok_or("no height")?,
+            key_generation: generation.ok_or("no key_generation")?,
+            pgw: pgw.ok_or("no pgw")?,
+            pevm: pevm.ok_or("no pevm")?,
+            sigs,
+        })
+    }
+
+    /// Whether this is `committee`'s key: the same epoch, and a valid signature from every
+    /// one of its members — not a threshold of them, the same rule as [`confirm_key`].
+    pub fn verify(&self, committee: &CommitteeView, ed: &dyn crate::wire_auth::Ed25519) -> Result<(), String> {
+        if committee.epoch != self.epoch {
+            return Err(format!("certificate is for epoch {}, the committee is epoch {}", self.epoch, committee.epoch));
+        }
+        let message = key_cert_message(committee, self.key_generation, &self.pgw, &self.pevm);
+        let mut seen = BTreeSet::new();
+        for (i, sig) in &self.sigs {
+            let key = committee.signer_key(*i as usize).ok_or_else(|| format!("no member {i} with a signer key"))?;
+            if !seen.insert(*i) {
+                return Err(format!("two signatures for member {i}"));
+            }
+            if !ed.verify(sig, &message, &key) {
+                return Err(format!("member {i}'s signature does not verify"));
+            }
+        }
+        let n = committee.members.len() as u16;
+        let missing: Vec<u16> = (0..n).filter(|i| !seen.contains(i)).collect();
+        if !missing.is_empty() {
+            return Err(format!("no signature from members {missing:?}"));
+        }
+        Ok(())
+    }
 }
 
 /// Send a step's frames. Each round package goes out once, so every one must arrive:
@@ -843,7 +1117,7 @@ mod tests {
     /// the real sockets + the security-critical per-message auth) so it works on
     /// any libzmq. Exercises everything except the committee read.
     #[cfg(feature = "omq-mesh")]
-    fn socket_dkg_harness(use_curve: bool, base_port: u16) {
+    fn socket_dkg_harness(use_curve: bool, base_port: u16, stagger: std::time::Duration, absent: Option<u16>) {
         use crate::committee::CommitteeView;
         use crate::ffi::ed25519_keypair;
         use crate::omq_mesh::{MeshAuth, OmqMeshConfig, OmqPeerTransport, PeerAddr};
@@ -894,9 +1168,19 @@ mod tests {
             round_height: 0,
         };
 
+        // A run missing a member stops at the connection barrier, which is bounded by the
+        // run's timeout: keep that short so the test does not wait out a whole DKG.
+        let run_timeout = match absent {
+            Some(_) => Duration::from_secs(5),
+            None => Duration::from_secs(30) + stagger * n as u32,
+        };
+        let started = std::time::Instant::now();
         let (tx, rx) = mpsc::channel();
         let mut handles = Vec::new();
         for i in 0..n {
+            if absent == Some(i) {
+                continue;
+            }
             let committee = committee.clone();
             let ed_pk = ed_pk.clone();
             let cv_pk = cv_pk.clone();
@@ -933,15 +1217,32 @@ mod tests {
                 let mut store = MemoryShareStore::new();
                 let mut rng = rand::rngs::OsRng;
                 // Let every node bind + connect before the first round-1 sends.
-                std::thread::sleep(Duration::from_millis(800));
+                std::thread::sleep(Duration::from_millis(800) + stagger * i as u32);
                 let vk = run_over_transport(
                     &committee, i, 0, &mut transport, &mut store, &mut rng,
-                    Duration::from_secs(30),
+                    run_timeout,
                 );
                 tx.send((i, vk)).unwrap();
             }));
         }
         drop(tx);
+
+        if let Some(a) = absent {
+            // Every present member gives up at the barrier, naming the absent one, instead
+            // of waiting out its timeout for round packages that will never come.
+            for _ in 1..n {
+                let (i, vk) = rx.recv().unwrap();
+                match vk {
+                    Err(DriverError::Protocol(m)) if m.contains(&format!("[{a}]")) => {}
+                    other => panic!("node {i}: expected a barrier failure naming peer {a}, got {other:?}"),
+                }
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert!(started.elapsed() < Duration::from_secs(20), "the barrier did not fail fast");
+            return;
+        }
 
         let mut vks = Vec::new();
         for _ in 0..n {
@@ -966,7 +1267,7 @@ mod tests {
     #[test]
     #[ignore = "binds real ZMQ CURVE sockets on localhost"]
     fn dkg_over_real_curve_sockets() {
-        socket_dkg_harness(true, 55900);
+        socket_dkg_harness(true, 55900, std::time::Duration::ZERO, None);
     }
 
     /// Real sockets **without** CURVE (works on any libzmq): still exercises the
@@ -976,7 +1277,159 @@ mod tests {
     #[test]
     #[ignore = "binds real ZMQ sockets on localhost"]
     fn dkg_over_real_plain_sockets() {
-        socket_dkg_harness(false, 55920);
+        socket_dkg_harness(false, 55920, std::time::Duration::ZERO, None);
+    }
+
+    /// Members that start the protocol seconds apart, as automatic starts on separate hosts
+    /// do: the last starts 15s after the first.
+    ///   cargo test -p beldex-bridge-signer --features live-dkg -- --ignored --nocapture dkg_over_sockets_with_members_starting_apart
+    #[cfg(feature = "omq-mesh")]
+    #[test]
+    #[ignore = "binds real ZMQ sockets on localhost"]
+    fn dkg_over_sockets_with_members_starting_apart() {
+        socket_dkg_harness(false, 55940, std::time::Duration::from_secs(3), None);
+    }
+
+    /// One member never starts: the others stop within seconds and name it, so the next
+    /// attempt is not lost waiting out a whole DKG timeout.
+    ///   cargo test -p beldex-bridge-signer --features live-dkg -- --ignored --nocapture dkg_over_sockets_stops_fast_without_a_member
+    #[cfg(feature = "omq-mesh")]
+    #[test]
+    #[ignore = "binds real ZMQ sockets on localhost"]
+    fn dkg_over_sockets_stops_fast_without_a_member() {
+        socket_dkg_harness(false, 55960, std::time::Duration::ZERO, Some(5));
+    }
+
+    /// A bus shared across threads, for drivers that run concurrently ([`confirm_key`]).
+    #[derive(Clone)]
+    struct SharedBus(std::sync::Arc<Vec<std::sync::Mutex<VecDeque<WireMsg>>>>, u16);
+    impl SessionTransport for SharedBus {
+        fn broadcast(&mut self, msg: &WireMsg) -> Result<(), crate::wire::MeshError> {
+            for (i, inbox) in self.0.iter().enumerate() {
+                if i as u16 != self.1 {
+                    inbox.lock().unwrap().push_back(msg.clone());
+                }
+            }
+            Ok(())
+        }
+        fn send_to(&mut self, peer: u16, msg: &WireMsg) -> Result<(), crate::wire::MeshError> {
+            self.0[peer as usize].lock().unwrap().push_back(msg.clone());
+            Ok(())
+        }
+        fn poll(&mut self) -> Result<Option<WireMsg>, crate::wire::MeshError> {
+            Ok(self.0[self.1 as usize].lock().unwrap().pop_front())
+        }
+    }
+
+    /// A stand-in transport key: a "signature" is H(key ‖ msg) ‖ H(msg ‖ key), so it binds
+    /// both and cannot be made without the key's bytes. Real ed25519 is tested in `ffi.rs`.
+    struct TestKey([u8; 32]);
+    fn test_sig(key: &[u8; 32], msg: &[u8]) -> [u8; 64] {
+        let mut s = [0u8; 64];
+        s[..32].copy_from_slice(&crate::coordinator::sha256(&[&key[..], msg].concat()));
+        s[32..].copy_from_slice(&crate::coordinator::sha256(&[msg, &key[..]].concat()));
+        s
+    }
+    impl crate::wire_auth::MsgSigner for TestKey {
+        fn sign(&self, msg: &[u8]) -> Result<[u8; 64], &'static str> {
+            Ok(test_sig(&self.0, msg))
+        }
+    }
+    struct TestEd;
+    impl crate::wire_auth::Ed25519 for TestEd {
+        fn verify(&self, sig: &[u8; 64], msg: &[u8], pubkey: &[u8; 32]) -> bool {
+            *sig == test_sig(pubkey, msg)
+        }
+    }
+
+    fn signed_committee(n: u16) -> CommitteeView {
+        let mut c = committee(n, n - 1);
+        c.signer_keys = (0..n).map(|i| [100 + i as u8; 32]).collect();
+        c
+    }
+
+    /// Run [`confirm_key`] on every member, member `i` claiming `keys[i]` (`None` = absent);
+    /// member `forger` signs with a key that is not its committee key.
+    fn confirm_all(keys: &[Option<&'static str>], forger: Option<usize>) -> Vec<Option<Result<KeyCertificate, DriverError>>> {
+        let n = keys.len() as u16;
+        let c = signed_committee(n);
+        let inboxes = std::sync::Arc::new((0..n).map(|_| std::sync::Mutex::new(VecDeque::new())).collect());
+        let handles: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| {
+                let (c, mut bus, key) = (c.clone(), SharedBus(std::sync::Arc::clone(&inboxes), i as u16), *key);
+                let signer = TestKey(if forger == Some(i) { [0xEE; 32] } else { c.signer_keys[i] });
+                std::thread::spawn(move || {
+                    key.map(|k| {
+                        let pgw = crate::coordinator::sha256(k.as_bytes());
+                        confirm_key(&c, i as u16, 1, &pgw, &[2; 33], &signer, &TestEd, &mut bus, Duration::from_secs(3))
+                    })
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    }
+
+    #[test]
+    fn every_member_keeps_the_key_only_when_all_finished_with_it() {
+        let all = confirm_all(&[Some("K"), Some("K"), Some("K"), Some("K")], None);
+        assert!(all.iter().all(|r| matches!(r, Some(Ok(_)))), "{all:?}");
+
+        // One member with a different key: everyone else refuses, naming it.
+        let split = confirm_all(&[Some("K"), Some("K"), Some("X"), Some("K")], None);
+        for (i, r) in split.iter().enumerate() {
+            match r {
+                Some(Err(DriverError::Protocol(m))) if i != 2 => assert!(m.contains("member 2"), "{m}"),
+                Some(Err(DriverError::Protocol(_))) => {}
+                other => panic!("member {i}: {other:?}"),
+            }
+        }
+
+        // One member never confirms: the rest give up, naming it.
+        let absent = confirm_all(&[Some("K"), None, Some("K"), Some("K")], None);
+        for r in absent.iter().flatten() {
+            match r {
+                Err(DriverError::Protocol(m)) => assert!(m.contains("[1]"), "{m}"),
+                other => panic!("{other:?}"),
+            }
+        }
+
+        // One member signs with a key that is not its committee key: the rest refuse it.
+        let forged = confirm_all(&[Some("K"), Some("K"), Some("K"), Some("K")], Some(3));
+        for (i, r) in forged.iter().enumerate().filter(|(i, _)| *i != 3) {
+            match r {
+                Some(Err(DriverError::Protocol(m))) => assert!(m.contains("member 3"), "member {i}: {m}"),
+                other => panic!("member {i}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_certificate_proves_the_whole_committee_made_the_key() {
+        let all = confirm_all(&[Some("K"), Some("K"), Some("K"), Some("K")], None);
+        let certs: Vec<KeyCertificate> = all.into_iter().map(|r| r.unwrap().unwrap()).collect();
+        // Every member ends with the same certificate, and it reads back from its file form.
+        assert!(certs.windows(2).all(|w| w[0] == w[1]));
+        let cert = KeyCertificate::from_text(&certs[0].to_text()).unwrap();
+        assert_eq!(cert, certs[0]);
+        assert_eq!(cert.sigs.len(), 4);
+
+        let c = signed_committee(4);
+        cert.verify(&c, &TestEd).unwrap();
+
+        // Someone else's key under these signatures does not verify.
+        let mut other = cert.clone();
+        other.pevm = [3; 33];
+        assert!(other.verify(&c, &TestEd).unwrap_err().contains("does not verify"));
+        // Neither does one with a member's signature missing...
+        let mut short = cert.clone();
+        short.sigs.remove(2);
+        assert!(short.verify(&c, &TestEd).unwrap_err().contains("[2]"));
+        // ...nor one checked against a different committee.
+        let mut later = signed_committee(4);
+        later.epoch += 1;
+        assert!(cert.verify(&later, &TestEd).is_err());
     }
 
     /// A run that fails after a peer went over its frame budget says which peer.
