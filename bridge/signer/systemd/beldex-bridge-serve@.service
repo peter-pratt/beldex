@@ -1,0 +1,50 @@
+# beldex-bridge-serve@<seat>.service — a bridge seat's signer: it signs the committee's mints,
+# releases and key hand-offs while it holds a share of the live key, and installs its share of
+# the next key itself once that key is live on both legs (the wBDX signer and the gateway owner).
+#
+# Every seat runs it, on the committee or not: a seat with no live share waits for its next one.
+# It exits with status 75 when its key has been handed over and its next one is live, to be
+# started again on that key; `Restart=always` does that. A seat left off the incoming committee
+# archives its old share tree and waits.
+#
+#   /etc/beldex/bridge-signer-<seat>.env   the seat's settings (see the signer README), at least:
+#     BRIDGE_SIGNER_SERVE_LIVE=1
+#     BRIDGE_SIGNER_SHARE_DIR, BRIDGE_SIGNER_SHARE_KEY_FILE, BRIDGE_SIGNER_MN_KEY_FILE
+#     BRIDGE_SIGNER_OXENMQ_ENDPOINT, BRIDGE_SIGNER_BELDEXD_RPC_URL, BRIDGE_SIGNER_GENESIS_HASH
+#     BRIDGE_SIGNER_GATEWAY_ID, BRIDGE_SIGNER_GATEWAY_VIEW_SECRET, BRIDGE_SIGNER_EVM_CHAINS
+#     BRIDGE_SIGNER_MINT_BUS_ENDPOINT (comma-separated bus daemons), BRIDGE_SIGNER_HANDOVER_BUILDER
+#     BRIDGE_SIGNER_ACK_WALLET_RPC + BRIDGE_SIGNER_ACK_WALLET_LOGIN_FILE: the seat's own small fee
+#       wallet (a local beldex-wallet-rpc with --rpc-login, its user:password in a file of mode
+#       0600), which pays its key attestations and rotation acknowledgements
+#     BRIDGE_SIGNER_STATUS_LISTEN (e.g. 127.0.0.1:9100, for monitoring /health)
+#   It must not set BRIDGE_SIGNER_MESH_USE_CURVE=false or the plaintext opt-ins: those are for
+#   test networks, and the signer refuses them unless its daemon is on one.
+#
+#   systemctl enable --now beldex-bridge-serve@<seat> beldex-bridge-dkg@<seat>
+
+[Unit]
+Description=Beldex bridge signer (serve) for seat %i
+Wants=network-online.target
+After=network-online.target
+# Start after the seat's own beldexd, e.g.:  After=beldexd@%i.service
+
+[Service]
+Type=simple
+User=beldex
+Group=beldex
+EnvironmentFile=/etc/beldex/bridge-signer-%i.env
+ExecStart=/usr/bin/beldex-bridge-signer serve
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+# Where the seat's data dir (share trees, finality cursors, outboxes) lives.
+ReadWritePaths=/var/lib/beldex
+
+[Install]
+WantedBy=multi-user.target

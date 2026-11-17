@@ -1,0 +1,38 @@
+# beldex-bridge-dkg@<seat>.service — a bridge seat's key maker: once the seat is on the selected
+# committee it runs the DKG with the other members at heights they all derive from the chain,
+# retrying within the epoch, and leaves the key in `shares-next` beside the live tree with every
+# member's signature on it (`keycert`). It then attests the key on chain from the seat's fee
+# wallet (the outgoing committee hands over only to an attested key), and signs the key's
+# activation and publishes it. The seat's serve installs the key once it is live.
+#
+# Same settings file as beldex-bridge-serve@<seat>; it also reads, if set:
+#   BRIDGE_SIGNER_DKG_PORT_BASE, BRIDGE_SIGNER_DKG_RETRY_BLOCKS, BRIDGE_SIGNER_DKG_CUTOFF_BLOCKS,
+#   BRIDGE_SIGNER_DKG_TIMEOUT_SECS
+# and needs its own BRIDGE_SIGNER_STATUS_LISTEN port if monitored: put it in
+#   /etc/beldex/bridge-dkg-<seat>.env  (read after the shared file, so it wins).
+
+[Unit]
+Description=Beldex bridge signer (dkg-auto) for seat %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=beldex
+Group=beldex
+EnvironmentFile=/etc/beldex/bridge-signer-%i.env
+EnvironmentFile=-/etc/beldex/bridge-dkg-%i.env
+ExecStart=/usr/bin/beldex-bridge-signer dkg-auto
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ReadWritePaths=/var/lib/beldex
+
+[Install]
+WantedBy=multi-user.target

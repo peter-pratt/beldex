@@ -1,0 +1,42 @@
+# beldex-bridge-handover-submit.service — the runner's Beldex submitter, run beside the relayer
+# by whoever pays the bridge's Beldex fees. It builds the gateway hand-over with the hand-over
+# wallet for a key whose certificate and attestation it checked, and sends it once the committee
+# has signed it and the wBDX key has moved. Rotation acknowledgements are paid by each member's
+# own fee wallet, not here. It holds no bridge key.
+#
+#   /etc/beldex/bridge-submitter.env:
+#     BRIDGE_SIGNER_OXENMQ_ENDPOINT        the bus daemons, comma-separated
+#     BRIDGE_SIGNER_BELDEXD_RPC_URL        a beldexd HTTP RPC
+#     BRIDGE_SIGNER_HANDOVER_WALLET_RPC    http://127.0.0.1:PORT/json_rpc, for nothing else
+#     BRIDGE_SIGNER_HANDOVER_WALLET_LOGIN_FILE   its user:password, in a file of mode 0600
+#     BRIDGE_SIGNER_RELEASE_GATEWAY        the reserve gateway's id
+#     BRIDGE_SIGNER_EVM_CHAINS             the wBDX chains (contract + RPC)
+#     BRIDGE_SIGNER_HANDOVER_LISTEN        where the committee's leader asks for builds
+#     BRIDGE_SIGNER_HANDOVER_DIR           its records: keep with the wallets' seeds (recovery)
+#     BRIDGE_SIGNER_STATUS_LISTEN, BRIDGE_SIGNER_WALLET_LOW   monitoring
+# The wallet RPCs run on this machine, bound to 127.0.0.1 with --rpc-login.
+
+[Unit]
+Description=Beldex bridge hand-over submitter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=beldex
+Group=beldex
+EnvironmentFile=/etc/beldex/bridge-submitter.env
+ExecStart=/usr/bin/beldex-bridge-signer handover-submit
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ReadWritePaths=/var/lib/beldex-bridge
+
+[Install]
+WantedBy=multi-user.target

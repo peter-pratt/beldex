@@ -1,0 +1,35 @@
+# beldex-bridge-relay-watch.service — the runner's EVM relayer: it takes every committee-signed
+# mint, rotateSigner and activateRotation off the bus and sends it with the relayer's gas key,
+# holding an activation until the contract's challenge window is over.
+#
+#   /etc/beldex/bridge-relay.env (mode 0600: it holds the gas key):
+#     BRIDGE_SIGNER_OXENMQ_ENDPOINT   the bus daemons, comma-separated
+#     BRIDGE_SIGNER_RELAY_CMD         "/usr/bin/beldex-bridge-relayer relay -"
+#     RELAYER_GAS_KEY                 the EVM gas key (pays gas only; it cannot move bridge funds)
+#     RELAYER_CHAINS                  [{"chain_id":56,"rpc_url":"https://..."}]
+#     RELAYER_STATE_DIR               its in-flight transactions
+
+[Unit]
+Description=Beldex bridge EVM relayer (relay-watch)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=beldex
+Group=beldex
+EnvironmentFile=/etc/beldex/bridge-relay.env
+ExecStart=/usr/bin/beldex-bridge-signer relay-watch
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ReadWritePaths=/var/lib/beldex-bridge
+
+[Install]
+WantedBy=multi-user.target
