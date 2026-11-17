@@ -2751,6 +2751,7 @@ namespace
   using master_nodes::bridge_key_attestation_record;
   using master_nodes::check_bridge_standby_naming;
   using master_nodes::check_bridge_owner_change;
+  using master_nodes::first_waiting_bridge_key;
   using master_nodes::find_attested_bridge_key;
   using master_nodes::bridge_committee_operator_overlap;
 
@@ -2891,7 +2892,13 @@ TEST(GatewayBridgeKeyAttestation, a_standby_needs_attested_keys_from_committees_
   records.push_back(rec(next, 2, 0));
   EXPECT_FALSE(check_bridge_standby_naming(records, live, next, NET_FC, overlap, {}, 0, reason));
 
+  // Attested, but by an epoch committee: that key is the owner's successor, never a standby.
   records.back().attested_height = 20;
+  EXPECT_FALSE(check_bridge_standby_naming(records, live, next, NET_FC, overlap, {}, 0, reason));
+  EXPECT_NE(reason.find("only from a standby round"), std::string::npos) << reason;
+
+  // A standby round's key (drawn in epoch 2) is named.
+  records.back().round_height = 2 * cryptonote::bridge_epoch_blocks(NET_FC) + 10;
   EXPECT_TRUE(check_bridge_standby_naming(records, live, next, NET_FC, overlap, {}, 0, reason)) << reason;
 
   // One member too many in common.
@@ -2911,6 +2918,31 @@ TEST(GatewayBridgeKeyAttestation, a_standby_needs_attested_keys_from_committees_
   records.push_back(rec(next, 3, 15));
   EXPECT_EQ(find_attested_bridge_key(records, next)->epoch, 3u);
   EXPECT_FALSE(check_bridge_standby_naming(records, live, next, NET_FC, overlap, {}, 0, reason));
+}
+
+TEST(GatewayBridgeKeyAttestation, only_a_standby_rounds_key_waits_to_be_named)
+{
+  const crypto::eddsa_public_key live = new_vk(), successor = new_vk(), round_key = new_vk();
+  auto rec = [](const crypto::eddsa_public_key& vk, uint64_t epoch, uint64_t round, uint64_t height) {
+    bridge_key_attestation_record r{};
+    r.pgw_vk = vk; r.epoch = epoch; r.round_height = round; r.attested_height = height;
+    return r;
+  };
+  auto overlap = [](const bridge_key_attestation_record&, const bridge_key_attestation_record&) -> std::optional<size_t> {
+    return 0;
+  };
+  const uint64_t epoch_blocks = cryptonote::bridge_epoch_blocks(NET_FC);
+  const auto owner = rec(live, 1, 0, 10);
+
+  // The next epoch committee's key, attested for the rotation to it: a successor, not a standby.
+  std::vector<bridge_key_attestation_record> records{owner, rec(successor, 2, 0, 20)};
+  EXPECT_FALSE(first_waiting_bridge_key(records, owner, {}, 30, NET_FC, overlap));
+
+  // A standby round's key is the one waiting, even when attested after the successor.
+  records.push_back(rec(round_key, 1, epoch_blocks + 10, 25));
+  const auto waiting = first_waiting_bridge_key(records, owner, {}, 30, NET_FC, overlap);
+  ASSERT_TRUE(waiting);
+  EXPECT_EQ(waiting->pgw_vk, round_key);
 }
 
 TEST(GatewayBridgeKeyAttestation, the_gateway_owner_moves_only_to_a_newer_committees_attested_key)

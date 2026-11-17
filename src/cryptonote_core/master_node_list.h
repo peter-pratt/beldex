@@ -376,7 +376,8 @@ namespace master_nodes
   // the second), or nullopt if either committee is unknown.
   using bridge_record_overlap_fn = std::function<std::optional<size_t>(const bridge_key_attestation_record&,
                                                                        const bridge_key_attestation_record&)>;
-  // The key waiting to be named at `height`, the first attested if several: attested in the last
+  // The key waiting to be named at `height`, the first attested if several: a standby round's
+  // key (an epoch committee's key is the owner's successor, never a standby), attested in the last
   // gateway_standby_stale_blocks (older, and its holders are presumed to have moved on), from a
   // committee newer than the owner's and than the last named standby's (`liveness`; a gateway
   // never names a key twice, and named standbys only get newer) and within the overlap limit.
@@ -397,8 +398,8 @@ namespace master_nodes
                                  const cryptonote::gateway_owner_key_v& next,
                                  cryptonote::network_type nettype,
                                  std::string& reason);
-  // The standby-naming rule over attestation `records`: owner and standby are attested keys
-  // whose committees share at most size - threshold members, and a round's key is named only if
+  // The standby-naming rule over attestation `records`: owner and standby are attested keys, the
+  // standby a standby round's, whose committees share at most size - threshold members, and it is named only if
   // it is the first waiting (first_waiting_bridge_key): rounds racing do not get to choose.
   bool check_bridge_standby_naming(const std::vector<bridge_key_attestation_record>& records,
                                    const cryptonote::gateway_owner_key_v& owner,

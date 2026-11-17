@@ -2928,6 +2928,12 @@ namespace master_nodes
       reason = "the standby key has no committee attestation";
       return false;
     }
+    if (s->round_height == 0)
+    {
+      reason = "the standby key is an epoch committee's (epoch " + std::to_string(s->epoch)
+               + "): a standby comes only from a standby round; an epoch committee's key is a successor";
+      return false;
+    }
     const auto shared = overlap(*o, *s);
     if (!shared)
     {
@@ -2975,6 +2981,10 @@ namespace master_nodes
     std::optional<bridge_key_attestation_record> first;
     for (const auto &r : records)
     {
+      // Only a standby round's key: an epoch committee's key is the owner's successor (the
+      // rotation hands the gateway and wBDX to it), never a standby.
+      if (r.round_height == 0)
+        continue;
       if (r.attested_height == 0 || r.attested_height + recent < height || r.pgw_vk == owner.pgw_vk
           || (named && r.pgw_vk == *named) || r.committee_height(nettype) <= newer_than)
         continue;
