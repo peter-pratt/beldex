@@ -177,6 +177,44 @@ pub struct OmqMeshConfig {
     pub peers: Vec<PeerAddr>,
 }
 
+/// How long a peer's connection is left before it is made again on a full queue.
+const REDIAL_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What the outbound sockets are made from, kept so one can be made again.
+struct Redial {
+    use_curve: bool,
+    self_curve_public: [u8; 32],
+    self_curve_secret: [u8; 32],
+    peers: BTreeMap<u16, PeerAddr>,
+    /// When each peer's socket was last made again.
+    last: BTreeMap<u16, std::time::Instant>,
+}
+
+impl Redial {
+    /// One outbound PUSH socket to `p`, curve client with the peer's key pinned.
+    fn dial(&self, ctx: &zmq::Context, p: &PeerAddr) -> Result<zmq::Socket, MeshError> {
+        let sock = ctx
+            .socket(zmq::PUSH)
+            .map_err(|e| MeshError::Io(format!("push socket: {e}")))?;
+        if self.use_curve {
+            sock.set_curve_serverkey(&p.curve_pubkey)
+                .map_err(|e| MeshError::Io(format!("curve_serverkey: {e}")))?;
+            sock.set_curve_publickey(&self.self_curve_public)
+                .map_err(|e| MeshError::Io(format!("curve_publickey: {e}")))?;
+            sock.set_curve_secretkey(&self.self_curve_secret)
+                .map_err(|e| MeshError::Io(format!("curve_secretkey: {e}")))?;
+        }
+        // Don't block a broadcast on a slow/absent peer; drop instead.
+        sock.set_sndtimeo(0)
+            .map_err(|e| MeshError::Io(format!("sndtimeo: {e}")))?;
+        sock.set_linger(0)
+            .map_err(|e| MeshError::Io(format!("linger: {e}")))?;
+        sock.connect(&p.endpoint)
+            .map_err(|e| MeshError::Io(format!("connect {}: {e}", p.endpoint)))?;
+        Ok(sock)
+    }
+}
+
 /// A curve-authenticated peer-to-peer session transport.
 pub struct OmqPeerTransport {
     /// The CURVE allow-list's handler (CURVE only). Dropped, and its thread joined, with
@@ -186,6 +224,8 @@ pub struct OmqPeerTransport {
     listener: zmq::Socket,
     /// Outbound PUSH sockets keyed by peer committee index.
     peers: BTreeMap<u16, zmq::Socket>,
+    /// What each outbound socket was made from, to make it again (see [`Self::send_peer`]).
+    redial: Redial,
     /// Message-authentication context (S4). `None` only on the curve-less
     /// plumbing test path; **production must set it** via [`Self::with_auth`].
     auth: Option<MeshAuth>,
@@ -244,30 +284,45 @@ impl OmqPeerTransport {
             .map_err(|e| MeshError::Io(format!("bind {}: {e}", cfg.listen_endpoint)))?;
 
         // Outbound: one PUSH per peer, curve client with the peer's key pinned.
+        let redial = Redial {
+            use_curve: cfg.use_curve,
+            self_curve_public: cfg.self_curve_public,
+            self_curve_secret: cfg.self_curve_secret,
+            peers: cfg.peers.iter().map(|p| (p.index, p.clone())).collect(),
+            last: BTreeMap::new(),
+        };
         let mut peers = BTreeMap::new();
         for p in &cfg.peers {
-            let sock = ctx
-                .socket(zmq::PUSH)
-                .map_err(|e| MeshError::Io(format!("push socket: {e}")))?;
-            if cfg.use_curve {
-                sock.set_curve_serverkey(&p.curve_pubkey)
-                    .map_err(|e| MeshError::Io(format!("curve_serverkey: {e}")))?;
-                sock.set_curve_publickey(&cfg.self_curve_public)
-                    .map_err(|e| MeshError::Io(format!("curve_publickey: {e}")))?;
-                sock.set_curve_secretkey(&cfg.self_curve_secret)
-                    .map_err(|e| MeshError::Io(format!("curve_secretkey: {e}")))?;
-            }
-            // Don't block a broadcast on a slow/absent peer; drop instead.
-            sock.set_sndtimeo(0)
-                .map_err(|e| MeshError::Io(format!("sndtimeo: {e}")))?;
-            sock.set_linger(0)
-                .map_err(|e| MeshError::Io(format!("linger: {e}")))?;
-            sock.connect(&p.endpoint)
-                .map_err(|e| MeshError::Io(format!("connect {}: {e}", p.endpoint)))?;
-            peers.insert(p.index, sock);
+            peers.insert(p.index, redial.dial(&ctx, p)?);
         }
 
-        Ok(OmqPeerTransport { _zap: zap, _ctx: ctx, listener, peers, auth: None })
+        Ok(OmqPeerTransport { _zap: zap, _ctx: ctx, listener, peers, redial, auth: None })
+    }
+
+    /// Hand one frame to peer `idx`. A full queue means the connection has not taken anything
+    /// for a while. A peer that restarted on the same port can leave it so for good: the
+    /// connection was refused by the process that held the port before (another committee's
+    /// allow-list), and it does not recover once the new one listens. So the socket is made
+    /// again — at most every [`REDIAL_AFTER`] per peer, the frames queued in it dropped (they
+    /// are resent on schedule) — and the frame tried once more on the new one.
+    fn send_peer(&mut self, idx: u16, bytes: &[u8]) -> Result<(), String> {
+        let Some(sock) = self.peers.get(&idx) else { return Err("unknown peer".into()) };
+        match Self::send_frame(sock, bytes) {
+            Err(why) if why.starts_with("its send queue is full") => {
+                let due = self.redial.last.get(&idx).is_none_or(|t| t.elapsed() >= REDIAL_AFTER);
+                let Some(p) = self.redial.peers.get(&idx).cloned().filter(|_| due) else { return Err(why) };
+                self.redial.last.insert(idx, std::time::Instant::now());
+                match self.redial.dial(&self._ctx, &p) {
+                    Ok(fresh) => {
+                        self.peers.insert(idx, fresh);
+                        let sock = self.peers.get(&idx).expect("just inserted");
+                        Self::send_frame(sock, bytes).map_err(|e| format!("{why}; connected again, and {e}"))
+                    }
+                    Err(e) => Err(format!("{why}; connecting again failed: {e:?}")),
+                }
+            }
+            other => other,
+        }
     }
 
     /// Serialize a message for the wire: signed frame (`canonical ‖ sig`) when
@@ -311,10 +366,10 @@ impl SessionTransport for OmqPeerTransport {
     /// frame must not keep it from the peers after it in the map.
     fn broadcast(&mut self, msg: &WireMsg) -> Result<(), MeshError> {
         let bytes = self.frame_out(msg)?;
-        let failed: Vec<(u16, String)> = self
-            .peers
-            .iter()
-            .filter_map(|(idx, sock)| Self::send_frame(sock, &bytes).err().map(|why| (*idx, why)))
+        let indices: Vec<u16> = self.peers.keys().copied().collect();
+        let failed: Vec<(u16, String)> = indices
+            .into_iter()
+            .filter_map(|idx| self.send_peer(idx, &bytes).err().map(|why| (idx, why)))
             .collect();
         if failed.is_empty() {
             Ok(())
@@ -325,8 +380,10 @@ impl SessionTransport for OmqPeerTransport {
 
     fn send_to(&mut self, peer_index: u16, msg: &WireMsg) -> Result<(), MeshError> {
         let bytes = self.frame_out(msg)?;
-        let sock = self.peers.get(&peer_index).ok_or(MeshError::UnknownPeer(peer_index))?;
-        Self::send_frame(sock, &bytes).map_err(|why| MeshError::Undelivered(vec![(peer_index, why)]))
+        if !self.peers.contains_key(&peer_index) {
+            return Err(MeshError::UnknownPeer(peer_index));
+        }
+        self.send_peer(peer_index, &bytes).map_err(|why| MeshError::Undelivered(vec![(peer_index, why)]))
     }
 
     fn poll(&mut self) -> Result<Option<WireMsg>, MeshError> {
@@ -418,7 +475,8 @@ mod tests {
 
     /// A peer that is down must not cost the others their frames, and must not be passed
     /// off as delivered. Peer 1 has no listener, so once its queue is full (the ZMQ
-    /// high-water mark, 1000 frames) every frame to it is refused; peer 2 is up. Before,
+    /// high-water mark, 1000 frames) its connection is made again once, and once that
+    /// queue is full too every frame to it is refused; peer 2 is up. Before,
     /// a refused frame was reported as sent (EAGAIN -> Ok), and any other send error
     /// returned from the broadcast before it reached the peers after it.
     #[test]
@@ -446,7 +504,7 @@ mod tests {
         .expect("bind b");
         std::thread::sleep(std::time::Duration::from_millis(300));
 
-        let frames = 1200;
+        let frames = 2200;
         let mut refused = 0;
         let mut got = 0;
         for _ in 0..frames {
@@ -517,6 +575,56 @@ mod tests {
         }
         assert!(from.contains(&1), "the committee peer's frames arrive");
         assert!(!from.contains(&2), "the stranger's never do");
+    }
+
+    /// A peer restarted on the same port, on a key of a committee the sender belongs to, gets
+    /// the sender's frames again. The process that held the port before allowed another
+    /// committee, which did not include the sender: its connection was refused there, and
+    /// on its own it stays refused after the new process listens. (Found on the devnet: one
+    /// member never reached another after both moved to a new key, until both restarted.)
+    #[test]
+    #[ignore = "binds real ZMQ sockets on localhost; needs libzmq+libsodium"]
+    fn a_peer_restarted_on_its_port_is_reached_again() {
+        if zmq::CurveKeyPair::new().is_err() {
+            eprintln!("SKIP: linked libzmq has no CURVE support");
+            return;
+        }
+        let (a, b, other) = (zmq::CurveKeyPair::new().unwrap(), zmq::CurveKeyPair::new().unwrap(), zmq::CurveKeyPair::new().unwrap());
+        let ep = |p: u16| format!("tcp://127.0.0.1:{p}");
+        let peer = |index: u16, port: u16, k: &zmq::CurveKeyPair| PeerAddr {
+            index,
+            endpoint: ep(port),
+            curve_pubkey: k.public_key,
+            signer_ed25519: [0; 32],
+        };
+        // B's old process: its committee is B and `other`, not A.
+        let old_b = curve_node(1, 55851, &b, vec![peer(2, 55852, &other)]);
+        let mut ta = curve_node(0, 55850, &a, vec![peer(1, 55851, &b)]);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        for _ in 0..5 {
+            let _ = ta.broadcast(&wire(0, SessionMsg::Ack));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // B restarts on its new key's committee, A and B, on the same port.
+        drop(old_b);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut new_b = curve_node(1, 55851, &b, vec![peer(0, 55850, &a)]);
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let mut got = 0;
+        for _ in 0..2500 {
+            let _ = ta.broadcast(&wire(0, SessionMsg::Ack));
+            while let Ok(Some(_)) = new_b.poll() {
+                got += 1;
+            }
+            if got > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        while poll_until(&mut new_b).is_some() {
+            got += 1;
+        }
+        assert!(got > 0, "the restarted peer is reached again");
     }
 
     /// A frame over MAX_FRAME_BYTES is refused before it is held in memory, and the
