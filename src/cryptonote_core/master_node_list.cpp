@@ -2860,6 +2860,46 @@ namespace master_nodes
                                        get_bridge_standby_liveness(), height, reason);
   }
 
+  bool check_bridge_owner_change(const std::vector<bridge_key_attestation_record> &records,
+                                 const cryptonote::gateway_owner_key_v &current,
+                                 const cryptonote::gateway_owner_key_v &next,
+                                 cryptonote::network_type nettype,
+                                 std::string &reason)
+  {
+    if (current == next)
+      return true;
+    const auto *next_vk = std::get_if<crypto::eddsa_public_key>(&next);
+    if (!next_vk)
+    {
+      reason = "the bridge gateway's new owner must be a committee (eddsa) key";
+      return false;
+    }
+    const auto n = find_attested_bridge_key(records, *next_vk);
+    if (!n)
+    {
+      reason = "the bridge gateway's new owner key has no committee attestation: its committee must attest it first";
+      return false;
+    }
+    if (const auto *cur_vk = std::get_if<crypto::eddsa_public_key>(&current))
+    {
+      const auto c = find_attested_bridge_key(records, *cur_vk);
+      if (c && n->committee_height(nettype) <= c->committee_height(nettype))
+      {
+        reason = "the bridge gateway's new owner key is from a committee (height " + std::to_string(n->committee_height(nettype))
+                 + ") no newer than its current owner's (height " + std::to_string(c->committee_height(nettype)) + ")";
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool master_node_list::check_owner_change(const cryptonote::gateway_owner_key_v &current,
+                                            const cryptonote::gateway_owner_key_v &next,
+                                            std::string &reason) const
+  {
+    return check_bridge_owner_change(get_bridge_key_attestations(), current, next, m_blockchain.nettype(), reason);
+  }
+
   bool check_bridge_standby_naming(const std::vector<bridge_key_attestation_record> &records,
                                    const cryptonote::gateway_owner_key_v &owner,
                                    const cryptonote::gateway_owner_key_v &standby,

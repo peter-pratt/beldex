@@ -387,6 +387,16 @@ namespace master_nodes
       uint64_t height,
       cryptonote::network_type nettype,
       const bridge_record_overlap_fn& overlap);
+  // The owner-change rule for the bridge gateway over attestation `records`: a new owner is a
+  // committee (eddsa) key consensus counts as attested, by a committee newer than the current
+  // owner's when that one is attested too. So the gateway only ever moves to a key a committee
+  // made and every node can see, never to one only its outgoing owner vouches for, and never
+  // back to an older committee's.
+  bool check_bridge_owner_change(const std::vector<bridge_key_attestation_record>& records,
+                                 const cryptonote::gateway_owner_key_v& current,
+                                 const cryptonote::gateway_owner_key_v& next,
+                                 cryptonote::network_type nettype,
+                                 std::string& reason);
   // The standby-naming rule over attestation `records`: owner and standby are attested keys
   // whose committees share at most size - threshold members, and a round's key is named only if
   // it is the first waiting (first_waiting_bridge_key): rounds racing do not get to choose.
@@ -779,6 +789,10 @@ namespace master_nodes
     std::optional<bridge_key_attestation_record> attested_bridge_key(const crypto::eddsa_public_key& pgw_vk) const;
     /// HF23: whether `gateway_id` is THE bridge gateway (whose owner changes are hand-overs).
     bool is_bridge_gateway(const crypto::public_key& gateway_id) const;
+    /// HF23: may the bridge gateway's owner move from `current` to `next`? (check_bridge_owner_change)
+    bool check_owner_change(const cryptonote::gateway_owner_key_v& current,
+                            const cryptonote::gateway_owner_key_v& next,
+                            std::string& reason) const;
     /// HF23: may the bridge gateway, owned by `owner`, name `standby`? Both must be attested
     /// keys, and their committees may share at most size - threshold members: then losing
     /// enough of the live key's holders to silence it can never also silence the standby.

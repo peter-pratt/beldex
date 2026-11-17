@@ -2750,6 +2750,7 @@ namespace
 {
   using master_nodes::bridge_key_attestation_record;
   using master_nodes::check_bridge_standby_naming;
+  using master_nodes::check_bridge_owner_change;
   using master_nodes::find_attested_bridge_key;
   using master_nodes::bridge_committee_operator_overlap;
 
@@ -2910,6 +2911,43 @@ TEST(GatewayBridgeKeyAttestation, a_standby_needs_attested_keys_from_committees_
   records.push_back(rec(next, 3, 15));
   EXPECT_EQ(find_attested_bridge_key(records, next)->epoch, 3u);
   EXPECT_FALSE(check_bridge_standby_naming(records, live, next, NET_FC, overlap, {}, 0, reason));
+}
+
+TEST(GatewayBridgeKeyAttestation, the_gateway_owner_moves_only_to_a_newer_committees_attested_key)
+{
+  const crypto::eddsa_public_key live = new_vk(), next = new_vk();
+  auto rec = [](const crypto::eddsa_public_key& vk, uint64_t epoch, uint64_t height) {
+    bridge_key_attestation_record r{};
+    r.pgw_vk = vk; r.epoch = epoch; r.attested_height = height;
+    return r;
+  };
+  std::string reason;
+  std::vector<bridge_key_attestation_record> records{rec(live, 1, 10)};
+
+  // Restating the same owner is no change.
+  EXPECT_TRUE(check_bridge_owner_change(records, live, live, NET_FC, reason)) << reason;
+
+  // A key no committee attested, or one still collecting.
+  EXPECT_FALSE(check_bridge_owner_change(records, live, next, NET_FC, reason));
+  EXPECT_NE(reason.find("no committee attestation"), std::string::npos) << reason;
+  records.push_back(rec(next, 2, 0));
+  EXPECT_FALSE(check_bridge_owner_change(records, live, next, NET_FC, reason));
+
+  // Attested by the next committee: the hand-over goes through.
+  records.back().attested_height = 20;
+  EXPECT_TRUE(check_bridge_owner_change(records, live, next, NET_FC, reason)) << reason;
+
+  // Never back to an older committee's key, and never to a key that is not a committee's.
+  EXPECT_FALSE(check_bridge_owner_change(records, next, live, NET_FC, reason));
+  EXPECT_NE(reason.find("no newer"), std::string::npos) << reason;
+  EXPECT_FALSE(check_bridge_owner_change(records, live, rand_pubkey(), NET_FC, reason));
+  EXPECT_NE(reason.find("eddsa"), std::string::npos) << reason;
+
+  // An owner no committee attested (registered before any attestation): the new key must
+  // still be attested.
+  const crypto::eddsa_public_key bare = new_vk();
+  EXPECT_TRUE(check_bridge_owner_change(records, bare, next, NET_FC, reason)) << reason;
+  EXPECT_FALSE(check_bridge_owner_change(records, bare, new_vk(), NET_FC, reason));
 }
 
 // The signer builds this message itself (bridge/signer/src/key_attestation.rs): pin its layout.

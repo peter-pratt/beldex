@@ -3574,6 +3574,28 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
     }
   }
 
+  // HF23: the bridge gateway's owner moves only to a key consensus counts as a newer
+  // committee's (master_node_list::check_owner_change): a hand-over or a takeover's completion,
+  // never a key only the outgoing owner vouches for. (A governance repoint is its own path.)
+  if (hf_version >= hf::hf23_bridge)
+  {
+    tx_extra_gateway_descriptor_operation op{};
+    if (cryptonote::get_field_from_tx_extra(tx.extra, op) && op.op_type == gateway_descriptor_op_type::update_address
+        && m_master_node_list.is_bridge_gateway(op.address_id))
+    {
+      gateway_account_data acct;
+      std::string owner_reason;
+      if (load_gateway_account(*m_db, op.address_id, acct) && !acct.descriptor_history.empty()
+          && !m_master_node_list.check_owner_change(acct.latest_descriptor().owner_key, op.descriptor.owner_key, owner_reason))
+      {
+        MERROR_VER("Bridge gateway owner change refused for tx " << get_transaction_hash(tx) << ": " << owner_reason);
+        tvc.m_verbose_error = std::move(owner_reason);
+        tvc.m_verifivation_failed = true;
+        return false;
+      }
+    }
+  }
+
   if (tx.is_transfer())
   {
     // A tx whose outputs are ALL gateway deposits (e.g. an exchange sweep) needs
