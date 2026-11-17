@@ -332,7 +332,9 @@ omq_rpc::omq_rpc(cryptonote::core& core, core_rpc_server& rpc, const boost::prog
 
   // Phase I mint-payload bus. A committee signer publishes its completed, already-signed
   // wBDX mint payload here and the daemon fans it out to subscribed relayers, so relaying
-  // needs no access to a signer host, its logs, or its filesystem.
+  // needs no access to a signer host, its logs, or its filesystem. The key hand-off's
+  // rotateSigner and activateRotation (`rotate` / `activate`) travel the same way, and so
+  // does the outgoing committee's signature over the gateway hand-over (`handover`).
   //
   // **Only a seated committee member may publish**, proven cryptographically: the publisher
   // signs `BRIDGE_MINT_PUBLISH ‖ genesis ‖ payload` with the `signer_ed25519` consensus
@@ -1037,20 +1039,54 @@ void omq_rpc::on_bridge_mint_payload(oxenmq::Message& m)
     publisher_mn = pk;
   }
 
-  // Well-formedness + the dedup key.
-  std::string beldex_txid;
-  uint32_t output_index = 0;
+  // Well-formedness + the dedup key. Besides mints the bus carries the key hand-off's two
+  // EVM calls, which a relayer sends the same way: `rotate` (the outgoing committee's
+  // rotateSigner) and `activate` (the incoming committee's activateRotation), the gateway
+  // hand-over's signature (`handover`), the completed rotation acknowledgement (`ack`), and the
+  // standby's EVM calls, sent by the relayer too: `set_standby` (the live committee names its
+  // standby) and `takeover_begin` / `takeover_complete` / `takeover_cancel`.
+  // Each is one per rotation or step, however many members publish it.
+  std::string key, kind;
   try {
     const auto j = nlohmann::json::parse(payload);
-    if (j.value("kind", "") != "mint") {
-      m.send_reply(OMQ_BAD_REQUEST, "bridge.mint_payload: not a mint payload");
+    kind = j.value("kind", "");
+    // An `ack` carries the daemon-checked evidence (rotation_hex) instead of a signature.
+    if (j.value(kind == "ack" ? "rotation_hex" : "sig", "").empty()) {
+      m.send_reply(OMQ_BAD_REQUEST, kind == "ack" ? "bridge.mint_payload: missing rotation_hex" : "bridge.mint_payload: missing sig");
       return;
     }
-    beldex_txid = j.value("beldex_txid", "");
-    if (j.contains("output_index"))
-      output_index = j.at("output_index").get<uint32_t>();
-    if (beldex_txid.empty() || j.value("sig", "").empty()) {
-      m.send_reply(OMQ_BAD_REQUEST, "bridge.mint_payload: missing beldex_txid or sig");
+    const auto num = [&](const char* f) { return std::to_string(j.at(f).get<uint64_t>()); };
+    if (kind == "mint") {
+      const std::string beldex_txid = j.value("beldex_txid", "");
+      uint32_t output_index = 0;
+      if (j.contains("output_index"))
+        output_index = j.at("output_index").get<uint32_t>();
+      if (beldex_txid.empty()) {
+        m.send_reply(OMQ_BAD_REQUEST, "bridge.mint_payload: missing beldex_txid or sig");
+        return;
+      }
+      key = beldex_txid + ":" + std::to_string(output_index);
+    } else if (kind == "rotate") {
+      // The signer is part of the key: a payload for the same epoch but another key must
+      // not suppress the real one.
+      key = "rotate:" + num("chain_id") + ":" + num("new_key_epoch") + ":" + num("nonce") + ":" +
+            j.value("new_signer", "");
+    } else if (kind == "activate") {
+      key = "activate:" + num("chain_id") + ":" + num("pending_key_epoch") + ":" + j.value("pending_signer", "");
+    } else if (kind == "handover") {
+      // The outgoing committee's Pgw signature over a gateway hand-over, for the submitter
+      // whose wallet built it.
+      key = "handover:" + j.value("gateway_id", "") + ":" + j.value("owner", "") + ":" + j.value("hash_to_sign", "");
+    } else if (kind == "ack") {
+      // A completed rotation acknowledgement, for whoever pays to put it on chain.
+      key = "ack:" + num("chain_id") + ":" + num("key_epoch");
+    } else if (kind == "set_standby" || kind == "takeover_begin" || kind == "takeover_complete"
+               || kind == "takeover_cancel") {
+      // A standby step: its signature is single-use on chain, so it names the step.
+      key = kind + ":" + num("chain_id") + ":" + j.value("sig", "");
+    } else {
+      m.send_reply(OMQ_BAD_REQUEST,
+                   "bridge.mint_payload: not a mint, rotate, activate, handover, ack, set_standby or takeover payload");
       return;
     }
   } catch (const std::exception& e) {
@@ -1103,7 +1139,6 @@ void omq_rpc::on_bridge_mint_payload(oxenmq::Message& m)
   // the first delivery with no second one. The quiet period is well under the signers'
   // re-delivery interval. The retained window doubles as the replay-on-subscribe backlog
   // (see the header comment).
-  const std::string key = beldex_txid + ":" + std::to_string(output_index);
   bool refan = false;
   {
     constexpr size_t MAX_RETAINED = 256; // ≤ 8 KiB each → ≤ 2 MiB worst case
@@ -1135,7 +1170,7 @@ void omq_rpc::on_bridge_mint_payload(oxenmq::Message& m)
     ++sent;
   });
   MGINFO("bridge.mint_payload: committee index " << publisher_index
-         << (refan ? " re-delivered" : " published") << " mint for " << key << "; fanned out to "
+         << (refan ? " re-delivered" : " published") << " " << kind << " for " << key << "; fanned out to "
          << sent << " subscriber(s)");
   m.send_reply(OMQ_OK, std::to_string(sent));
 }
