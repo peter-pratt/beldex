@@ -4564,13 +4564,24 @@ namespace cryptonote::rpc {
       auto members = json::array();
       for (const auto& pk : r.members)
         members.push_back(tools::type_to_hex(pk));
+      auto checked_in = json::array();
+      for (const auto& pk : r.checked_in)
+        checked_in.push_back(tools::type_to_hex(pk));
       rounds.push_back(json{{"round", master_nodes::bridge_standby_round_at(nettype, r.round_height).value_or(0)},
                             {"round_height", r.round_height},
+                            {"checkin_end", r.round_height + cryptonote::bridge_standby_round_checkin_blocks(nettype)},
                             {"window_end", r.round_height + cryptonote::bridge_standby_round_window_blocks(nettype)},
-                            {"members", std::move(members)}});
+                            {"members", std::move(members)},
+                            {"checked_in", std::move(checked_in)}});
     }
     cmd.response["standby_rounds"] = std::move(rounds);
     cmd.response["standby_round_window"] = cryptonote::bridge_standby_round_window_blocks(nettype);
+    cmd.response["standby_round_checkin"] = cryptonote::bridge_standby_round_checkin_blocks(nettype);
+    cmd.response["standby_round_min_members"] = cryptonote::bridge_standby_round_min_members(nettype);
+    auto missed = json::array();
+    for (const auto& m : mnl.get_bridge_standby_missed_checkins())
+      missed.push_back(json{{"master_node", tools::type_to_hex(m.mn)}, {"round_height", m.round_height}});
+    cmd.response["standby_missed_checkins"] = std::move(missed);
     cmd.response["height"] = top ? top - 1 : 0;
     if (owner_record)
       if (const auto waiting = mnl.first_waiting_standby_key(*owner_record))

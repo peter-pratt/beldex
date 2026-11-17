@@ -1149,12 +1149,13 @@ KV_SERIALIZE_MAP_CODE_END()
 
 KV_SERIALIZE_MAP_CODE_BEGIN(BRIDGE_KEY_ATTESTATION::request)
   KV_SERIALIZE(epoch);
-  KV_SERIALIZE(pgw_vk);
-  KV_SERIALIZE(pevm_address);
+  KV_SERIALIZE_OPT(pgw_vk, std::string{})
+  KV_SERIALIZE_OPT(pevm_address, std::string{})
   KV_SERIALIZE(voter_index);
   KV_SERIALIZE(signature);
   KV_SERIALIZE_OPT(priority, (uint32_t)0)
   KV_SERIALIZE_OPT(round_height, (uint64_t)0)
+  KV_SERIALIZE_OPT(check_in, false)
 KV_SERIALIZE_MAP_CODE_END()
 
 KV_SERIALIZE_MAP_CODE_BEGIN(BRIDGE_KEY_ATTESTATION::response)

@@ -3521,7 +3521,9 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
       std::vector<crypto::ed25519_public_key> signer_keys;
       size_t threshold = 0;
       std::string att_reason;
-      if (att.version >= 1)
+      if (att.version == BRIDGE_STANDBY_CHECKIN_VERSION)
+        m_master_node_list.check_bridge_standby_checkin(att, members, signer_keys, att_reason);
+      else if (att.version >= 1)
         m_master_node_list.check_bridge_standby_attestation(att, members, signer_keys, att_reason);
       else if (!m_master_node_list.get_bridge_committee(epoch_height, members, signer_keys, threshold))
         att_reason = "no bridge committee for epoch " + std::to_string(att.epoch);
@@ -3529,7 +3531,7 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
         { /* reason set above */ }
       else if (!cryptonote::verify_bridge_key_attestation(att, signer_keys, m_nettype, att_reason))
         { /* reason set by the verifier */ }
-      else if (m_master_node_list.has_bridge_key_attestation_vote(att))
+      else if (att.version != BRIDGE_STANDBY_CHECKIN_VERSION && m_master_node_list.has_bridge_key_attestation_vote(att))
         att_reason = "this member's attestation of that key is already recorded";
       if (!att_reason.empty())
       {

@@ -883,8 +883,15 @@ namespace cryptonote
   // a standby's, which must not share too many members with it.
   //
   // Version 1 is a standby round's committee speaking: `round_height` is the round's start and
-  // `voter_index` an index in that round's committee. It counts only within the round's window
-  // (bridge_standby_round_window_blocks), so a committee can never be picked after the fact.
+  // `voter_index` an index among the round's members that checked in. It counts only within the
+  // round's window (bridge_standby_round_window_blocks), once check-ins have closed, so a
+  // committee can never be picked after the fact.
+  //
+  // Version 2 is a round member's check-in, before any key exists: "my signer is running and
+  // will take part". `round_height` is the round's start, `voter_index` an index in the round's
+  // drawn committee, and the keys are empty. It counts only within the round's first
+  // bridge_standby_round_checkin_blocks; the members that checked in then generate the key.
+  constexpr uint8_t BRIDGE_STANDBY_CHECKIN_VERSION = 2;
   struct tx_extra_bridge_key_attestation
   {
     uint8_t                   version = 0;

@@ -3259,13 +3259,16 @@ namespace {
     require_open();
     BRIDGE_KEY_ATTESTATION::response res{};
     cryptonote::tx_extra_bridge_key_attestation att{};
-    att.version = req.round_height ? 1 : 0;
+    att.version = req.check_in ? cryptonote::BRIDGE_STANDBY_CHECKIN_VERSION : req.round_height ? 1 : 0;
     att.round_height = req.round_height;
     att.epoch = req.epoch;
     att.voter_index = req.voter_index;
-    if (!tools::hex_to_type(req.pgw_vk, att.pgw_vk))
+    if (req.check_in && !req.round_height)
+      throw wallet_rpc_error{error_code::WRONG_KEY, "a check-in needs the round_height of its standby round"};
+    // A check-in comes before any key: it names none.
+    if (!req.check_in && !tools::hex_to_type(req.pgw_vk, att.pgw_vk))
       throw wallet_rpc_error{error_code::WRONG_KEY, "pgw_vk must be 64-char hex"};
-    if (!tools::hex_to_type(req.pevm_address, att.pevm_address))
+    if (!req.check_in && !tools::hex_to_type(req.pevm_address, att.pevm_address))
       throw wallet_rpc_error{error_code::WRONG_KEY, "pevm_address must be 40-char hex"};
     if (!tools::hex_to_type(req.signature, att.signature))
       throw wallet_rpc_error{error_code::WRONG_SIGNATURE, "signature must be 128-char hex"};

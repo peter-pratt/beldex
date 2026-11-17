@@ -374,7 +374,8 @@ uint64_t gateway_standby_alive_height(network_type nettype, uint64_t chain_heigh
 std::string bridge_key_attestation_message(network_type nettype, const tx_extra_bridge_key_attestation& att)
 {
   // DOMAIN || genesis(32) || version(u8) || epoch(u64 LE) || pgw_vk(32) || pevm_address(20),
-  // and for version >= 1 || round_height(u64 LE).
+  // and for version >= 1 || round_height(u64 LE). A check-in (version 2) has empty keys; its
+  // version byte keeps it from ever reading as an attestation.
   // The voter is not in it: every member signs the same statement.
   const crypto::hash& genesis = gateway_chain_binding(nettype);
   std::string buf;
@@ -393,13 +394,14 @@ bool verify_bridge_key_attestation(const tx_extra_bridge_key_attestation& att,
                                    const std::vector<crypto::ed25519_public_key>& signer_keys,
                                    network_type nettype, std::string& reason)
 {
-  if (att.version > 1)
+  if (att.version > BRIDGE_STANDBY_CHECKIN_VERSION)
   {
     reason = "unknown key attestation version";
     return false;
   }
-  // A round's attestation names the epoch its round is in, so the two can never disagree.
-  if (att.version == 1 && (att.round_height == 0 || att.epoch != att.round_height / bridge_epoch_blocks(nettype)))
+  // A round's attestation or check-in names the epoch its round is in, so the two can never
+  // disagree.
+  if (att.version >= 1 && (att.round_height == 0 || att.epoch != att.round_height / bridge_epoch_blocks(nettype)))
   {
     reason = "key attestation of standby round " + std::to_string(att.round_height) + " names epoch "
              + std::to_string(att.epoch);
@@ -411,9 +413,11 @@ bool verify_bridge_key_attestation(const tx_extra_bridge_key_attestation& att,
              + std::to_string(att.epoch);
     return false;
   }
-  if (!att.pgw_vk || !att.pevm_address)
+  // A check-in comes before any key: it names none. Anything else must name one.
+  const bool checkin = att.version == BRIDGE_STANDBY_CHECKIN_VERSION;
+  if (checkin ? (att.pgw_vk || att.pevm_address) : (!att.pgw_vk || !att.pevm_address))
   {
-    reason = "key attestation names an empty key";
+    reason = checkin ? "a standby round check-in names a key" : "key attestation names an empty key";
     return false;
   }
   const std::string msg = bridge_key_attestation_message(nettype, att);

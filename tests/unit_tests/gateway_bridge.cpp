@@ -38,6 +38,7 @@
 #include <memory>
 #include <set>
 #include <algorithm>
+#include <numeric>
 #include <optional>
 #include <unordered_set>
 #include <sodium/crypto_sign.h> // ed25519 keypair/sign for the slash-evidence test
@@ -478,7 +479,19 @@ namespace
       crypto_sign_ed25519_keypair(ep.data, es.data);
       c.ed_pub.push_back(ep); c.ed_sec.push_back(es);
     }
-    return c;
+    // Sorted by master node key, as consensus keeps a committee, the three lists together: a
+    // member's index is then the same in each, and in any subset kept in that order.
+    std::vector<size_t> order(n);
+    std::iota(order.begin(), order.end(), size_t{0});
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return c.mn[a] < c.mn[b]; });
+    committee_keys sorted;
+    for (size_t i : order)
+    {
+      sorted.mn.push_back(c.mn[i]);
+      sorted.ed_pub.push_back(c.ed_pub[i]);
+      sorted.ed_sec.push_back(c.ed_sec[i]);
+    }
+    return sorted;
   }
 
   // Insert a registered (optionally seated) bridge seat into `st`.
@@ -3514,11 +3527,13 @@ TEST(GatewayStandbyRounds, rounds_and_record_committees_survive_state_serializat
 {
   master_node_list::state_serialized s{};
   s.version = master_node_list::state_serialized::get_version(hf::hf23_bridge);
-  ASSERT_EQ(s.version, master_node_list::state_serialized::version_t::version_8_bridge_standby_rounds);
+  ASSERT_EQ(s.version, master_node_list::state_serialized::version_t::version_9_bridge_standby_checkins);
   master_nodes::bridge_standby_round round{};
   round.round_height = 130;
   round.members = {rand_pubkey(), rand_pubkey()};
   s.bridge_standby_rounds.push_back(round);
+  s.bridge_standby_round_checkins.push_back({130, {round.members[1]}});
+  s.bridge_standby_missed_checkins.push_back({round.members[0], 130});
   bridge_key_attestation_record r{};
   r.pgw_vk = new_vk();
   s.bridge_key_attestations.push_back(r);
@@ -3533,6 +3548,20 @@ TEST(GatewayStandbyRounds, rounds_and_record_committees_survive_state_serializat
   EXPECT_EQ(got.bridge_key_attestation_committees[0].round_height, 130u);
   EXPECT_EQ(got.bridge_key_attestation_committees[0].members, round.members);
   ASSERT_EQ(got.bridge_key_attestations.size(), 1u);
+  ASSERT_EQ(got.bridge_standby_round_checkins.size(), 1u);
+  EXPECT_EQ(got.bridge_standby_round_checkins[0].round_height, 130u);
+  EXPECT_EQ(got.bridge_standby_round_checkins[0].checked_in, std::vector<crypto::public_key>{round.members[1]});
+  ASSERT_EQ(got.bridge_standby_missed_checkins.size(), 1u);
+  EXPECT_EQ(got.bridge_standby_missed_checkins[0].mn, round.members[0]);
+  EXPECT_EQ(got.bridge_standby_missed_checkins[0].round_height, 130u);
+
+  // A state saved before check-ins loads with none, and its rounds as they were.
+  s.version = master_node_list::state_serialized::version_t::version_8_bridge_standby_rounds;
+  master_node_list::state_serialized before_checkins{};
+  ASSERT_NO_THROW(serialization::parse_binary(serialization::dump_binary(s), before_checkins));
+  EXPECT_EQ(before_checkins.bridge_standby_rounds.size(), 1u);
+  EXPECT_TRUE(before_checkins.bridge_standby_round_checkins.empty());
+  EXPECT_TRUE(before_checkins.bridge_standby_missed_checkins.empty());
 
   // A state saved before rounds loads with none, and its records keep their old layout.
   s.version = master_node_list::state_serialized::version_t::version_7_bridge_standby_liveness;
@@ -3577,13 +3606,31 @@ namespace
     return cur.process_bridge_key_attestation_tx(NET_FC, blk, tx, none);
   }
 
-  // A state where `c` are seated and are the committee of the standby round at `round_height`.
+  // A state where `c` are seated and are the committee of the standby round at `round_height`,
+  // all of them checked in (as after its check-in blocks): attestation indices are then theirs.
   void open_round(master_node_list::state_t& cur, const committee_keys& c, uint64_t round_height)
   {
     for (size_t i = 0; i < c.mn.size(); ++i)
       seat_member(cur, c.mn[i], c.ed_pub[i], 1);
-    cur.bridge_standby_rounds.push_back(master_nodes::bridge_standby_round{round_height, c.mn});
+    cur.bridge_standby_rounds.push_back(master_nodes::bridge_standby_round{round_height, c.mn, c.mn});
   }
+
+  // Member `voter` of the round at `round_height` checking in (key attestation version 2).
+  tx_extra_bridge_key_attestation sign_checkin(const committee_keys& c, uint16_t voter, uint64_t round_height)
+  {
+    tx_extra_bridge_key_attestation att{};
+    att.version = BRIDGE_STANDBY_CHECKIN_VERSION;
+    att.round_height = round_height;
+    att.epoch = round_height / bridge_epoch_blocks(NET_FC);
+    att.voter_index = voter;
+    const std::string msg = bridge_key_attestation_message(NET_FC, att);
+    crypto_sign_detached(att.signature.data, nullptr, reinterpret_cast<const unsigned char*>(msg.data()), msg.size(),
+                         c.ed_sec[voter].data);
+    return att;
+  }
+
+  // The first block after a round's check-ins: an attestation is no earlier.
+  uint64_t after_checkins(uint64_t round_height) { return round_height + bridge_standby_round_checkin_blocks(NET_FC) + 1; }
 
   master_nodes::bridge_record_overlap_fn overlap_of(const master_node_list::state_t& cur)
   {
@@ -3637,7 +3684,7 @@ TEST(GatewayStandbyRounds, the_attestation_format_and_message_carry_the_round)
   no_round.round_height = 0;
   EXPECT_FALSE(verify_bridge_key_attestation(no_round, c.ed_pub, NET_FC, reason));
   auto future = att;
-  future.version = 2;
+  future.version = BRIDGE_STANDBY_CHECKIN_VERSION + 1;
   EXPECT_FALSE(verify_bridge_key_attestation(future, c.ed_pub, NET_FC, reason));
   EXPECT_NE(reason.find("unknown key attestation version"), std::string::npos) << reason;
 }
@@ -3651,11 +3698,13 @@ TEST(GatewayStandbyRounds, a_round_is_attested_only_within_its_window)
   open_round(cur, c, 130);
   const crypto::eddsa_public_key vk = new_vk();
 
-  // Too early, too late: the edges of the window.
+  // Too early, too late: the edges of the window. While the round takes check-ins its key
+  // cannot exist yet, so that is too early too.
   EXPECT_FALSE(run_round_attestation(cur, sign_round_attestation(c, 0, 130, vk), 130)) << "before the round's block is on chain";
+  EXPECT_FALSE(run_round_attestation(cur, sign_round_attestation(c, 0, 130, vk), after_checkins(130) - 1)) << "during check-ins";
   EXPECT_FALSE(run_round_attestation(cur, sign_round_attestation(c, 0, 130, vk), 130 + window + 1));
   EXPECT_TRUE(cur.bridge_key_attestations.empty());
-  EXPECT_TRUE(run_round_attestation(cur, sign_round_attestation(c, 0, 130, vk), 131));
+  EXPECT_TRUE(run_round_attestation(cur, sign_round_attestation(c, 0, 130, vk), after_checkins(130)));
   EXPECT_TRUE(run_round_attestation(cur, sign_round_attestation(c, 1, 130, vk), 130 + window));
 
   // A round that never opened, however well signed; a non-member; a forged signature; twice.
@@ -3687,17 +3736,174 @@ TEST(GatewayStandbyRounds, a_member_attests_one_key_a_round)
   const committee_keys c = make_committee(bridge_committee_size(NET_FC));
   master_node_list::state_t cur(nullptr);
   open_round(cur, c, 130);
-  cur.bridge_standby_rounds.push_back(master_nodes::bridge_standby_round{140, c.mn});
+  cur.bridge_standby_rounds.push_back(master_nodes::bridge_standby_round{140, c.mn, c.mn});
   const crypto::eddsa_public_key vk = new_vk();
+  const uint64_t at = after_checkins(130);
 
-  ASSERT_TRUE(run_round_attestation(cur, sign_round_attestation(c, 0, 130, vk), 131));
-  EXPECT_FALSE(run_round_attestation(cur, sign_round_attestation(c, 0, 130, new_vk()), 132)) << "another key";
-  EXPECT_FALSE(run_round_attestation(cur, sign_round_attestation(c, 0, 130, vk, 0x55), 132)) << "another wBDX address";
+  ASSERT_TRUE(run_round_attestation(cur, sign_round_attestation(c, 0, 130, vk), at));
+  EXPECT_FALSE(run_round_attestation(cur, sign_round_attestation(c, 0, 130, new_vk()), at + 1)) << "another key";
+  EXPECT_FALSE(run_round_attestation(cur, sign_round_attestation(c, 0, 130, vk, 0x55), at + 1)) << "another wBDX address";
   EXPECT_EQ(cur.bridge_key_attestations.size(), 1u);
   // Another member of the round may, and so may this one in another round.
-  EXPECT_TRUE(run_round_attestation(cur, sign_round_attestation(c, 1, 130, new_vk()), 132));
-  EXPECT_TRUE(run_round_attestation(cur, sign_round_attestation(c, 0, 140, new_vk()), 141));
+  EXPECT_TRUE(run_round_attestation(cur, sign_round_attestation(c, 1, 130, new_vk()), at + 1));
+  EXPECT_TRUE(run_round_attestation(cur, sign_round_attestation(c, 0, 140, new_vk()), after_checkins(140)));
   EXPECT_EQ(cur.bridge_key_attestations.size(), 3u);
+}
+
+// Check-in (attestation version 2): before a round's key exists, each member says on chain that
+// its signer is running. Only the round's first blocks take check-ins, and the members that
+// checked in are the ones that generate and attest the key.
+TEST(GatewayStandbyRounds, a_round_takes_check_ins_only_in_its_first_blocks)
+{
+  const uint64_t checkin = bridge_standby_round_checkin_blocks(NET_FC);
+  const committee_keys c = make_committee(bridge_committee_size(NET_FC));
+  master_node_list::state_t cur(nullptr);
+  for (size_t i = 0; i < c.mn.size(); ++i)
+    seat_member(cur, c.mn[i], c.ed_pub[i], 1);
+  cur.bridge_standby_rounds.push_back(master_nodes::bridge_standby_round{130, c.mn});
+
+  // It names no key, signs the round, and never reads as an attestation of one.
+  std::string reason;
+  const auto in = sign_checkin(c, 0, 130);
+  EXPECT_TRUE(verify_bridge_key_attestation(in, c.ed_pub, NET_FC, reason)) << reason;
+  auto with_key = in;
+  with_key.pgw_vk = new_vk();
+  EXPECT_FALSE(verify_bridge_key_attestation(with_key, c.ed_pub, NET_FC, reason));
+  EXPECT_NE(reason.find("names a key"), std::string::npos) << reason;
+  auto as_attestation = in;
+  as_attestation.version = 1;
+  EXPECT_FALSE(verify_bridge_key_attestation(as_attestation, c.ed_pub, NET_FC, reason)) << "signed as a check-in only";
+
+  // The round's first blocks only.
+  EXPECT_FALSE(run_round_attestation(cur, sign_checkin(c, 0, 130), 130)) << "before the round's block is on chain";
+  EXPECT_FALSE(run_round_attestation(cur, sign_checkin(c, 0, 130), 130 + checkin + 1)) << "after its check-ins";
+  EXPECT_TRUE(cur.bridge_standby_rounds[0].checked_in.empty());
+  EXPECT_TRUE(run_round_attestation(cur, sign_checkin(c, 3, 130), 131));
+  EXPECT_TRUE(run_round_attestation(cur, sign_checkin(c, 1, 130), 130 + checkin));
+
+  // A round that never opened; a non-member; a forged signature; twice.
+  EXPECT_FALSE(run_round_attestation(cur, sign_checkin(c, 0, 120), 121));
+  auto outsider = sign_checkin(c, 2, 130);
+  outsider.voter_index = static_cast<uint16_t>(c.mn.size());
+  EXPECT_FALSE(run_round_attestation(cur, outsider, 131));
+  auto forged = sign_checkin(c, 2, 130);
+  forged.voter_index = 4;
+  EXPECT_FALSE(run_round_attestation(cur, forged, 131));
+  EXPECT_FALSE(run_round_attestation(cur, sign_checkin(c, 3, 130), 131)) << "a member checks in once";
+
+  // Kept sorted, like the committee; no attestation record is made for a check-in.
+  EXPECT_EQ(cur.bridge_standby_rounds[0].checked_in, (std::vector<crypto::public_key>{c.mn[1], c.mn[3]}));
+  EXPECT_TRUE(cur.bridge_key_attestations.empty());
+}
+
+TEST(GatewayStandbyRounds, the_key_is_generated_by_the_members_that_checked_in)
+{
+  const size_t size = bridge_committee_size(NET_FC), threshold = bridge_committee_threshold(NET_FC);
+  const size_t min_members = bridge_standby_round_min_members(NET_FC);
+  ASSERT_EQ(min_members, size - 1) << "the devnet's 6 of threshold 4 may lose one member";
+  const committee_keys c = make_committee(size);
+  master_node_list::state_t cur(nullptr);
+  for (size_t i = 0; i < c.mn.size(); ++i)
+    seat_member(cur, c.mn[i], c.ed_pub[i], 1);
+  cur.bridge_standby_rounds.push_back(master_nodes::bridge_standby_round{130, c.mn});
+  cur.bridge_standby_rounds.push_back(master_nodes::bridge_standby_round{140, c.mn});
+
+  // Round 130: one member (index 2) is offline; the rest check in.
+  committee_keys in;
+  for (size_t i = 0; i < size; ++i)
+    if (i != 2)
+    {
+      ASSERT_TRUE(run_round_attestation(cur, sign_checkin(c, static_cast<uint16_t>(i), 130), 131));
+      in.mn.push_back(c.mn[i]);
+      in.ed_pub.push_back(c.ed_pub[i]);
+      in.ed_sec.push_back(c.ed_sec[i]);
+    }
+
+  // While it takes check-ins, its committee is the drawn one; after, those that checked in.
+  std::vector<crypto::public_key> got;
+  std::vector<crypto::ed25519_public_key> keys;
+  bool closed = true;
+  cur.height = 131;
+  ASSERT_TRUE(cur.bridge_round_committee(130, NET_FC, got, keys, false, &closed));
+  EXPECT_FALSE(closed);
+  EXPECT_EQ(got, c.mn);
+  cur.height = 132;
+  cur.update_bridge_standby_rounds(NET_FC, hf::hf23_bridge, 132, no_resolver);
+  ASSERT_TRUE(cur.bridge_round_committee(130, NET_FC, got, keys, false, &closed));
+  EXPECT_TRUE(closed);
+  EXPECT_EQ(got, in.mn);
+  EXPECT_EQ(keys, in.ed_pub);
+
+  // The one that missed is remembered, and it is drawn last for a while.
+  ASSERT_EQ(cur.bridge_standby_missed_checkins.size(), 1u);
+  EXPECT_EQ(cur.bridge_standby_missed_checkins[0].mn, c.mn[2]);
+  EXPECT_EQ(cur.bridge_standby_missed_checkins[0].round_height, 130u);
+
+  // The key is attested by its place among those that checked in, and the record keeps them.
+  const crypto::eddsa_public_key vk = new_vk();
+  auto beyond = sign_round_attestation(in, 0, 130, vk);
+  beyond.voter_index = static_cast<uint16_t>(in.mn.size());
+  EXPECT_FALSE(run_round_attestation(cur, beyond, after_checkins(130)));
+  EXPECT_FALSE(run_round_attestation(cur, sign_round_attestation(c, 2, 130, vk), after_checkins(130)))
+      << "index 2 is another member among those that checked in";
+  for (uint16_t i = 0; i < threshold; ++i)
+    ASSERT_TRUE(run_round_attestation(cur, sign_round_attestation(in, i, 130, vk), after_checkins(130)));
+  const auto rec = find_attested_bridge_key(cur.bridge_key_attestations, vk);
+  ASSERT_TRUE(rec);
+  EXPECT_EQ(rec->members, in.mn);
+
+  // Round 140: only the threshold check in, short of the minimum. No key may be generated.
+  for (uint16_t i = 0; i < threshold; ++i)
+    ASSERT_TRUE(run_round_attestation(cur, sign_checkin(c, i, 140), 141));
+  cur.height = 142;
+  cur.update_bridge_standby_rounds(NET_FC, hf::hf23_bridge, 142, no_resolver);
+  EXPECT_FALSE(cur.bridge_round_committee(140, NET_FC, got, keys, false, &closed));
+  EXPECT_TRUE(closed);
+  EXPECT_TRUE(got.empty());
+  std::vector<crypto::public_key> members;
+  std::vector<crypto::ed25519_public_key> signer_keys;
+  std::string reason;
+  EXPECT_FALSE(cur.check_bridge_standby_attestation(sign_round_attestation(c, 0, 140, new_vk()), after_checkins(140),
+                                                    NET_FC, members, signer_keys, reason));
+  EXPECT_NE(reason.find("only 4 of standby round 140's members checked in"), std::string::npos) << reason;
+  EXPECT_EQ(cur.bridge_standby_missed_checkins.size(), 1u + (size - threshold));
+}
+
+TEST(GatewayStandbyRounds, a_seat_that_missed_a_check_in_is_drawn_last)
+{
+  const size_t size = bridge_committee_size(NET_FC);
+  const std::unordered_set<std::string> owners{"o1", "o2", "o3", "o4", "o5", "o6"};
+  const crypto::hash seed = crypto::cn_fast_hash("seed", 4);
+  std::vector<bridge_standby_candidate> candidates;
+  for (const auto& o : owners)
+    candidates.push_back({rand_pubkey(), o});
+  for (size_t i = 0; i < 10; ++i)
+    candidates.push_back({rand_pubkey(), "n" + std::to_string(i)});
+  auto draw_with_missed = [&](size_t missed) {
+    auto cands = candidates;
+    for (size_t i = 0; i < missed; ++i)
+      cands[owners.size() + i].missed_checkin = true;
+    std::map<std::string, size_t> drawn; // "fresh", "missed", "owner"
+    for (const auto& m : draw_bridge_standby_committee(cands, owners, seed, hf::hf23_bridge, NET_FC))
+      for (const auto& c : cands)
+        if (c.mn == m)
+          ++drawn[owners.count(c.op) ? "owner" : c.missed_checkin ? "missed" : "fresh"];
+    return drawn;
+  };
+  // Enough others did not miss one: none that did is drawn.
+  EXPECT_EQ(draw_with_missed(4), (std::map<std::string, size_t>{{"fresh", size}}));
+  // Too few: every one that did not miss is drawn, then those that did, before the owner's
+  // operators: a standby apart from the owner comes first.
+  EXPECT_EQ(draw_with_missed(7), (std::map<std::string, size_t>{{"fresh", 3}, {"missed", size - 3}}));
+
+  // A miss is forgotten an epoch after its round.
+  master_node_list::state_t cur(nullptr);
+  cur.bridge_standby_missed_checkins.push_back({rand_pubkey(), 130});
+  const uint64_t forget = bridge_standby_missed_checkin_blocks(NET_FC);
+  cur.update_bridge_standby_rounds(NET_FC, hf::hf23_bridge, 130 + forget, no_resolver);
+  EXPECT_EQ(cur.bridge_standby_missed_checkins.size(), 1u);
+  cur.update_bridge_standby_rounds(NET_FC, hf::hf23_bridge, 131 + forget, no_resolver);
+  EXPECT_TRUE(cur.bridge_standby_missed_checkins.empty());
 }
 
 TEST(GatewayStandbyRounds, epoch_attestations_still_work_and_stay_apart)
@@ -3709,7 +3915,7 @@ TEST(GatewayStandbyRounds, epoch_attestations_still_work_and_stay_apart)
   ASSERT_TRUE(run_attestation(cur, c, sign_attestation(c, 0, 3, vk), 131));
   auto same_epoch = sign_round_attestation(c, 0, 130, vk);
   ASSERT_EQ(same_epoch.epoch, 1u);
-  ASSERT_TRUE(run_round_attestation(cur, same_epoch, 131));
+  ASSERT_TRUE(run_round_attestation(cur, same_epoch, after_checkins(130)));
   ASSERT_EQ(cur.bridge_key_attestations.size(), 2u);
   EXPECT_EQ(cur.bridge_key_attestations[0].round_height, 0u);
   EXPECT_EQ(cur.bridge_key_attestations[1].round_height, 130u);
@@ -3810,7 +4016,7 @@ TEST(GatewayStandbyRounds, the_record_cap_never_drops_the_owner_or_the_named_sta
   while (cur.bridge_key_attestations.size() < 64)
     cur.bridge_key_attestations.push_back(attested(new_vk(), 0, c.mn));
 
-  ASSERT_TRUE(run_round_attestation(cur, sign_round_attestation(c, 0, 130, new_vk()), 131));
+  ASSERT_TRUE(run_round_attestation(cur, sign_round_attestation(c, 0, 130, new_vk()), after_checkins(130)));
   EXPECT_EQ(cur.bridge_key_attestations.size(), 64u);
   EXPECT_TRUE(find_attested_bridge_key(cur.bridge_key_attestations, owner));
   EXPECT_TRUE(find_attested_bridge_key(cur.bridge_key_attestations, standby));
@@ -3846,11 +4052,16 @@ TEST(GatewayStandbyRounds, from_a_round_to_a_named_standby)
   const auto members = cur.bridge_standby_rounds[0].members;
   ASSERT_EQ(members.size(), size);
 
-  // ...whose members attest their key, by their place in it...
+  // ...whose members check in, then attest their key, by their place among those that did...
   committee_keys drawn;
   for (const auto& m : members)
     drawn.ed_sec.push_back(secret.at(m));
   drawn.mn = members;
+  for (uint16_t i = 0; i < size; ++i)
+    ASSERT_TRUE(run_round_attestation(cur, sign_checkin(drawn, i, 130), 131));
+  cur.update_bridge_standby_rounds(NET_FC, hf::hf23_bridge, 132, no_resolver);
+  EXPECT_EQ(cur.bridge_standby_rounds[0].checked_in, members);
+  EXPECT_TRUE(cur.bridge_standby_missed_checkins.empty());
   for (uint16_t i = 0; i < threshold; ++i)
     ASSERT_TRUE(run_round_attestation(cur, sign_round_attestation(drawn, i, 130, key), 135));
   const auto rec = find_attested_bridge_key(cur.bridge_key_attestations, key);
@@ -3867,7 +4078,7 @@ TEST(GatewayStandbyRounds, from_a_round_to_a_named_standby)
   EXPECT_TRUE(check_bridge_standby_naming(cur.bridge_key_attestations, owner, key, NET_FC, overlap_of(cur), {}, 142, reason)) << reason;
   std::vector<crypto::public_key> got;
   std::vector<crypto::ed25519_public_key> keys;
-  ASSERT_TRUE(cur.bridge_round_committee(130, got, keys));
+  ASSERT_TRUE(cur.bridge_round_committee(130, NET_FC, got, keys));
   EXPECT_EQ(got, members);
 }
 
@@ -3979,9 +4190,9 @@ TEST(GatewayStandbyRounds, a_reorg_across_a_rounds_start_draws_another_committee
   a.mn = a_members;
   for (const auto& m : a_members)
     a.ed_sec.push_back(secret.at(m));
-  const auto att = sign_round_attestation(a, static_cast<uint16_t>(differs_at), 130, new_vk());
-  EXPECT_TRUE(run_round_attestation(chain_a, att, 131));
-  EXPECT_FALSE(run_round_attestation(chain_b, att, 131)) << "another member holds that place on this chain";
+  const auto checkin = sign_checkin(a, static_cast<uint16_t>(differs_at), 130);
+  EXPECT_TRUE(run_round_attestation(chain_a, checkin, 131));
+  EXPECT_FALSE(run_round_attestation(chain_b, checkin, 131)) << "another member holds that place on this chain";
 }
 
 // Once a round's key is live, its holders are who observe the rotation away from it: their ack is

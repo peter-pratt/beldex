@@ -11,7 +11,9 @@
 //!
 //! A standby key comes from a standby round: while the bridge has no working standby, consensus
 //! draws a committee every few blocks, from operators outside the owner's committee. Its
-//! members attest naming the round (`round_height`, its start), within the round's window.
+//! members first check in (version 2, no key yet) in the round's first blocks, to say their
+//! signer is running; the members that did generate the key, and attest it naming the round
+//! (`round_height`, its start) within the round's window.
 
 use crate::ffi::{ed25519_sign_detached, ed25519_verify_consensus};
 
@@ -21,19 +23,29 @@ pub const DOMAIN: &[u8] = b"bridge_key_attestation_v1";
 pub const VERSION: u8 = 0;
 /// The version of a standby round committee's attestation.
 pub const ROUND_VERSION: u8 = 1;
-/// How many blocks after a round's start a member may still join its DKG. Everyone starts on
-/// seeing the round's block; joining much later only makes the others wait out their timeout.
-pub const ROUND_JOIN_BLOCKS: u64 = 2;
+/// The version of a standby round member's check-in (`BRIDGE_STANDBY_CHECKIN_VERSION`).
+pub const CHECKIN_VERSION: u8 = 2;
 
 /// The bytes every member of committee `epoch` signs:
 /// `DOMAIN ‖ genesis(32) ‖ version(u8) ‖ epoch(u64 LE) ‖ pgw_vk(32) ‖ pevm_address(20)`, and for
 /// a standby round (`round_height` != 0) `‖ round_height(u64 LE)`.
 /// The member is not in it: all sign the same statement.
 pub fn message(genesis: &[u8; 32], epoch: u64, round_height: u64, pgw_vk: &[u8; 32], pevm_address: &[u8; 20]) -> Vec<u8> {
+    let version = if round_height != 0 { ROUND_VERSION } else { VERSION };
+    message_of(version, genesis, epoch, round_height, pgw_vk, pevm_address)
+}
+
+/// The bytes a member of the standby round at `round_height` signs to check in: the
+/// attestation layout with version 2 and no key, which therefore never reads as an attestation.
+pub fn checkin_message(genesis: &[u8; 32], epoch: u64, round_height: u64) -> Vec<u8> {
+    message_of(CHECKIN_VERSION, genesis, epoch, round_height, &[0; 32], &[0; 20])
+}
+
+fn message_of(version: u8, genesis: &[u8; 32], epoch: u64, round_height: u64, pgw_vk: &[u8; 32], pevm_address: &[u8; 20]) -> Vec<u8> {
     let mut v = Vec::with_capacity(DOMAIN.len() + 32 + 1 + 8 + 32 + 20 + 8);
     v.extend_from_slice(DOMAIN);
     v.extend_from_slice(genesis);
-    v.push(if round_height != 0 { ROUND_VERSION } else { VERSION });
+    v.push(version);
     v.extend_from_slice(&epoch.to_le_bytes());
     v.extend_from_slice(pgw_vk);
     v.extend_from_slice(pevm_address);
@@ -52,12 +64,21 @@ pub fn sign(
     pgw_vk: &[u8; 32],
     pevm_address: &[u8; 20],
 ) -> Result<[u8; 64], String> {
-    let msg = message(genesis, epoch, round_height, pgw_vk, pevm_address);
-    let sig = ed25519_sign_detached(sk64, &msg).map_err(str::to_string)?;
+    sign_bytes(sk64, &message(genesis, epoch, round_height, pgw_vk, pevm_address))
+}
+
+/// This member's check-in for the standby round at `round_height` (in epoch `epoch`), signed
+/// with its signer key: it says the signer is running and will take part in the round's key.
+pub fn sign_checkin(sk64: &[u8; 64], genesis: &[u8; 32], epoch: u64, round_height: u64) -> Result<[u8; 64], String> {
+    sign_bytes(sk64, &checkin_message(genesis, epoch, round_height))
+}
+
+fn sign_bytes(sk64: &[u8; 64], msg: &[u8]) -> Result<[u8; 64], String> {
+    let sig = ed25519_sign_detached(sk64, msg).map_err(str::to_string)?;
     // A key the daemon does not hold this member to would only be refused there; say so here.
     let mut pubkey = [0u8; 32];
     pubkey.copy_from_slice(&sk64[32..]);
-    if !ed25519_verify_consensus(&sig, &msg, &pubkey) {
+    if !ed25519_verify_consensus(&sig, msg, &pubkey) {
         return Err("the key attestation does not verify under this node's signer key".into());
     }
     Ok(sig)
@@ -119,6 +140,8 @@ pub struct StandbyRound {
     /// The round's start.
     pub round_height: u64,
     pub members: Vec<[u8; 32]>,
+    /// The members that have checked in: once check-ins close, the ones that generate its key.
+    pub checked_in: Vec<[u8; 32]>,
 }
 
 /// What the daemon's `bridge_get_standby` says about the bridge gateway and its standby, beyond
@@ -136,6 +159,8 @@ pub struct StandbyView {
     pub height: u64,
     /// How many blocks from its start a standby round takes attestations.
     pub round_window: u64,
+    /// How many blocks from its start a standby round takes check-ins (0 from a daemon without).
+    pub checkin_blocks: u64,
     /// The standby rounds still taking attestations.
     pub rounds: Vec<StandbyRound>,
     /// The attested key waiting to be named: the one consensus will accept. Consensus decides
@@ -143,9 +168,10 @@ pub struct StandbyView {
     pub waiting_key: Option<[u8; 32]>,
 }
 
-/// The standby round whose committee should generate a key now: Ok with its start, or why none.
+/// The standby round a member should check in to now: Ok with its start, or why none.
 /// Consensus draws a round only while a standby is due, so this only has to find the latest one
-/// and refuse to join it too late. Whether this node is on its committee is for the caller.
+/// and refuse to join it once a check-in sent now could no longer land in its check-in blocks.
+/// Whether this node is on its committee is for the caller.
 pub fn standby_round_due(view: &StandbyView) -> Result<u64, String> {
     if view.standby_key.is_some() && !view.standby_stale {
         return Err("a standby is named".into());
@@ -161,8 +187,13 @@ pub fn standby_round_due(view: &StandbyView) -> Result<u64, String> {
     let Some(round) = view.rounds.iter().map(|r| r.round_height).filter(|&r| r <= view.height).max() else {
         return Err("no standby round is open".into());
     };
-    if view.height > round + ROUND_JOIN_BLOCKS {
-        return Err(format!("standby round {round} started too long ago to join; waiting for the next"));
+    if view.checkin_blocks == 0 {
+        return Err("the daemon reports no check-in blocks for standby rounds: update beldexd".into());
+    }
+    // A check-in sent now lands in the next block at the earliest, and only blocks up to
+    // round + checkin_blocks take one.
+    if view.height >= round + view.checkin_blocks {
+        return Err(format!("standby round {round} started too long ago to check in; waiting for the next"));
     }
     Ok(round)
 }
@@ -238,21 +269,28 @@ pub fn parse_view(result: &serde_json::Value) -> Option<StandbyView> {
         }
         Some(out)
     };
-    let mut rounds = Vec::new();
-    for r in result.get("standby_rounds").and_then(serde_json::Value::as_array).into_iter().flatten() {
-        let mut members = Vec::new();
-        for m in r.get("members")?.as_array()? {
+    let keys = |list: Option<&serde_json::Value>| -> Option<Vec<[u8; 32]>> {
+        let mut out = Vec::new();
+        for m in list.and_then(serde_json::Value::as_array).into_iter().flatten() {
             let s = m.as_str()?;
             if s.len() != 64 || !s.is_ascii() {
                 return None;
             }
-            let mut out = [0u8; 32];
-            for (i, b) in out.iter_mut().enumerate() {
+            let mut k = [0u8; 32];
+            for (i, b) in k.iter_mut().enumerate() {
                 *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
             }
-            members.push(out);
+            out.push(k);
         }
-        rounds.push(StandbyRound { round_height: r.get("round_height")?.as_u64()?, members });
+        Some(out)
+    };
+    let mut rounds = Vec::new();
+    for r in result.get("standby_rounds").and_then(serde_json::Value::as_array).into_iter().flatten() {
+        rounds.push(StandbyRound {
+            round_height: r.get("round_height")?.as_u64()?,
+            members: keys(Some(r.get("members")?))?,
+            checked_in: keys(r.get("checked_in"))?,
+        });
     }
     Some(StandbyView {
         owner_key: key("owner_key"),
@@ -261,6 +299,7 @@ pub fn parse_view(result: &serde_json::Value) -> Option<StandbyView> {
         standby_stale: result.get("standby_stale").and_then(serde_json::Value::as_bool).unwrap_or(false),
         height: result.get("height")?.as_u64()?,
         round_window: result.get("standby_round_window")?.as_u64()?,
+        checkin_blocks: result.get("standby_round_checkin").and_then(serde_json::Value::as_u64).unwrap_or(0),
         rounds,
         waiting_key: key("waiting_key"),
     })
@@ -304,6 +343,19 @@ pub fn parse_records(result: &serde_json::Value) -> Option<Vec<Record>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_check_in_is_the_attestation_layout_with_version_2_and_no_key() {
+        let g = [9u8; 32];
+        let m = checkin_message(&g, 1, 130);
+        assert_eq!(m.len(), DOMAIN.len() + 32 + 1 + 8 + 32 + 20 + 8);
+        assert_eq!(m[DOMAIN.len() + 32], CHECKIN_VERSION);
+        assert!(m[DOMAIN.len() + 32 + 1 + 8..DOMAIN.len() + 32 + 1 + 8 + 52].iter().all(|&b| b == 0), "no key");
+        assert_eq!(&m[m.len() - 8..], &130u64.to_le_bytes());
+        // Never the bytes of an attestation, even of an empty key in the same round.
+        assert_ne!(m, message(&g, 1, 130, &[0; 32], &[0; 20]));
+        assert_ne!(checkin_message(&g, 1, 140), m, "bound to its round");
+    }
 
     #[test]
     fn the_message_is_the_consensus_layout() {
@@ -405,7 +457,8 @@ mod tests {
             owner_epoch: Some(4),
             height: 131,
             round_window: 10,
-            rounds: vec![StandbyRound { round_height: 130, members: vec![[7; 32]] }],
+            checkin_blocks: 2,
+            rounds: vec![StandbyRound { round_height: 130, members: vec![[7; 32]], checked_in: vec![] }],
             ..StandbyView::default()
         }
     }
@@ -422,7 +475,7 @@ mod tests {
 
         // Rounds overlap by their windows: the latest is the one to join.
         let two = StandbyView {
-            rounds: vec![StandbyRound { round_height: 130, members: vec![] }, StandbyRound { round_height: 140, members: vec![] }],
+            rounds: vec![StandbyRound { round_height: 130, ..Default::default() }, StandbyRound { round_height: 140, ..Default::default() }],
             height: 140,
             ..view()
         };
@@ -433,9 +486,12 @@ mod tests {
         assert!(no(&StandbyView { height: 129, ..view() }).contains("no standby round"));
         assert_eq!(standby_round_due(&StandbyView { height: 131, ..two.clone() }), Ok(130));
 
-        // A node that comes up late does not make the others wait out their timeout.
-        assert_eq!(standby_round_due(&StandbyView { height: 130 + ROUND_JOIN_BLOCKS, ..view() }), Ok(130));
-        assert!(no(&StandbyView { height: 131 + ROUND_JOIN_BLOCKS, ..view() }).contains("too long ago"));
+        // A check-in sent now must land within the round's check-in blocks (130, 132]: from the
+        // round's block or the next, not later.
+        assert_eq!(standby_round_due(&StandbyView { height: 130, ..view() }), Ok(130));
+        assert_eq!(standby_round_due(&StandbyView { height: 131, ..view() }), Ok(130));
+        assert!(no(&StandbyView { height: 132, ..view() }).contains("too long ago"));
+        assert!(no(&StandbyView { checkin_blocks: 0, ..view() }).contains("update beldexd"));
     }
 
     #[test]
@@ -458,14 +514,17 @@ mod tests {
     fn the_daemons_view_parses() {
         let v = serde_json::json!({
             "owner_key": "01".repeat(32), "owner_epoch": 4, "height": 131, "standby_round_window": 10,
-            "standby_rounds": [{ "round": 1, "round_height": 130, "window_end": 140, "members": ["07".repeat(32)] }],
+            "standby_round_checkin": 2,
+            "standby_rounds": [{ "round": 1, "round_height": 130, "checkin_end": 132, "window_end": 140,
+                                 "members": ["07".repeat(32), "08".repeat(32)], "checked_in": ["08".repeat(32)] }],
             "attestations": []
         });
         let got = parse_view(&v).unwrap();
         assert_eq!(got.owner_key, Some([1; 32]));
         assert_eq!((got.standby_key, got.standby_stale, got.waiting_key), (None, false, None));
         assert_eq!((got.height, got.round_window), (131, 10));
-        assert_eq!(got.rounds, vec![StandbyRound { round_height: 130, members: vec![[7; 32]] }]);
+        assert_eq!(got.checkin_blocks, 2);
+        assert_eq!(got.rounds, vec![StandbyRound { round_height: 130, members: vec![[7; 32], [8; 32]], checked_in: vec![[8; 32]] }]);
         let mut named = v.clone();
         named["standby_key"] = serde_json::json!("02".repeat(32));
         named["standby_stale"] = serde_json::json!(true);
