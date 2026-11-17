@@ -200,6 +200,7 @@ namespace cryptonote::rpc {
     void invoke(GATEWAY_CREATE_TRANSFER& gateway_create_transfer, rpc_context context);
     void invoke(GATEWAY_SUBMIT_TRANSFER& gateway_submit_transfer, rpc_context context);
     void invoke(GATEWAY_DECODE_WITHDRAWAL& gateway_decode_withdrawal, rpc_context context);
+    void invoke(GATEWAY_DECODE_DESCRIPTOR_UPDATE& gateway_decode_descriptor_update, rpc_context context);
     void invoke(GATEWAY_RELEASE_REF_STATUS& gateway_release_ref_status, rpc_context context);
     void invoke(BRIDGE_GET_RESERVES& bridge_get_reserves, rpc_context context);
     void invoke(GATEWAY_GET_HISTORY& gateway_get_history, rpc_context context);

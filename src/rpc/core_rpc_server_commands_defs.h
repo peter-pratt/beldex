@@ -2849,6 +2849,36 @@ namespace cryptonote::rpc {
     } request;
   };
 
+  /// RPC: gateway/gateway_decode_descriptor_update
+  ///
+  /// Decode an unsigned gateway descriptor update (the hand-over a wallet builds with
+  /// `gateway_update_descriptor`) into what its owner signature would authorise, so each
+  /// member of the bridge committee can check, on its OWN daemon, the hand-over it is asked
+  /// to sign: which gateway, which new owner key, whether the reserve flag is kept, and the
+  /// hash the signature must cover, recomputed from THIS blob. A blob that is anything more
+  /// than one update of one gateway — another tx type, a gateway withdrawal input, more than
+  /// one descriptor op, a registration — is refused, since an owner signature over it would
+  /// authorise more than the hand-over.
+  ///
+  /// Inputs:
+  /// - `tx_blob` -- hex of the unsigned tx from `gateway_update_descriptor`.
+  ///
+  /// Output:
+  /// - `gateway_id` -- 64-char hex id of the gateway the update re-points.
+  /// - `owner_key_type` -- "beldex", "eth" or "eddsa"; `owner_key` -- the new owner key, hex.
+  /// - `bridge_reserve` -- whether the new descriptor carries the reserve flag.
+  /// - `descriptor_version`, `meta_info`.
+  /// - `hash_to_sign` -- the ownership message the CURRENT owner must sign.
+  /// - `status` -- Generic RPC error code. "OK" is the success value.
+  struct GATEWAY_DECODE_DESCRIPTOR_UPDATE : PUBLIC
+  {
+    static constexpr auto names() { return NAMES("gateway_decode_descriptor_update"); }
+    struct request_parameters
+    {
+      std::string tx_blob;
+    } request;
+  };
+
   /// RPC: gateway/gateway_release_ref_status
   ///
   /// Whether a source EVM burn has already been discharged by a release from
@@ -3236,6 +3266,7 @@ namespace cryptonote::rpc {
     GATEWAY_CREATE_TRANSFER,
     GATEWAY_SUBMIT_TRANSFER,
     GATEWAY_DECODE_WITHDRAWAL,
+    GATEWAY_DECODE_DESCRIPTOR_UPDATE,
     GATEWAY_RELEASE_REF_STATUS,
     BRIDGE_GET_RESERVES,
     GATEWAY_GET_HISTORY,

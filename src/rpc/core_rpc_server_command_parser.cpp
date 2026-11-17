@@ -437,6 +437,10 @@ namespace cryptonote::rpc {
         "tx_key",  c.request.tx_key);
   }
 
+  void parse_request(GATEWAY_DECODE_DESCRIPTOR_UPDATE& c, rpc_input in) {
+    get_values(in, "tx_blob", required{c.request.tx_blob});
+  }
+
   void parse_request(GATEWAY_RELEASE_REF_STATUS& c, rpc_input in) {
     get_values(in,
         "chain_ids",   required{c.request.chain_ids},

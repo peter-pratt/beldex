@@ -4147,6 +4147,55 @@ namespace cryptonote::rpc {
   }
 
   //------------------------------------------------------------------------------------------------------------------------------
+  void core_rpc_server::invoke(GATEWAY_DECODE_DESCRIPTOR_UPDATE& cmd, rpc_context context)
+  {
+    const auto nettype = m_core.get_nettype();
+    if (!oxenc::is_hex(cmd.request.tx_blob))
+      throw rpc_error{ERROR_WRONG_PARAM, "tx_blob is not valid hex"};
+    cryptonote::transaction tx;
+    if (!cryptonote::parse_and_validate_tx_from_blob(oxenc::from_hex(cmd.request.tx_blob), tx))
+      throw rpc_error{ERROR_WRONG_PARAM, "failed to parse tx_blob"};
+
+    // Exactly one update of one gateway, and nothing an owner signature could also authorise.
+    if (tx.type != cryptonote::txtype::update_gateway_address)
+      throw rpc_error{ERROR_WRONG_PARAM, "not a gateway descriptor update"};
+    if (tx.has_gateway_inputs())
+      throw rpc_error{ERROR_WRONG_PARAM, "the tx also spends from a gateway"};
+    if (cryptonote::tx_extra_gateway_takeover step{}; cryptonote::get_field_from_tx_extra(tx.extra, step))
+      throw rpc_error{ERROR_WRONG_PARAM, "the tx is a standby takeover step"};
+    std::vector<cryptonote::tx_extra_gateway_descriptor_operation> ops;
+    {
+      size_t skip = 0;
+      cryptonote::tx_extra_gateway_descriptor_operation op{};
+      while (cryptonote::get_field_from_tx_extra(tx.extra, op, skip++))
+        ops.push_back(op);
+    }
+    if (ops.size() != 1)
+      throw rpc_error{ERROR_WRONG_PARAM, "expected exactly one descriptor operation, found " + std::to_string(ops.size())};
+    const auto& op = ops.front();
+    if (op.op_type != cryptonote::gateway_descriptor_op_type::update_address)
+      throw rpc_error{ERROR_WRONG_PARAM, "the descriptor operation is not an update"};
+
+    cmd.response["gateway_id"] = tools::type_to_hex(op.address_id);
+    var::visit([&](const auto& key) {
+      using key_t = std::decay_t<decltype(key)>;
+      if constexpr (std::is_same_v<key_t, crypto::public_key>)
+        cmd.response["owner_key_type"] = "beldex";
+      else if constexpr (std::is_same_v<key_t, crypto::eth_public_key>)
+        cmd.response["owner_key_type"] = "eth";
+      else if constexpr (std::is_same_v<key_t, crypto::eddsa_public_key>)
+        cmd.response["owner_key_type"] = "eddsa";
+      cmd.response["owner_key"] = tools::type_to_hex(key);
+    }, op.descriptor.owner_key);
+    cmd.response["bridge_reserve"]     = op.descriptor.is_bridge_reserve();
+    // A hand-over names no standby: the outgoing committee's signature must not choose one.
+    cmd.response["has_standby"]        = static_cast<bool>(op.descriptor.has_standby);
+    cmd.response["descriptor_version"] = op.descriptor.version;
+    cmd.response["meta_info"]          = op.descriptor.meta_info;
+    cmd.response["hash_to_sign"]       = tools::type_to_hex(cryptonote::gateway_ownership_message(nettype, tx));
+    cmd.response["status"]             = STATUS_OK;
+  }
+
   void core_rpc_server::invoke(GATEWAY_DECODE_WITHDRAWAL& cmd, rpc_context context)
   {
     auto& req = cmd.request;
