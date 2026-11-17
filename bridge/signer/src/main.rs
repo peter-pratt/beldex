@@ -121,6 +121,20 @@ fn enforce_network_policy(cfg: &Config, settings: &[String]) -> Result<(), Strin
     Ok(())
 }
 
+/// The parts of one DKG run that `dkg-auto` chooses per attempt; `dkg` reads them from the
+/// environment.
+#[cfg(feature = "live-dkg")]
+struct DkgRun {
+    key_generation: u32,
+    share_dir: Option<String>,
+    port_base: Option<u16>,
+    timeout: std::time::Duration,
+    /// Refuse to run unless the committee is still this epoch's.
+    epoch: Option<u64>,
+    /// The standby round whose committee makes this key, instead of the current epoch's.
+    standby_round: Option<u64>,
+}
+
 /// `dkg` subcommand: fetch the live committee and run the `Pgw` FROST DKG across
 /// the authenticated mesh (C.2). Only built with `--features live-dkg`.
 #[cfg(feature = "live-dkg")]
@@ -137,6 +151,26 @@ fn run_dkg(cfg: &Config) -> Result<(), String> {
 /// `standby_round` by that standby round's.
 #[cfg(feature = "live-dkg")]
 fn run_dkg_into(cfg: &Config, share_dir: Option<&str>, key_generation: u32, standby_round: Option<u64>) -> Result<(), String> {
+    let run = DkgRun {
+        key_generation,
+        share_dir: share_dir.map(str::to_string),
+        port_base: std::env::var("BRIDGE_SIGNER_MESH_PORT_BASE")
+            .ok()
+            .and_then(|s| s.parse().ok()),
+        timeout: std::time::Duration::from_secs(
+            std::env::var("BRIDGE_SIGNER_DKG_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(900),
+        ),
+        epoch: None,
+        standby_round,
+    };
+    run_dkg_with(cfg, &run)
+}
+
+#[cfg(feature = "live-dkg")]
+fn run_dkg_with(cfg: &Config, run: &DkgRun) -> Result<(), String> {
     use beldex_bridge_signer::dkg_driver::live::{run_live_capture, MeshIdentity, PeerTransportAddr};
     use beldex_bridge_signer::ffi;
     use beldex_bridge_signer::omq_client::OmqCommitteeClient;
@@ -151,13 +185,16 @@ fn run_dkg_into(cfg: &Config, share_dir: Option<&str>, key_generation: u32, stan
     //    the daemon reports for itself (OMQ `self_index`) so no per-node pubkey
     //    config is needed; fall back to matching the configured MN pubkey.
     let client = OmqCommitteeClient::new(cfg.oxenmq_endpoint.clone());
-    let committee_json = match standby_round {
+    let committee_json = match run.standby_round {
         Some(round) => client.fetch_standby_round_json(round),
         None => client.fetch_committee_json(None),
     }
     .map_err(|e| e.to_string())?;
     let committee = beldex_bridge_signer::committee::CommitteeView::from_bridge_committee_json(&committee_json)
         .map_err(|e| e.to_string())?;
+    if let Some(e) = run.epoch.filter(|e| *e != committee.epoch) {
+        return Err(format!("the committee moved on to epoch {} (this run was for epoch {e})", committee.epoch));
+    }
     let self_index = committee
         .daemon_self_index
         .or_else(|| committee.self_index(&cfg.self_mn_pubkey))
@@ -173,9 +210,7 @@ fn run_dkg_into(cfg: &Config, share_dir: Option<&str>, key_generation: u32, stan
     // A single-host deployment (local devnet) sets a port base: every node shares
     // the committee's IP but listens on `port_base + index`. **Dual DKG** (both
     // legs) requires this mode so each leg gets a distinct port range.
-    let port_base: Option<u16> = std::env::var("BRIDGE_SIGNER_MESH_PORT_BASE")
-        .ok()
-        .and_then(|s| s.parse().ok());
+    let port_base: Option<u16> = run.port_base;
 
     // 2) This node's mesh keys (x25519 channel + ed25519 message-auth), derived
     //    once. Turnkey path: read the masternode ed25519 key file
@@ -224,12 +259,8 @@ fn run_dkg_into(cfg: &Config, share_dir: Option<&str>, key_generation: u32, stan
         ed25519_secret,
     };
 
-    let timeout = Duration::from_secs(
-        std::env::var("BRIDGE_SIGNER_DKG_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(900),
-    );
+    let key_generation: u32 = run.key_generation;
+    let timeout: Duration = run.timeout;
     // Channel encryption. Production: CURVE (needs libzmq built with CURVE). Set
     // BRIDGE_SIGNER_MESH_USE_CURVE=false for a libzmq without CURVE — plain sockets,
     // but per-message ed25519 auth (S4) stays on.
@@ -261,18 +292,18 @@ fn run_dkg_into(cfg: &Config, share_dir: Option<&str>, key_generation: u32, stan
     {
         Some(d) => std::path::PathBuf::from(d),
         None => {
-            let share = share_dir.ok_or_else(|| {
+            let share = run.share_dir.clone().ok_or_else(|| {
                 "set BRIDGE_SIGNER_SHARE_DIR or BRIDGE_SIGNER_EXECUTION_LEDGER: a DKG must \
                  record its execution ids so a retry cannot reuse them"
                     .to_string()
             })?;
-            let share = std::path::Path::new(share);
+            let share = std::path::Path::new(&share);
             share.parent().unwrap_or(std::path::Path::new(".")).join("dkg-executions")
         }
     };
     // The shares this run produces must be sealable before the ceremony starts: finding
     // out at the end would mean a finished DKG whose output cannot be saved.
-    if let Some(share) = share_dir {
+    if let Some(share) = &run.share_dir {
         beldex_bridge_signer::share_file::require_key(Some(std::path::Path::new(share)))?;
     }
     {
@@ -315,6 +346,7 @@ fn run_dkg_into(cfg: &Config, share_dir: Option<&str>, key_generation: u32, stan
     };
 
     // --- Pgw (ed25519 / FROST) ------------------------------------------------
+    let mut pgw_vk = None;
     if run_pgw {
         let (identity, peers) = match port_base {
             Some(base) => {
@@ -379,10 +411,11 @@ fn run_dkg_into(cfg: &Config, share_dir: Option<&str>, key_generation: u32, stan
         println!("Pgw DKG complete — group ed25519 key (gateway owner_key): {}", hex(&group_vk));
         // Persist the share material so a later `sign` invocation can load it. This
         // is a dev file store; production custody (Vault/enclave) is D.1.
-        if let Some(dir) = share_dir {
-            persist_pgw_material(dir, self_index, &kp_blob, &pk_blob, &group_vk)?;
+        if let Some(dir) = &run.share_dir {
+            persist_pgw_material(&dir, self_index, &kp_blob, &pk_blob, &group_vk)?;
             println!("Pgw share material written to {dir}/pgw-{self_index}.{{keypackage,pubkeypackage,groupvk}}");
         }
+        pgw_vk = Some(group_vk);
     }
 
     // --- Pevm (secp256k1 / CGGMP21) -------------------------------------------
@@ -446,14 +479,33 @@ fn run_dkg_into(cfg: &Config, share_dir: Option<&str>, key_generation: u32, stan
                 .map_err(|e| format!("Pevm share completion failed: {e:?}"))?;
             println!("Pevm complete share ready (keygen + aux-info)");
 
-            if let Some(dir) = share_dir {
-                persist_pevm_material(dir, self_index, &complete_blob, &x33)?;
+            if let Some(dir) = &run.share_dir {
+                persist_pevm_material(&dir, self_index, &complete_blob, &x33)?;
                 println!("Pevm share material written to {dir}/pevm-{self_index}.{{keyshare,groupkey}}");
+            }
+
+            // Both legs done here does not mean done everywhere: keep the key only once
+            // every member says, signed, that it finished with the same two
+            // (dkg_driver::confirm_key). The signatures are the key's certificate.
+            if let Some(vk) = &pgw_vk {
+                let pevm: [u8; 33] = x33[..].try_into().map_err(|_| "Pevm group key is not 33 bytes".to_string())?;
+                let signer = beldex_bridge_signer::wire_auth::LibsodiumSigner { sk64: ed25519_secret };
+                let cert = beldex_bridge_signer::dkg_driver::confirm_key(
+                    &committee, self_index, key_generation, vk, &pevm, &signer,
+                    &beldex_bridge_signer::wire_auth::LibsodiumEd25519, &mut transport, timeout,
+                )
+                .map_err(|e| format!("key confirmation failed: {e:?}"))?;
+                println!("all {} members confirmed they hold this key", committee.size());
+                if let Some(dir) = &run.share_dir {
+                    std::fs::write(format!("{dir}/{KEY_CERT_FILE}"), cert.to_text())
+                        .map_err(|e| format!("write {dir}/{KEY_CERT_FILE}: {e}"))?;
+                    println!("key certificate ({} signatures) written to {dir}/{KEY_CERT_FILE}", cert.sigs.len());
+                }
             }
         }
         #[cfg(not(feature = "live-pevm-dkg"))]
         {
-            let _ = base;
+            let _ = (base, pgw_vk);
             return Err("the Pevm leg needs a build with --features live-pevm-dkg".into());
         }
     }
@@ -461,7 +513,7 @@ fn run_dkg_into(cfg: &Config, share_dir: Option<&str>, key_generation: u32, stan
     // The committee these shares belong to. A share's index is its position in THIS list,
     // and this list — not whichever committee consensus selects later — is who can sign
     // with the key until it is replaced on chain.
-    if let Some(dir) = share_dir {
+    if let Some(dir) = &run.share_dir {
         std::fs::write(format!("{dir}/{KEY_COMMITTEE_FILE}"), &committee_json)
             .map_err(|e| format!("write {dir}/{KEY_COMMITTEE_FILE}: {e}"))?;
         println!("key committee (epoch {}) written to {dir}/{KEY_COMMITTEE_FILE}", committee.epoch);
@@ -474,6 +526,39 @@ fn run_dkg_into(cfg: &Config, share_dir: Option<&str>, key_generation: u32, stan
 /// Beside each share tree: the `bridge.committee` reply `dkg` ran against.
 #[cfg(feature = "live-dkg")]
 const KEY_COMMITTEE_FILE: &str = "committee.json";
+
+/// Beside each share tree: every member's signature on the key ([`beldex_bridge_signer::dkg_driver::KeyCertificate`]).
+#[cfg(feature = "live-dkg")]
+const KEY_CERT_FILE: &str = "keycert";
+
+#[cfg(feature = "live-dkg")]
+fn run_verify_keycert(path: Option<String>) -> Result<(), String> {
+    use beldex_bridge_signer::dkg_driver::KeyCertificate;
+    use beldex_bridge_signer::omq_client::OmqCommitteeClient;
+
+    let path = path.ok_or("usage: verify-keycert <keycert file>")?;
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+    let cert = KeyCertificate::from_text(&text).map_err(|e| format!("{path}: {e}"))?;
+    let endpoint = std::env::var("BRIDGE_SIGNER_OXENMQ_ENDPOINT")
+        .map_err(|_| "set BRIDGE_SIGNER_OXENMQ_ENDPOINT (beldexd's OMQ socket)".to_string())?;
+    let committee = OmqCommitteeClient::new(endpoint)
+        .fetch_committee(Some(cert.height))
+        .map_err(|e| format!("bridge.committee at height {}: {e}", cert.height))?;
+    cert.verify(&committee, &beldex_bridge_signer::wire_auth::LibsodiumEd25519)?;
+    println!(
+        "OK: the key of the epoch {} committee ({} members, all signed)\n  Pgw  {}\n  Pevm {}",
+        cert.epoch,
+        committee.size(),
+        hex(&cert.pgw),
+        hex(&cert.pevm)
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "live-dkg"))]
+fn run_verify_keycert(_path: Option<String>) -> Result<(), String> {
+    Err("verify-keycert requires a build with `--features live-dkg`".into())
+}
 
 /// The committee that holds the key in `dir`, and this node's index in it.
 ///
@@ -517,6 +602,635 @@ fn load_key_committee(
 #[cfg(not(feature = "live-dkg"))]
 fn run_dkg(_cfg: &Config) -> Result<(), String> {
     Err("the `dkg` subcommand requires a build with `--features live-dkg`".into())
+}
+
+/// The epoch whose complete key a share tree holds for this node, if any: its saved
+/// committee, both legs' files under the index that committee gave this node, and the
+/// key's certificate.
+#[cfg(feature = "live-dkg")]
+fn tree_key_epoch(dir: &std::path::Path) -> Option<u64> {
+    let json = std::fs::read_to_string(dir.join(KEY_COMMITTEE_FILE)).ok()?;
+    let c = beldex_bridge_signer::committee::CommitteeView::from_bridge_committee_json(&json).ok()?;
+    let i = c.daemon_self_index?;
+    let files = [
+        format!("pgw-{i}.keypackage"),
+        format!("pgw-{i}.groupvk"),
+        format!("pevm-{i}.keyshare"),
+        format!("pevm-{i}.groupkey"),
+        KEY_CERT_FILE.to_string(),
+    ];
+    files.iter().all(|f| dir.join(f).is_file()).then_some(c.epoch)
+}
+
+/// Whether the key in `dir` is one a hand-off is under way to (the contract's pending signer)
+/// or has reached (its current signer) on any chain in `BRIDGE_SIGNER_EVM_CHAINS`. Such a tree
+/// is never moved aside for a newer committee's key: its members still have to sign with it,
+/// or install it. False when nothing can be read: the lock is then the only guard.
+#[cfg(feature = "serve-live")]
+fn key_in_use(dir: &std::path::Path) -> bool {
+    use beldex_bridge_signer::evm_watcher::{parse_evm_chains, HttpJsonRpc, JsonRpcClient};
+    let Some(cert) = std::fs::read_to_string(dir.join(KEY_CERT_FILE))
+        .ok()
+        .and_then(|t| beldex_bridge_signer::dkg_driver::KeyCertificate::from_text(&t).ok())
+    else {
+        return false;
+    };
+    let Ok(vk) = k256::ecdsa::VerifyingKey::from_sec1_bytes(&cert.pevm) else { return false };
+    let signer = hex(&beldex_bridge_signer::aggregate_signature::eth_address(&vk));
+    let chains = std::env::var("BRIDGE_SIGNER_EVM_CHAINS").ok().and_then(|j| parse_evm_chains(&j).ok()).unwrap_or_default();
+    chains.iter().any(|c| {
+        let client = HttpJsonRpc::new(c.rpc_url.clone());
+        // currentSigner(), pendingSigner()
+        ["0x4cd615e7", "0x14d90c45"].iter().any(|sel| {
+            client
+                .call("eth_call", serde_json::json!([{ "to": format!("0x{}", hex(&c.contract)), "data": sel }, "latest"]))
+                .ok()
+                .and_then(|w| w.as_str().and_then(|w| w.get(26..)).map(str::to_ascii_lowercase))
+                .is_some_and(|a| a == signer)
+        })
+    })
+}
+
+#[cfg(all(feature = "live-dkg", not(feature = "serve-live")))]
+fn key_in_use(_dir: &std::path::Path) -> bool {
+    false
+}
+
+/// `root/base`, or `root/base.<n>` for the first free `n`: a tree moved aside never lands on
+/// another one.
+#[cfg(feature = "live-dkg")]
+fn free_name(root: &std::path::Path, base: &str) -> std::path::PathBuf {
+    let mut p = root.join(base);
+    let mut n = 1;
+    while p.exists() {
+        p = root.join(format!("{base}.{n}"));
+        n += 1;
+    }
+    p
+}
+
+/// `dkg-auto`: run beside `beldexd` and make this node's share of each epoch's key as soon
+/// as its committee is selected, retrying within the epoch on the schedule every member
+/// derives from the chain ([`beldex_bridge_signer::dkg::AttemptSchedule`]).
+///
+/// Every key goes into the `shares-next` beside `BRIDGE_SIGNER_SHARE_DIR`, on every member
+/// alike: which tree a key lands in must not depend on what one node happens to hold, or
+/// a member new to the bridge would treat the next key as the live one. Installing it in
+/// the live tree is a separate step (the rotation's promotion; at launch, the first key's
+/// setup). Each attempt writes into a fresh directory and only a complete key is moved into
+/// place, so a failed attempt leaves no part of a key behind. Whether an epoch already has
+/// its key is read from this node's own trees; the key announcement on Beldex is meant to
+/// replace that.
+#[cfg(feature = "live-dkg")]
+fn run_dkg_auto(cfg: &Config) -> Result<(), String> {
+    use beldex_bridge_signer::dkg::AttemptSchedule;
+    use beldex_bridge_signer::omq_client::OmqCommitteeClient;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    let num = |k: &str, default: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(default);
+    let live = PathBuf::from(
+        std::env::var("BRIDGE_SIGNER_SHARE_DIR").map_err(|_| "set BRIDGE_SIGNER_SHARE_DIR (the live share tree)".to_string())?,
+    );
+    let root = live.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let next = root.join("shares-next");
+    let epoch_blocks = cfg.bridge_epoch_blocks;
+    // By default an attempt an hour on a 2880-block day, the last one a full interval
+    // before the next committee is selected.
+    let retry = num("BRIDGE_SIGNER_DKG_RETRY_BLOCKS", (epoch_blocks / 24).max(60));
+    let schedule = AttemptSchedule {
+        settle: num("BRIDGE_SIGNER_DKG_SETTLE_BLOCKS", 2),
+        retry,
+        join: num("BRIDGE_SIGNER_DKG_JOIN_BLOCKS", 3),
+        cutoff: num("BRIDGE_SIGNER_DKG_CUTOFF_BLOCKS", retry),
+    };
+    // Its own ports: a member of both the outgoing committee (serving) and the incoming one
+    // (generating) runs both meshes at once.
+    let port_base: Option<u16> = std::env::var("BRIDGE_SIGNER_DKG_PORT_BASE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| {
+            std::env::var("BRIDGE_SIGNER_MESH_PORT_BASE")
+                .ok()
+                .and_then(|s| s.parse::<u16>().ok())
+                .map(|b| b + 1000)
+        });
+    // The Pevm aux-info phase alone takes minutes.
+    let timeout = Duration::from_secs(num("BRIDGE_SIGNER_DKG_TIMEOUT_SECS", 1800));
+    let poll = Duration::from_secs(num("BRIDGE_SIGNER_DKG_POLL_SECS", 5).max(1));
+    println!(
+        "dkg-auto: live tree {}, new keys into {}; an attempt every {} blocks from block {} of an epoch, \
+         {} block(s) to join, none in its last {}; mesh port base {:?}, timeout {}s",
+        live.display(), next.display(), schedule.retry, schedule.settle, schedule.join, schedule.cutoff,
+        port_base, timeout.as_secs()
+    );
+
+    // Work directories of a run this process did not finish (it was stopped mid-attempt).
+    // They never hold a key: one is only ever moved into place complete.
+    if let Ok(it) = std::fs::read_dir(&root) {
+        for e in it.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let parts: Vec<&str> = name.strip_prefix(".dkg-").unwrap_or("").split('-').collect();
+            if parts.len() == 2 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) {
+                let _ = std::fs::remove_dir_all(e.path());
+                println!("dkg-auto: removed the unfinished attempt {}", e.path().display());
+            }
+        }
+    }
+    // A rotation that is installing the key in `shares-next` holds this; that key is then
+    // never replaced, even by a newer committee's.
+    let lock = root.join("shares-next.lock");
+
+    let client = OmqCommitteeClient::new(cfg.oxenmq_endpoint.clone());
+    // The last attempt started. An attempt is never started twice: its execution ids are
+    // spent once it begins.
+    let mut tried: Option<(u64, u32)> = None;
+    // The activation (sign_activation) is tried once per slot of ACTIVATION_SLOT blocks,
+    // started only in a slot's first few blocks: the signers derive the slot, and with it
+    // the session's attempt number, from the chain, so they start the same session.
+    const ACTIVATION_SLOT: u64 = 10;
+    let mut activation_tried: Option<(u64, u64)> = None;
+    // The key attestation (attest_tree_key): the epoch it is done for, and when to look again.
+    let mut attest_done: Option<u64> = None;
+    let mut attest_next = std::time::Instant::now();
+    let mut said = String::new();
+    let mut say = |msg: String| {
+        if msg != said {
+            println!("{msg}");
+            said = msg;
+        }
+    };
+    #[cfg(feature = "serve-live")]
+    let status = StatusBoard::start("dkg-auto");
+    // The status endpoint's calls; they compile away in a build without it.
+    macro_rules! status {
+        ($($call:tt)*) => {{
+            #[cfg(feature = "serve-live")]
+            status.$($call)*;
+        }};
+    }
+    loop {
+        std::thread::sleep(poll);
+        let (committee, tip) = match (client.fetch_committee(None), client.fetch_height()) {
+            (Ok(c), Ok(h)) => (c, h),
+            (Err(e), _) | (_, Err(e)) => {
+                say(format!("dkg-auto: no answer from beldexd: {e}"));
+                status!(problem("beldexd", Some(e.to_string())));
+                continue;
+            }
+        };
+        let epoch = committee.epoch;
+        status!(beat(poll * 6));
+        status!(problem("beldexd", None));
+        status!(set("epoch", epoch));
+        status!(set("height", tip));
+        status!(set("live_key_epoch", tree_key_epoch(&live).map_or(serde_json::Value::Null, |e| e.into())));
+        status!(set("next_key_epoch", tree_key_epoch(&next).map_or(serde_json::Value::Null, |e| e.into())));
+        if committee.members.is_empty() {
+            say(format!("epoch {epoch}: no bridge committee (bridge dormant)"));
+            continue;
+        }
+        let Some(self_index) = committee.daemon_self_index else {
+            say(format!("epoch {epoch}: this node is not on the committee"));
+            status!(set("member", "not on the committee"));
+            status!(problem("dkg", None));
+            continue;
+        };
+        status!(set("member", self_index));
+        if tree_key_epoch(&live) == Some(epoch) || tree_key_epoch(&next) == Some(epoch) {
+            say(format!("epoch {epoch}: this node holds its share of the epoch's key"));
+            status!(problem("dkg", None));
+            // Every member attests the key on chain: the outgoing committee hands over only to an
+            // attested one. After sending, the chain gets time to count it before another try.
+            if attest_done != Some(epoch) && std::time::Instant::now() >= attest_next {
+                let tree = if tree_key_epoch(&next) == Some(epoch) { &next } else { &live };
+                match attest_tree_key(cfg, tree, epoch, self_index as u16) {
+                    Ok((done, m)) => {
+                        if done {
+                            attest_done = Some(epoch);
+                        }
+                        attest_next = std::time::Instant::now() + Duration::from_secs(600);
+                        status!(set("attestation", m.clone()));
+                        status!(problem("attestation", None));
+                        say(format!("epoch {epoch}: {m}"));
+                    }
+                    Err(e) => {
+                        attest_next = std::time::Instant::now() + Duration::from_secs(60);
+                        status!(problem("attestation", Some(e.clone())));
+                        eprintln!("epoch {epoch}: key attestation: {e}");
+                    }
+                }
+            }
+            let slot = tip / ACTIVATION_SLOT;
+            if let Some(base) = port_base.filter(|_| tree_key_epoch(&next) == Some(epoch)) {
+                // At once the first time (the signers all finish the DKG together, so they are
+                // in the same slot), then at the start of each later slot until it is signed.
+                let first = activation_tried.map_or(true, |(e, _)| e != epoch);
+                if (first || tip % ACTIVATION_SLOT < schedule.join.max(1)) && activation_tried != Some((epoch, slot)) {
+                    activation_tried = Some((epoch, slot));
+                    // Ports 200 above the DKG's: clear of its two legs' meshes.
+                    match sign_activation(cfg, &next, base + 200, slot as u32) {
+                        Ok(m) => {
+                            status!(set("activation", m.clone()));
+                            status!(problem("activation", None));
+                            say(format!("epoch {epoch}: {m}"))
+                        }
+                        Err(e) => {
+                            status!(problem("activation", Some(e.clone())));
+                            eprintln!("epoch {epoch}: activation not signed yet: {e}")
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        // This epoch's key, finished while a rotation held the lock: once the rotation is
+        // done it is the newest key, so it goes where an uninstalled key belongs.
+        let parked = root.join(format!("shares-next.unplaced-at-{epoch}"));
+        if !lock.exists() && tree_key_epoch(&parked) == Some(epoch) && !key_in_use(&next) {
+            if next.exists() {
+                let aside = free_name(&root, &format!("shares-next.superseded-at-{epoch}"));
+                std::fs::rename(&next, &aside).map_err(|e| format!("move {} aside: {e}", next.display()))?;
+                println!("epoch {epoch}: the uninstalled key moved to {}", aside.display());
+            }
+            std::fs::rename(&parked, &next).map_err(|e| format!("move the key into {}: {e}", next.display()))?;
+            println!("epoch {epoch}: key kept aside during the rotation now in {}", next.display());
+            continue;
+        }
+        let Some(k) = schedule.attempt_at(committee.height, epoch_blocks, tip) else {
+            say(format!("epoch {epoch}: member {self_index}, waiting for the next attempt to open"));
+            continue;
+        };
+        if tried >= Some((epoch, k)) {
+            continue;
+        }
+        if lock.exists() {
+            say(format!("epoch {epoch}: a rotation holds {}; not making a new key", lock.display()));
+            continue;
+        }
+        tried = Some((epoch, k));
+
+        let target = next.clone();
+        let work = root.join(format!(".dkg-{epoch}-{k}"));
+        let _ = std::fs::remove_dir_all(&work);
+        println!(
+            "epoch {epoch}: attempt {k} at height {tip}, member {self_index} of {} → {}",
+            committee.size(),
+            target.display()
+        );
+        let run = DkgRun {
+            key_generation: k,
+            share_dir: Some(work.to_string_lossy().into_owned()),
+            port_base,
+            timeout,
+            epoch: Some(epoch),
+            standby_round: None,
+        };
+        // A DKG holds this loop for up to its timeout: say so, and that it is not stuck.
+        status!(set("dkg_running", format!("epoch {epoch} attempt {k} since height {tip}")));
+        status!(beat(timeout + Duration::from_secs(120)));
+        let result = run_dkg_with(cfg, &run);
+        status!(set("dkg_running", serde_json::Value::Null));
+        if let Err(e) = result {
+            eprintln!("epoch {epoch}: attempt {k} failed: {e}");
+            status!(set("last_attempt", format!("epoch {epoch} attempt {k}: failed: {e}")));
+            status!(problem("dkg", Some(format!("epoch {epoch} attempt {k} failed: {e}"))));
+            let _ = std::fs::remove_dir_all(&work);
+            continue;
+        }
+        status!(set("last_attempt", format!("epoch {epoch} attempt {k}: key made")));
+        status!(problem("dkg", None));
+        if lock.exists() || key_in_use(&next) {
+            // A rotation took the old key while this one was being made, or a hand-off is
+            // under way to it on chain: leave it in place.
+            let parked = root.join(format!("shares-next.unplaced-at-{epoch}"));
+            std::fs::rename(&work, &parked).map_err(|e| format!("park the key in {}: {e}", parked.display()))?;
+            eprintln!("epoch {epoch}: {} is in use by a hand-off; the new key was kept in {}", next.display(), parked.display());
+            continue;
+        }
+        if next.exists() {
+            // A key that was never installed: the newest committee's replaces it. Kept rather
+            // than deleted, like every retired tree.
+            let aside = free_name(&root, &format!("shares-next.superseded-at-{epoch}"));
+            std::fs::rename(&next, &aside).map_err(|e| format!("move {} aside: {e}", next.display()))?;
+            println!("epoch {epoch}: the uninstalled key moved to {}", aside.display());
+        }
+        std::fs::rename(&work, &target).map_err(|e| format!("move the key into {}: {e}", target.display()))?;
+        println!("epoch {epoch}: key ready in {} (generation {k})", target.display());
+    }
+}
+
+/// The epoch of the committee consensus counts as holding the key (`pgw`, `pevm`), from this
+/// node's own daemon (`bridge_get_standby`): the first epoch committee whose members attested it
+/// (key_attestation). `None` while it is not attested, or if only a standby round attested it.
+#[cfg(feature = "serve-live")]
+fn attested_epoch_of(
+    daemon: &beldex_bridge_signer::evm_watcher::HttpJsonRpc,
+    pgw: &[u8; 32],
+    pevm: &[u8; 20],
+) -> Result<Option<u64>, String> {
+    use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
+    use beldex_bridge_signer::key_attestation as ka;
+    let v = daemon.call("bridge_get_standby", serde_json::json!({})).map_err(|e| format!("bridge_get_standby: {e:?}"))?;
+    let records = ka::parse_records(&v).ok_or("bridge_get_standby: no attestations in the reply")?;
+    Ok(ka::holder(&records, pgw).filter(|r| r.round_height == 0 && r.pevm_address == *pevm).map(|r| r.epoch))
+}
+
+/// This member's key attestation for the key in `tree` (key_attestation): once every member
+/// has confirmed the key (its certificate), each says on chain, from its own fee wallet
+/// (`BRIDGE_SIGNER_ACK_WALLET_RPC`, logged in to with `BRIDGE_SIGNER_ACK_WALLET_LOGIN_FILE`),
+/// that its committee generated it. The outgoing committee hands over only to a key consensus
+/// counts as attested, so this comes before any hand-off. `Ok((true, _))` once the chain
+/// counts this member or the key; `Ok((false, _))` after sending one (or printing it, with no
+/// wallet), to be looked at again later.
+#[cfg(feature = "serve-live")]
+fn attest_tree_key(cfg: &Config, tree: &std::path::Path, epoch: u64, self_index: u16) -> Result<(bool, String), String> {
+    use beldex_bridge_signer::aggregate_signature::eth_address;
+    use beldex_bridge_signer::dkg_driver::KeyCertificate;
+    use beldex_bridge_signer::evm_watcher::{HttpJsonRpc, JsonRpcClient as _};
+    use beldex_bridge_signer::key_attestation as ka;
+
+    let cert = KeyCertificate::from_text(
+        &std::fs::read_to_string(tree.join(KEY_CERT_FILE)).map_err(|e| format!("{}/{KEY_CERT_FILE}: {e}", tree.display()))?,
+    )?;
+    if cert.epoch != epoch {
+        return Err(format!("{} holds epoch {}'s key, not epoch {epoch}'s", tree.display(), cert.epoch));
+    }
+    let pevm = eth_address(&k256::ecdsa::VerifyingKey::from_sec1_bytes(&cert.pevm).map_err(|e| format!("Pevm group key: {e}"))?);
+    let daemon = HttpJsonRpc::new(format!("{}/json_rpc", cfg.beldexd_rpc_url.trim_end_matches('/')));
+    let v = daemon.call("bridge_get_standby", serde_json::json!({})).map_err(|e| format!("bridge_get_standby: {e:?}"))?;
+    let records = ka::parse_records(&v).ok_or("bridge_get_standby: no attestations in the reply")?;
+    match ka::status(&records, epoch, 0, &cert.pgw, &pevm, self_index) {
+        ka::Status::Attested => return Ok((true, format!("key attested: committee epoch {epoch} holds gateway key {}", hex(&cert.pgw)))),
+        ka::Status::Counted => return Ok((true, format!("key attestation counted (member {self_index}); the others are still to come"))),
+        ka::Status::Missing => {}
+    }
+    let key_file = std::env::var("BRIDGE_SIGNER_MN_KEY_FILE").map_err(|_| "set BRIDGE_SIGNER_MN_KEY_FILE (this node's signer key)".to_string())?;
+    let sk: [u8; 64] = std::fs::read(&key_file)
+        .map_err(|e| format!("read {key_file}: {e}"))?
+        .try_into()
+        .map_err(|_| format!("{key_file} is not a 64-byte key_ed25519"))?;
+    let genesis = std::env::var("BRIDGE_SIGNER_GENESIS_HASH")
+        .ok()
+        .and_then(|h| config::parse_hex32(&h))
+        .filter(|g| *g != [0; 32])
+        .ok_or("set BRIDGE_SIGNER_GENESIS_HASH: the attestation is bound to the chain")?;
+    let sig = ka::sign(&sk, &genesis, epoch, 0, &cert.pgw, &pevm)?;
+    let wallet = match std::env::var("BRIDGE_SIGNER_ACK_WALLET_RPC").ok().filter(|v| !v.trim().is_empty()) {
+        None => {
+            println!(
+                "KEY-ATTESTATION epoch={epoch} round_height=0 pgw_vk={} pevm_address={} voter_index={self_index} signature={} \
+                 (no wallet RPC: submit with the wallet RPC bridge_key_attestation)",
+                hex(&cert.pgw),
+                hex(&pevm),
+                hex(&sig)
+            );
+            return Ok((false, "key attestation signed; no wallet RPC to send it (BRIDGE_SIGNER_ACK_WALLET_RPC)".into()));
+        }
+        Some(url) => match std::env::var("BRIDGE_SIGNER_ACK_WALLET_LOGIN_FILE").ok().filter(|v| !v.trim().is_empty()) {
+            Some(f) => HttpJsonRpc::new(url).with_basic_auth(&beldex_bridge_signer::rpc_login::read_login_file(std::path::Path::new(f.trim()))?),
+            None => HttpJsonRpc::new(url),
+        },
+    };
+    let r = wallet
+        .call(
+            "bridge_key_attestation",
+            serde_json::json!({
+                "epoch": epoch,
+                "round_height": 0,
+                "pgw_vk": hex(&cert.pgw),
+                "pevm_address": hex(&pevm),
+                "voter_index": self_index,
+                "signature": hex(&sig),
+            }),
+        )
+        .map_err(|e| format!("key attestation not submitted: {e:?}"))?;
+    Ok((
+        false,
+        format!(
+            "key attestation (committee epoch {epoch}, member {self_index}) submitted: tx {}",
+            r.get("tx_hash").and_then(serde_json::Value::as_str).unwrap_or("?")
+        ),
+    ))
+}
+
+#[cfg(not(feature = "serve-live"))]
+fn attest_tree_key(_cfg: &Config, _tree: &std::path::Path, _epoch: u64, _self_index: u16) -> Result<(bool, String), String> {
+    Ok((true, "key attestation needs a build with `--features serve-live`".into()))
+}
+
+/// `dkg-auto`'s part of the hand-off: the incoming committee signs `activateRotation` with the
+/// key it has just made (in `next`), and publishes it on the bus with the key's certificate.
+///
+/// The contract takes it only after the outgoing committee's `rotateSigner` and the challenge
+/// window, but it is signed now, while every member is still on line from the DKG. It is the
+/// first signature the new key makes, so it doubles as the proof that the key signs. The
+/// outgoing committee checks the certificate and this signature before it signs the hand-off
+/// to this key, and a relayer holds the payload until the contract takes it.
+///
+/// Per chain in `BRIDGE_SIGNER_EVM_CHAINS`; the payload is kept as `next/activation-<chain>`
+/// and published again on every call (the daemon's retained copy does not survive a restart),
+/// and signed again if the contract's key epoch has moved since. A member outside the signer
+/// set has nothing to sign.
+#[cfg(feature = "serve-live")]
+fn sign_activation(cfg: &Config, next: &std::path::Path, port_base: u16, attempt: u32) -> Result<String, String> {
+    use beldex_bridge_signer::aggregate_signature::{eth_address, pevm_signer};
+    use beldex_bridge_signer::dkg_driver::KeyCertificate;
+    use beldex_bridge_signer::evm_watcher::{parse_evm_chains, HttpJsonRpc, JsonRpcClient};
+    use beldex_bridge_signer::omq_client::{mint_publish_message, OmqCommitteeClient};
+
+    let chains = match std::env::var("BRIDGE_SIGNER_EVM_CHAINS") {
+        Ok(j) if !j.trim().is_empty() => parse_evm_chains(&j)?,
+        _ => return Ok("no BRIDGE_SIGNER_EVM_CHAINS: activation not signed".into()),
+    };
+    let dir = next.to_string_lossy().into_owned();
+    let cert_text = std::fs::read_to_string(next.join(KEY_CERT_FILE)).map_err(|e| format!("{dir}/{KEY_CERT_FILE}: {e}"))?;
+    let cert = KeyCertificate::from_text(&cert_text)?;
+    let signer = eth_address(
+        &k256::ecdsa::VerifyingKey::from_sec1_bytes(&cert.pevm).map_err(|e| format!("Pevm group key: {e}"))?,
+    );
+    let live = match build_live_signers_for(cfg, &dir, port_base) {
+        Ok(l) => l,
+        Err(e) if e.contains("not in the signer set") => return Ok("not in the activation's signer set".into()),
+        Err(e) => return Err(e),
+    };
+    let genesis: Option<[u8; 32]> =
+        std::env::var("BRIDGE_SIGNER_GENESIS_HASH").ok().and_then(|h| config::parse_hex32(&h)).filter(|g| *g != [0; 32]);
+    let bus_endpoint = std::env::var("BRIDGE_SIGNER_MINT_BUS_ENDPOINT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| cfg.oxenmq_endpoint.clone());
+    let mut done = Vec::new();
+    for c in &chains {
+        // The epoch it activates: the one after the contract's current key.
+        let reply = HttpJsonRpc::new(c.rpc_url.clone())
+            .call("eth_call", serde_json::json!([{ "to": format!("0x{}", hex(&c.contract)), "data": "0x6fdf657e" }, "latest"]))
+            .map_err(|e| format!("chain {}: keyEpoch(): {e:?}", c.chain_id))?;
+        let key_epoch = reply
+            .as_str()
+            .and_then(|w| w.strip_prefix("0x"))
+            .filter(|w| w.len() == 64 && w[..48].bytes().all(|b| b == b'0'))
+            .and_then(|w| u64::from_str_radix(&w[48..], 16).ok())
+            .ok_or_else(|| format!("chain {}: keyEpoch() returned {reply}", c.chain_id))?;
+        // Activated already (by a relayer that carried this payload): nothing left to sign
+        // or publish. Without this the epoch moving on would look like a stale activation and
+        // get one for the next epoch, to a key that is already live.
+        let current = HttpJsonRpc::new(c.rpc_url.clone())
+            .call("eth_call", serde_json::json!([{ "to": format!("0x{}", hex(&c.contract)), "data": "0x4cd615e7" }, "latest"]))
+            .map_err(|e| format!("chain {}: currentSigner(): {e:?}", c.chain_id))?;
+        if current.as_str().and_then(|w| w.get(26..)).is_some_and(|a| a.eq_ignore_ascii_case(&hex(&signer))) {
+            done.push(format!("chain {}: 0x{} is the live key, nothing to activate", c.chain_id, hex(&signer)));
+            continue;
+        }
+        let pending_key_epoch = key_epoch + 1;
+        let preimage =
+            beldex_bridge_signer::release_policy::activate_preimage(c.chain_id, c.contract, pending_key_epoch, signer);
+        let file = next.join(format!("activation-{}", c.chain_id));
+        let kept = std::fs::read_to_string(&file)
+            .ok()
+            .filter(|p| p.contains(&format!(r#""pending_key_epoch":{pending_key_epoch},"#)));
+        let payload = match kept {
+            Some(p) => p,
+            None => {
+                let sig = live.pevm_sign(&preimage, &live.signers, attempt)?;
+                if pevm_signer(&preimage, &sig) != Some(signer) {
+                    return Err(format!(
+                        "chain {}: the activation does not recover to the new key 0x{}",
+                        c.chain_id,
+                        hex(&signer)
+                    ));
+                }
+                let payload = format!(
+                    r#"{{"kind":"activate","contract":"{}","chain_id":{},"pending_signer":"{}","pending_key_epoch":{},"sig":"{}","keycert":"{}"}}"#,
+                    hex(&c.contract),
+                    c.chain_id,
+                    hex(&signer),
+                    pending_key_epoch,
+                    hex(&sig),
+                    cert_text.replace('\n', "\\n"),
+                );
+                std::fs::write(&file, &payload).map_err(|e| format!("write {}: {e}", file.display()))?;
+                payload
+            }
+        };
+        let published = match genesis {
+            Some(g) => {
+                let pub_sig = beldex_bridge_signer::ffi::ed25519_sign_detached(&live.ed25519_secret, &mint_publish_message(&g, &payload))?;
+                let member = live.committee.members[live.self_index as usize];
+                bus_endpoints(&bus_endpoint)
+                    .into_iter()
+                    .map(|e| match OmqCommitteeClient::new(e.clone()).publish_mint_payload(&payload, live.self_index, &pub_sig, &member) {
+                        Ok(r) => format!("published to {e} ({r})"),
+                        Err(err) => format!("NOT published to {e} ({err}); kept in {}", file.display()),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+            None => format!("not published (BRIDGE_SIGNER_GENESIS_HASH unset); kept in {}", file.display()),
+        };
+        done.push(format!("chain {} key epoch {pending_key_epoch} → 0x{}: {published}", c.chain_id, hex(&signer)));
+    }
+    Ok(format!("activation signed: {}", done.join("; ")))
+}
+
+#[cfg(all(feature = "live-dkg", not(feature = "serve-live")))]
+fn sign_activation(_cfg: &Config, _next: &std::path::Path, _port_base: u16, _attempt: u32) -> Result<String, String> {
+    Ok("activation not signed: needs a build with --features serve-live".into())
+}
+
+#[cfg(not(feature = "live-dkg"))]
+fn run_dkg_auto(_cfg: &Config) -> Result<(), String> {
+    Err("the `dkg-auto` subcommand requires a build with `--features live-dkg`".into())
+}
+
+/// What a long-running job (`serve`, `dkg-auto`, `handover-submit`) is doing, for monitoring:
+/// with `BRIDGE_SIGNER_STATUS_LISTEN` set (e.g. `127.0.0.1:9100`) a thread answers
+/// `GET /status` (all of it, as JSON) and `GET /health` (200 `ok`, or 503 and the problems), so
+/// any monitoring tool can poll it. The job records facts and problems; it also beats a
+/// heartbeat, and one missing for longer than the job said it may is a problem by itself —
+/// the HTTP thread answers even while the job is busy, so a stuck job still shows up.
+#[cfg(feature = "serve-live")]
+#[derive(Clone)]
+struct StatusBoard(std::sync::Arc<std::sync::Mutex<StatusState>>);
+
+#[cfg(feature = "serve-live")]
+struct StatusState {
+    facts: serde_json::Map<String, serde_json::Value>,
+    problems: std::collections::BTreeMap<String, String>,
+    beat: std::time::Instant,
+    stale_after: std::time::Duration,
+}
+
+#[cfg(feature = "serve-live")]
+impl StatusBoard {
+    fn start(role: &str) -> StatusBoard {
+        let board = StatusBoard(std::sync::Arc::new(std::sync::Mutex::new(StatusState {
+            facts: [("role".to_string(), serde_json::json!(role))].into_iter().collect(),
+            problems: Default::default(),
+            beat: std::time::Instant::now(),
+            stale_after: std::time::Duration::from_secs(300),
+        })));
+        if let Some(listen) = std::env::var("BRIDGE_SIGNER_STATUS_LISTEN").ok().filter(|v| !v.trim().is_empty()) {
+            match tiny_http::Server::http(&listen) {
+                Ok(server) => {
+                    println!("  status: http://{listen}/status and /health");
+                    let b = board.clone();
+                    std::thread::spawn(move || {
+                        for req in server.incoming_requests() {
+                            let (code, body) = b.answer(req.url());
+                            let _ = req.respond(tiny_http::Response::from_string(body).with_status_code(code));
+                        }
+                    });
+                }
+                Err(e) => eprintln!("  status endpoint not started ({listen}: {e})"),
+            }
+        }
+        board
+    }
+
+    fn set(&self, key: &str, value: impl Into<serde_json::Value>) {
+        if let Ok(mut s) = self.0.lock() {
+            s.facts.insert(key.to_string(), value.into());
+        }
+    }
+
+    /// Record (`Some`) or clear (`None`) a named problem.
+    fn problem(&self, name: &str, what: Option<String>) {
+        if let Ok(mut s) = self.0.lock() {
+            match what {
+                Some(w) => s.problems.insert(name.to_string(), w),
+                None => s.problems.remove(name),
+            };
+        }
+    }
+
+    /// The job is alive, and will be again within `next`.
+    fn beat(&self, next: std::time::Duration) {
+        if let Ok(mut s) = self.0.lock() {
+            s.beat = std::time::Instant::now();
+            s.stale_after = next;
+        }
+    }
+
+    fn answer(&self, url: &str) -> (u16, String) {
+        let Ok(s) = self.0.lock() else { return (500, "status unavailable".into()) };
+        let mut problems = s.problems.clone();
+        let quiet = s.beat.elapsed();
+        if quiet > s.stale_after {
+            problems.insert("stalled".into(), format!("no progress for {}s", quiet.as_secs()));
+        }
+        if url.starts_with("/health") {
+            return if problems.is_empty() {
+                (200, "ok\n".into())
+            } else {
+                (503, problems.iter().map(|(k, v)| format!("{k}: {v}\n")).collect())
+            };
+        }
+        let mut all = s.facts.clone();
+        all.insert("seconds_since_progress".into(), serde_json::json!(quiet.as_secs()));
+        all.insert("problems".into(), serde_json::json!(problems));
+        (200, serde_json::Value::Object(all).to_string())
+    }
 }
 
 /// Read a secret share file: it must be sealed under the share key (see
@@ -1157,6 +1871,18 @@ fn run_serve(cfg: &Config) -> Result<(), String> {
             e.amount,
             hex(&e.beldex_recipient)
         ),
+        Duty::Rotate(r) => println!(
+            "ROTATE duty: chain={} key epoch {} -> 0x{}",
+            r.chain_id,
+            r.new_key_epoch,
+            hex(&r.new_signer)
+        ),
+        Duty::Handover(h) => println!(
+            "HANDOVER duty: gateway 0x{} -> owner {} (key epoch {})",
+            hex(&h.gateway_id),
+            hex(&h.new_owner),
+            h.key_epoch
+        ),
     });
 
     let reports = serve(&mut orch, &mut src, &mut backend, &opts, || false);
@@ -1229,8 +1955,34 @@ fn run_relay_watch_standalone() -> Result<(), String> {
     // eligible: the signers re-deliver unminted payloads and the daemon re-fans them, and
     // that re-delivery is this process's only chance to try again.
     let mut handled: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // A key hand-off's two calls are sent once each, and the second only after the challenge
+    // window: an `activate` arrives right after the new committee's DKG, long before the
+    // contract will take it. One that could not be relayed yet is kept and tried again here
+    // until it lands (or the relayer reports its key epoch already live), not left to a
+    // re-delivery that may never come.
+    let mut held: std::collections::BTreeMap<String, (String, std::time::Instant)> = Default::default();
+    let mut retried_at = std::time::Instant::now();
+    const HOLD_RETRY: Duration = Duration::from_secs(30);
+    const HOLD_FOR: Duration = Duration::from_secs(2 * 24 * 3600);
     let per_sub_timeout = Duration::from_millis(5000 / subs.len().max(1) as u64);
     loop {
+        if retried_at.elapsed() >= HOLD_RETRY && !held.is_empty() {
+            retried_at = std::time::Instant::now();
+            held.retain(|key, (payload, since)| {
+                if since.elapsed() >= HOLD_FOR {
+                    eprintln!("     {key}: still not relayed after two days — dropped");
+                    return false;
+                }
+                match pipe_to_relay(&cmd, payload) {
+                    Ok(out) => {
+                        println!("     {key} relayed: {}", out.trim());
+                        handled.insert(key.clone());
+                        false
+                    }
+                    Err(_) => true,
+                }
+            });
+        }
         for sub in subs.iter_mut() {
             match sub.poll(per_sub_timeout) {
                 Ok(Some(payload)) => {
@@ -1241,21 +1993,61 @@ fn run_relay_watch_standalone() -> Result<(), String> {
                             s.split(end).next().unwrap_or("").trim_end_matches('}').to_string()
                         })
                     };
-                    let txid = field("beldex_txid", true).unwrap_or_default();
-                    let idx = field("output_index", false).unwrap_or_else(|| "0".into());
-                    let key = format!("{txid}:{idx}");
-                    if !txid.is_empty() && handled.contains(&key) {
-                        println!("(skip: {key} already relayed this session)");
+                    let kind = field("kind", true).unwrap_or_default();
+                    // The gateway hand-over's signature and a completed ack are for the Beldex
+                    // submitter, not EVM calls.
+                    if kind == "handover" || kind == "ack" {
+                        continue;
+                    }
+                    let chain = field("chain_id", false).unwrap_or_default();
+                    let (key, hand_off) = match kind.as_str() {
+                        // The signer is part of the name: a payload for the same epoch but
+                        // another key (a stale one, or a forgery) must not shadow the real one.
+                        "rotate" => (
+                            format!(
+                                "rotate:{chain}:{}:{}",
+                                field("new_key_epoch", false).unwrap_or_default(),
+                                field("new_signer", true).unwrap_or_default()
+                            ),
+                            true,
+                        ),
+                        "activate" => (
+                            format!(
+                                "activate:{chain}:{}:{}",
+                                field("pending_key_epoch", false).unwrap_or_default(),
+                                field("pending_signer", true).unwrap_or_default()
+                            ),
+                            true,
+                        ),
+                        // A standby naming or takeover step: named by its signature, which is
+                        // single-use on chain. Relayed once; the signers sign it again if it is
+                        // still wanted, so a refused one is not held.
+                        "set_standby" | "takeover_begin" | "takeover_complete" | "takeover_cancel" => (
+                            format!("{kind}:{chain}:{}", field("sig", true).unwrap_or_default()),
+                            false,
+                        ),
+                        _ => {
+                            let txid = field("beldex_txid", true).unwrap_or_default();
+                            let idx = field("output_index", false).unwrap_or_else(|| "0".into());
+                            (if txid.is_empty() { String::new() } else { format!("{txid}:{idx}") }, false)
+                        }
+                    };
+                    if !key.is_empty() && (handled.contains(&key) || held.contains_key(&key)) {
+                        println!("(skip: {key} already relayed or held this session)");
                         continue;
                     }
                     count += 1;
-                    println!("[{count}] mint payload received: {payload}");
+                    println!("[{count}] {} payload received: {payload}", if kind.is_empty() { "mint" } else { &kind });
                     match pipe_to_relay(&cmd, &payload) {
                         Ok(out) => {
                             println!("     relayed: {}", out.trim());
-                            if !txid.is_empty() {
+                            if !key.is_empty() {
                                 handled.insert(key);
                             }
+                        }
+                        Err(e) if hand_off => {
+                            eprintln!("     not relayed yet ({e}) — held, retried every {}s", HOLD_RETRY.as_secs());
+                            held.insert(key, (payload, std::time::Instant::now()));
                         }
                         Err(e) => eprintln!(
                             "     RELAY FAILED ({e}) — will try again when it is re-delivered"
@@ -1269,6 +2061,269 @@ fn run_relay_watch_standalone() -> Result<(), String> {
             }
         }
     }
+}
+
+/// `handover-submit`: the gateway hand-over's submitter, run beside the relayer by whoever pays
+/// the Beldex fees, with the hand-over wallet (`BRIDGE_SIGNER_HANDOVER_WALLET_RPC`, a wallet RPC
+/// kept for nothing else: spending the outputs a built hand-over uses voids it).
+///
+///   1. Builds: the outgoing committee's leader asks `GET /build?owner=<Pgw>`, and gets the
+///      unsigned descriptor update moving the reserve gateway to that owner. Only for a `Pgw`
+///      whose key certificate this process checked itself (activations on the bus), and once
+///      per owner: the build is kept and the same one is handed to every asker.
+///   2. Collects: the committee's `handover` signature from the bus, kept only if it verifies
+///      against the gateway's CURRENT owner key.
+///   3. Sends: once every chain's wBDX signer is that certificate's key — never before, or the
+///      gateway would follow a rotation that has not happened — then confirms the owner moved.
+///
+/// Rotation acknowledgements are not paid here: each member pays for its own, from its own
+/// fee wallet (`serve`, `BRIDGE_SIGNER_ACK_WALLET_RPC`).
+///
+/// Every step is kept in `BRIDGE_SIGNER_HANDOVER_DIR` (default `handovers`), one file per
+/// owner: with that directory and the wallet's seed, another machine can carry on (A41).
+#[cfg(feature = "serve-live")]
+fn run_handover_submit() -> Result<(), String> {
+    use beldex_bridge_signer::dkg_driver::KeyCertificate;
+    use beldex_bridge_signer::evm_watcher::{parse_evm_chains, HttpJsonRpc, JsonRpcClient};
+    use beldex_bridge_signer::omq_client::{OmqCommitteeClient, OmqMintSubscriber};
+    use std::time::{Duration, Instant};
+
+    let need = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty()).ok_or(format!("set {k}"));
+    // Every bus daemon to listen to, comma-separated; the first one also answers committees.
+    let buses = bus_endpoints(&need("BRIDGE_SIGNER_OXENMQ_ENDPOINT")?);
+    let bus = buses.first().cloned().ok_or("BRIDGE_SIGNER_OXENMQ_ENDPOINT lists no endpoint")?;
+    let daemon = HttpJsonRpc::new(format!("{}/json_rpc", need("BRIDGE_SIGNER_BELDEXD_RPC_URL")?.trim_end_matches('/')));
+    // Each wallet RPC is logged in to with the `user:password` in its own owner-only file
+    // (rpc_login): without one, anything that can reach its port can spend from it.
+    let login_for = |url: String, file_var: &str| -> Result<HttpJsonRpc, String> {
+        match std::env::var(file_var).ok().filter(|v| !v.trim().is_empty()) {
+            Some(p) => {
+                let login = beldex_bridge_signer::rpc_login::read_login_file(std::path::Path::new(p.trim()))?;
+                Ok(HttpJsonRpc::new(url).with_basic_auth(&login))
+            }
+            None => {
+                println!("  WARNING: {url} is used without a login ({file_var} not set)");
+                Ok(HttpJsonRpc::new(url))
+            }
+        }
+    };
+    let wallet = login_for(need("BRIDGE_SIGNER_HANDOVER_WALLET_RPC")?, "BRIDGE_SIGNER_HANDOVER_WALLET_LOGIN_FILE")?;
+    let gateway = need("BRIDGE_SIGNER_RELEASE_GATEWAY")?.to_ascii_lowercase();
+    let chains = parse_evm_chains(&need("BRIDGE_SIGNER_EVM_CHAINS")?)?;
+    let listen = std::env::var("BRIDGE_SIGNER_HANDOVER_LISTEN").unwrap_or_else(|_| "127.0.0.1:18090".into());
+    let dir = std::path::PathBuf::from(std::env::var("BRIDGE_SIGNER_HANDOVER_DIR").unwrap_or_else(|_| "handovers".into()));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let server = tiny_http::Server::http(&listen).map_err(|e| format!("listen {listen}: {e}"))?;
+    let committees = OmqCommitteeClient::new(bus);
+    let mut subs: Vec<OmqMintSubscriber> = buses.into_iter().map(OmqMintSubscriber::new).collect();
+    println!("handover-submit: gateway {gateway}, builds on http://{listen}/build?owner=<Pgw>, records in {}", dir.display());
+
+    // One record per new owner, as JSON: what was built, the signature once collected, and
+    // the transaction once sent.
+    let file = |owner: &str| dir.join(format!("{owner}.json"));
+    let load = |owner: &str| -> Option<serde_json::Value> { serde_json::from_str(&std::fs::read_to_string(file(owner)).ok()?).ok() };
+    let save = |owner: &str, rec: &serde_json::Value| -> Result<(), String> {
+        let tmp = file(&format!("{owner}.tmp"));
+        std::fs::write(&tmp, rec.to_string()).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, file(owner)).map_err(|e| format!("{}: {e}", file(owner).display()))
+    };
+    let owner_now = || -> Option<String> {
+        let info = daemon.call("get_gateway_info", serde_json::json!({ "gateway_address": gateway })).ok()?;
+        Some(info.get("owner_key")?.as_str()?.to_ascii_lowercase())
+    };
+    // A Pgw this process checked: its certificate's epoch and wBDX signer address.
+    let mut verified: std::collections::BTreeMap<String, (u64, String)> = Default::default();
+    let mut swept = Instant::now();
+    let status = StatusBoard::start("handover-submit");
+    // Below this many atomic units a wallet is reported low (unset: not checked).
+    let wallet_low: Option<u64> = std::env::var("BRIDGE_SIGNER_WALLET_LOW").ok().and_then(|v| v.trim().parse().ok());
+
+    loop {
+        status.beat(Duration::from_secs(120));
+        // 1. Builds.
+        if let Ok(Some(req)) = server.recv_timeout(Duration::from_millis(200)) {
+            let owner = req.url().split_once("owner=").map(|(_, o)| o.split('&').next().unwrap_or("").to_ascii_lowercase());
+            let answer = match owner {
+                Some(o) if o.len() == 64 && o.bytes().all(|b| b.is_ascii_hexdigit()) => match (load(&o), verified.get(&o)) {
+                    (Some(rec), _) => Ok(rec),
+                    (None, Some((epoch, signer))) => wallet
+                        .call(
+                            "gateway_update_descriptor",
+                            serde_json::json!({ "gateway_id": gateway, "owner_key_type": "eddsa", "owner_key": o,
+                                                "bridge_reserve": true, "meta_info": "bridge reserve", "priority": 1 }),
+                        )
+                        .map_err(|e| format!("wallet: {e:?}"))
+                        .and_then(|b| {
+                            let rec = serde_json::json!({
+                                "owner": o, "key_epoch": epoch, "signer": signer,
+                                "tx_blob": b.get("tx_blob"), "tx_metadata": b.get("tx_metadata"),
+                                "hash_to_sign": b.get("hash_to_sign"), "fee": b.get("fee"),
+                            });
+                            save(&o, &rec)?;
+                            println!("built the hand-over to {o} (key epoch {epoch}), hash {}", rec["hash_to_sign"]);
+                            Ok(rec)
+                        }),
+                    (None, None) => Err(format!("no checked key certificate names {o}")),
+                },
+                _ => Err("ask for /build?owner=<64 hex Pgw>".into()),
+            };
+            let reply = match answer {
+                Ok(rec) => tiny_http::Response::from_string(
+                    serde_json::json!({ "tx_blob": rec["tx_blob"], "hash_to_sign": rec["hash_to_sign"] }).to_string(),
+                ),
+                Err(e) => tiny_http::Response::from_string(serde_json::json!({ "error": e }).to_string()).with_status_code(404),
+            };
+            let _ = req.respond(reply);
+        }
+
+        // 2. The bus: certificates to build for, and the committee's signatures.
+        let mut arrived = Vec::new();
+        for sub in subs.iter_mut() {
+            while let Ok(Some(p)) = sub.poll(Duration::from_millis(20)) {
+                arrived.push(p);
+            }
+        }
+        for p in arrived {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&p) else { continue };
+            let text = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_ascii_lowercase();
+            match v.get("kind").and_then(|k| k.as_str()) {
+                Some("activate") => {
+                    let Ok(cert) = KeyCertificate::from_text(v.get("keycert").and_then(|x| x.as_str()).unwrap_or_default()) else { continue };
+                    let owner = hex(&cert.pgw);
+                    if verified.contains_key(&owner) {
+                        continue;
+                    }
+                    match committees.fetch_committee(Some(cert.height)).map_err(|e| e.to_string()).and_then(|c| {
+                        cert.verify(&c, &beldex_bridge_signer::wire_auth::LibsodiumEd25519)
+                    }) {
+                        Ok(()) => {
+                            // Built only for a key consensus counts as attested, as the committee checks.
+                            let pevm = k256::ecdsa::VerifyingKey::from_sec1_bytes(&cert.pevm)
+                                .map(|k| beldex_bridge_signer::aggregate_signature::eth_address(&k));
+                            match pevm.map_err(|e| e.to_string()).and_then(|a| attested_epoch_of(&daemon, &cert.pgw, &a)) {
+                                Ok(Some(e)) if e == cert.epoch => {
+                                    println!("checked the epoch {} key certificate and attestation: Pgw {owner}", cert.epoch);
+                                    verified.insert(owner, (cert.epoch, text("pending_signer")));
+                                }
+                                Ok(_) => eprintln!("  the epoch {} key {owner} is not attested on chain yet", cert.epoch),
+                                Err(e) => eprintln!("  the epoch {} key's attestation could not be read: {e}", cert.epoch),
+                            }
+                        }
+                        Err(e) => eprintln!("  an activation's key certificate does not check out: {e}"),
+                    }
+                }
+                Some("handover") if text("gateway_id") == gateway => {
+                    let owner = text("owner");
+                    let Some(mut rec) = load(&owner) else { continue };
+                    if rec.get("sig").is_some() || rec["hash_to_sign"].as_str().map(str::to_ascii_lowercase) != Some(text("hash_to_sign")) {
+                        continue;
+                    }
+                    let unhex = |h: &str| (0..h.len()).step_by(2).map(|i| h.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok())).collect::<Option<Vec<u8>>>();
+                    let (Some(sig), Some(hash), Some(cur)) = (unhex(&text("sig")), unhex(&text("hash_to_sign")), owner_now().and_then(|o| unhex(&o))) else { continue };
+                    let (Ok(sig), Ok(cur)) = (<[u8; 64]>::try_from(sig), <[u8; 32]>::try_from(cur)) else { continue };
+                    if beldex_bridge_signer::ffi::ed25519_verify_consensus(&sig, &hash, &cur) {
+                        rec["sig"] = serde_json::json!(text("sig"));
+                        if save(&owner, &rec).is_ok() {
+                            println!("the outgoing committee signed the hand-over to {owner}; sent once the wBDX key has moved");
+                        }
+                    } else {
+                        eprintln!("  a hand-over signature for {owner} does not verify against the gateway's owner key");
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 3. Send what is signed, once the wBDX key has moved everywhere; confirm what was sent.
+        if swept.elapsed() < Duration::from_secs(10) {
+            continue;
+        }
+        swept = Instant::now();
+        // What this submitter holds, for monitoring: checked keys, hand-overs by state, and its
+        // wallet's balance.
+        {
+            let mut state: std::collections::BTreeMap<String, String> = Default::default();
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for path in entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")) {
+                    let Some(owner) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else { continue };
+                    let Some(rec) = load(&owner) else { continue };
+                    let st = if rec.get("done").is_some() {
+                        "done"
+                    } else if rec.get("tx_hash").is_some() {
+                        "sent, waiting for the owner to change"
+                    } else if rec.get("sig").is_some() {
+                        "signed, sent once the wBDX key has moved"
+                    } else {
+                        "built, waiting for the committee's signature"
+                    };
+                    state.insert(owner, st.to_string());
+                }
+            }
+            status.set("checked_keys", verified.len());
+            status.set("handovers", serde_json::json!(state));
+            // Low is judged on the whole balance: right after paying, the change is locked for a
+            // few blocks and the unlocked part reads 0 although nothing is short.
+            let balance = |name: &str, w: &HttpJsonRpc| {
+                let b = w.call("get_balance", serde_json::json!({ "account_index": 0 })).ok();
+                let field = |k: &str| b.as_ref().and_then(|b| b.get(k).and_then(|x| x.as_u64()));
+                let (total, unlocked) = (field("balance"), field("unlocked_balance"));
+                status.set(&format!("{name}_balance"), total.map_or(serde_json::Value::Null, |u| u.into()));
+                status.set(&format!("{name}_unlocked"), unlocked.map_or(serde_json::Value::Null, |u| u.into()));
+                status.problem(
+                    &format!("{name}_low"),
+                    match (total, wallet_low) {
+                        (Some(t), Some(low)) if t < low => Some(format!("{t} atomic units, below {low}")),
+                        (None, _) => Some("balance unreadable".into()),
+                        _ => None,
+                    },
+                );
+            };
+            balance("handover_wallet", &wallet);
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for path in entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")) {
+            let Some(owner) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else { continue };
+            let Some(mut rec) = load(&owner) else { continue };
+            if rec.get("done").is_some() || rec.get("sig").is_none() {
+                continue;
+            }
+            if rec.get("tx_hash").is_some() {
+                if owner_now().as_deref() == Some(owner.as_str()) {
+                    rec["done"] = serde_json::json!(true);
+                    let _ = save(&owner, &rec);
+                    println!("hand-over done: the gateway's owner is now {owner}");
+                }
+                continue;
+            }
+            let signer = rec["signer"].as_str().unwrap_or_default().to_ascii_lowercase();
+            let moved = chains.iter().all(|c| {
+                HttpJsonRpc::new(c.rpc_url.clone())
+                    .call("eth_call", serde_json::json!([{ "to": format!("0x{}", hex(&c.contract)), "data": "0x4cd615e7" }, "latest"]))
+                    .ok()
+                    .and_then(|w| w.as_str().and_then(|w| w.get(26..)).map(str::to_ascii_lowercase))
+                    .is_some_and(|live| !signer.is_empty() && live == signer)
+            });
+            if !moved {
+                continue;
+            }
+            match wallet.call(
+                "gateway_submit_descriptor_update",
+                serde_json::json!({ "tx_metadata": rec["tx_metadata"], "signature": rec["sig"], "signature_type": "eddsa" }),
+            ) {
+                Ok(r) => {
+                    rec["tx_hash"] = r.get("tx_hash").cloned().unwrap_or_default();
+                    let _ = save(&owner, &rec);
+                    println!("sent the hand-over to {owner}: tx {}", rec["tx_hash"]);
+                }
+                Err(e) => eprintln!("  sending the hand-over to {owner} failed (tried again): {e:?}"),
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "serve-live"))]
+fn run_handover_submit() -> Result<(), String> {
+    Err("the `handover-submit` subcommand requires a build with `--features serve-live`".into())
 }
 
 #[cfg(not(feature = "omq-client"))]
@@ -1309,6 +2364,218 @@ fn pipe_to_relay(cmd: &str, payload: &str) -> Result<String, String> {
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// An `activate` payload off the bus, as a hand-off this committee may sign. Each member
+/// checks it itself; nothing on the bus is trusted:
+///   * it is for a wBDX this node serves;
+///   * its key certificate is the selected committee's: fetched from this node's own daemon
+///     at the certificate's height, every member's signature checks out, and that committee
+///     is newer than `own_epoch`, the one holding this node's key;
+///   * the payload's new signer is that certificate's key, and the activation recovers to it;
+///   * consensus counts that key as attested by that committee (key_attestation).
+/// Returns the rotation, and the certificate's `Pgw` and epoch for the gateway hand-over.
+/// `Ok(None)` for any other kind of payload.
+#[cfg(feature = "serve-live")]
+fn rotation_from_activation(
+    payload: &str,
+    own_epoch: u64,
+    contracts: &std::collections::BTreeMap<u64, [u8; 20]>,
+    committees: &beldex_bridge_signer::omq_client::OmqCommitteeClient,
+    daemon: &beldex_bridge_signer::evm_watcher::HttpJsonRpc,
+) -> Result<Option<(beldex_bridge_signer::orchestrator::RotationRequest, [u8; 32], u64)>, String> {
+    use beldex_bridge_signer::aggregate_signature::{eth_address, pevm_signer};
+    use beldex_bridge_signer::dkg_driver::KeyCertificate;
+    let v: serde_json::Value = serde_json::from_str(payload).map_err(|e| format!("not JSON: {e}"))?;
+    if v.get("kind").and_then(|k| k.as_str()) != Some("activate") {
+        return Ok(None);
+    }
+    let text = |f: &str| v.get(f).and_then(|x| x.as_str()).ok_or(format!("no {f}"));
+    let bytes = |f: &str| -> Result<Vec<u8>, String> {
+        let h = text(f)?;
+        (0..h.len()).step_by(2).map(|i| h.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok())).collect::<Option<_>>().ok_or(format!("{f}: not hex"))
+    };
+    let chain_id = v.get("chain_id").and_then(|x| x.as_u64()).ok_or("no chain_id")?;
+    let pending_key_epoch = v.get("pending_key_epoch").and_then(|x| x.as_u64()).ok_or("no pending_key_epoch")?;
+    let contract: [u8; 20] = bytes("contract")?.try_into().map_err(|_| "contract: not 20 bytes")?;
+    let new_signer: [u8; 20] = bytes("pending_signer")?.try_into().map_err(|_| "pending_signer: not 20 bytes")?;
+    let sig = bytes("sig")?;
+    if contracts.get(&chain_id) != Some(&contract) {
+        return Err(format!("for a wBDX this node does not serve (chain {chain_id}, 0x{})", hex(&contract)));
+    }
+    let cert = KeyCertificate::from_text(text("keycert")?)?;
+    if cert.epoch <= own_epoch {
+        return Err(format!("its key is epoch {}'s, not newer than this committee's {own_epoch}", cert.epoch));
+    }
+    let committee = committees
+        .fetch_committee(Some(cert.height))
+        .map_err(|e| format!("bridge.committee at height {}: {e}", cert.height))?;
+    cert.verify(&committee, &beldex_bridge_signer::wire_auth::LibsodiumEd25519).map_err(|e| format!("key certificate: {e}"))?;
+    let cert_signer =
+        eth_address(&k256::ecdsa::VerifyingKey::from_sec1_bytes(&cert.pevm).map_err(|e| format!("certificate Pevm key: {e}"))?);
+    if cert_signer != new_signer {
+        return Err(format!("names 0x{} but its certificate's key is 0x{}", hex(&new_signer), hex(&cert_signer)));
+    }
+    // And on chain: consensus counts the key as that committee's (its members attested it), so
+    // a hand-off only ever goes to a key every node can see, never to one only the bus vouches for.
+    match attested_epoch_of(daemon, &cert.pgw, &cert_signer)? {
+        Some(e) if e == cert.epoch => {}
+        Some(e) => return Err(format!("its key is attested as epoch {e}'s, not epoch {}'s", cert.epoch)),
+        None => return Err(format!("its key is not attested on chain yet (epoch {})", cert.epoch)),
+    }
+    let preimage = beldex_bridge_signer::release_policy::activate_preimage(chain_id, contract, pending_key_epoch, new_signer);
+    if pevm_signer(&preimage, &sig) != Some(new_signer) {
+        return Err("its signature does not recover to the new key".into());
+    }
+    let rotation =
+        beldex_bridge_signer::orchestrator::RotationRequest { chain_id, contract, new_signer, new_key_epoch: pending_key_epoch };
+    Ok(Some((rotation, cert.pgw, cert.epoch)))
+}
+
+/// A wBDX contract's rotation state, read from `client` at the latest block, the chain's
+/// clock included (the deadline a member accepts is the chain's, not its own).
+#[cfg(feature = "serve-live")]
+fn read_rotation_state(
+    client: &beldex_bridge_signer::evm_watcher::HttpJsonRpc,
+    contract: &[u8; 20],
+) -> Result<beldex_bridge_signer::release_policy::RotationState, String> {
+    use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
+    use beldex_bridge_signer::release_policy::RotationState;
+    let to = format!("0x{}", hex(contract));
+    let word = |selector: &str| -> Result<u64, String> {
+        let raw = client
+            .call("eth_call", serde_json::json!([{ "to": to, "data": selector }, "latest"]))
+            .map_err(|e| format!("eth_call {selector}: {e:?}"))?;
+        raw.as_str()
+            .and_then(|w| w.strip_prefix("0x"))
+            .filter(|w| w.len() == 64 && w[..48].bytes().all(|b| b == b'0'))
+            .and_then(|w| u64::from_str_radix(&w[48..], 16).ok())
+            .ok_or_else(|| format!("eth_call {selector}: {raw}"))
+    };
+    let block = client
+        .call("eth_getBlockByNumber", serde_json::json!(["latest", false]))
+        .map_err(|e| format!("latest block: {e:?}"))?;
+    let now = block
+        .get("timestamp")
+        .and_then(|t| t.as_str())
+        .and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok())
+        .ok_or("latest block has no timestamp")?;
+    Ok(RotationState {
+        key_epoch: word("0x6fdf657e")?,          // keyEpoch()
+        rotation_nonce: word("0x94603071")?,     // rotationNonce()
+        pending_activate_at: word("0x0919b421")?, // pendingActivateAt()
+        now,
+    })
+}
+
+/// Which of a member's share trees holds the live key, read from the chain: the key that is
+/// the wBDX signer on every configured chain AND owns the reserve gateway. Both legs, because
+/// they move by separate transactions, and a key live on only one is not yet the one to serve.
+#[cfg(feature = "serve-live")]
+struct LiveKeyProbe {
+    evm: Vec<(beldex_bridge_signer::evm_watcher::HttpJsonRpc, [u8; 20])>,
+    daemon: beldex_bridge_signer::evm_watcher::HttpJsonRpc,
+    gateway: String,
+}
+
+#[cfg(feature = "serve-live")]
+impl LiveKeyProbe {
+    fn new(configs: &[beldex_bridge_signer::evm_watcher::EvmChainConfig], beldexd_rpc: &str, gateway: &str) -> Self {
+        use beldex_bridge_signer::evm_watcher::HttpJsonRpc;
+        LiveKeyProbe {
+            evm: configs.iter().map(|c| (HttpJsonRpc::new(c.rpc_url.clone()), c.contract)).collect(),
+            daemon: HttpJsonRpc::new(format!("{}/json_rpc", beldexd_rpc.trim_end_matches('/'))),
+            gateway: gateway.to_string(),
+        }
+    }
+
+    fn word(&self, i: usize, selector: &str) -> Option<String> {
+        use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
+        let (client, contract) = self.evm.get(i)?;
+        let w = client
+            .call("eth_call", serde_json::json!([{ "to": format!("0x{}", hex(contract)), "data": selector }, "latest"]))
+            .ok()?;
+        w.as_str().filter(|w| w.len() == 66).map(|w| w[2..].to_ascii_lowercase())
+    }
+
+    /// The first chain's key epoch: names the tree a hand-off retires.
+    fn key_epoch(&self) -> Option<u64> {
+        self.word(0, "0x6fdf657e").and_then(|w| u64::from_str_radix(&w[48..], 16).ok())
+    }
+
+    /// Whether `dir`'s key is live on every leg. `None` when a read fails or `dir` holds no
+    /// certified key: not knowing is never taken for an answer.
+    fn is_live(&self, dir: &std::path::Path) -> Option<bool> {
+        use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
+        let cert = beldex_bridge_signer::dkg_driver::KeyCertificate::from_text(&std::fs::read_to_string(dir.join(KEY_CERT_FILE)).ok()?).ok()?;
+        let signer = hex(&beldex_bridge_signer::aggregate_signature::eth_address(
+            &k256::ecdsa::VerifyingKey::from_sec1_bytes(&cert.pevm).ok()?,
+        ));
+        for i in 0..self.evm.len() {
+            if self.word(i, "0x4cd615e7")?[24..] != signer {
+                return Some(false);
+            }
+        }
+        let info = self.daemon.call("get_gateway_info", serde_json::json!({ "gateway_address": self.gateway })).ok()?;
+        Some(info.get("owner_key")?.as_str()?.eq_ignore_ascii_case(&hex(&cert.pgw)))
+    }
+
+    /// This node's successor tree beside `live`, if its key is now live: `shares-next`, or one
+    /// a newer committee's key moved aside or parked (`dkg-auto`).
+    fn live_successor(&self, live: &std::path::Path) -> Option<std::path::PathBuf> {
+        let root = live.parent()?;
+        let mut candidates = vec![root.join("shares-next")];
+        if let Ok(it) = std::fs::read_dir(root) {
+            for e in it.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with("shares-next.superseded-at-") || name.starts_with("shares-next.unplaced-at-") {
+                    candidates.push(e.path());
+                }
+            }
+        }
+        candidates.into_iter().find(|c| c.is_dir() && self.is_live(c) == Some(true))
+    }
+
+    /// Where the tree a hand-off retires goes: `shares-gen<N>`, `N` from the new key epoch, so
+    /// every member names it alike whichever committees it sat on. Kept, never deleted.
+    fn archive(&self, live: &std::path::Path) -> Result<std::path::PathBuf, String> {
+        let root = live.parent().ok_or("share dir has no parent")?;
+        let n = self.key_epoch().ok_or("cannot read the key epoch to name the retired tree")?.saturating_sub(2);
+        let to = free_name(root, &format!("shares-gen{n}"));
+        std::fs::rename(live, &to).map_err(|e| format!("retire {} to {}: {e}", live.display(), to.display()))?;
+        Ok(to)
+    }
+}
+
+/// A comma-separated list of bus daemons (BRIDGE_SIGNER_MINT_BUS_ENDPOINT, or a subscriber's
+/// BRIDGE_SIGNER_OXENMQ_ENDPOINT), blanks dropped.
+#[cfg(feature = "omq-client")]
+fn bus_endpoints(list: &str) -> Vec<String> {
+    list.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect()
+}
+
+/// `serve`'s exit status when its key has been handed over and its successor is live: restart
+/// it, and it serves the successor (EX_TEMPFAIL).
+#[cfg(feature = "serve-live")]
+const RESTART_ON_SUCCESSOR: i32 = 75;
+
+/// Before anything loads the shares: if this node's successor key is live on every leg, move it
+/// in (the retired tree archived), so a member serves the key the bridge now trusts without a
+/// person moving trees. Nothing happens while the hand-off is still going.
+#[cfg(feature = "serve-live")]
+fn install_successor(probe: &LiveKeyProbe, live: &std::path::Path) -> Result<Option<String>, String> {
+    if probe.is_live(live) == Some(true) {
+        return Ok(None);
+    }
+    let Some(next) = probe.live_successor(live) else { return Ok(None) };
+    let retired = if live.exists() { Some(probe.archive(live)?) } else { None };
+    std::fs::rename(&next, live).map_err(|e| format!("install {} as {}: {e}", next.display(), live.display()))?;
+    Ok(Some(format!(
+        "installed the successor key: {} -> {}{}",
+        next.display(),
+        live.display(),
+        retired.map(|r| format!(" (retired tree kept in {})", r.display())).unwrap_or_default()
+    )))
 }
 
 /// Loaded, reusable signing context for the live `serve` backend: the committee view, this
@@ -1506,12 +2773,23 @@ fn pevm_group_key_of(share: &[u8]) -> Result<Vec<u8>, String> {
 /// the mesh identity from the MN key. Mirrors the `sign` subcommand's setup.
 #[cfg(feature = "serve-live")]
 fn build_live_signers(cfg: &Config) -> Result<LiveSigners, String> {
+    let dir = std::env::var("BRIDGE_SIGNER_SHARE_DIR")
+        .map_err(|_| "set BRIDGE_SIGNER_SHARE_DIR (where `dkg` wrote the shares)".to_string())?;
+    let port_base: u16 = std::env::var("BRIDGE_SIGNER_MESH_PORT_BASE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or("set BRIDGE_SIGNER_MESH_PORT_BASE (single-host devnet)")?;
+    build_live_signers_for(cfg, &dir, port_base)
+}
+
+/// [`build_live_signers`] for the key in `dir`, on a mesh at `port_base` — so `dkg-auto` can
+/// sign with a key it has just made, apart from the one `serve` signs with.
+#[cfg(feature = "serve-live")]
+fn build_live_signers_for(cfg: &Config, dir: &str, port_base: u16) -> Result<LiveSigners, String> {
     use beldex_bridge_signer::ffi;
     use std::time::Duration;
 
-    let dir = std::env::var("BRIDGE_SIGNER_SHARE_DIR")
-        .map_err(|_| "set BRIDGE_SIGNER_SHARE_DIR (where `dkg` wrote the shares)".to_string())?;
-    let (committee, self_index) = load_key_committee(cfg, &dir)?;
+    let (committee, self_index) = load_key_committee(cfg, dir)?;
     let signers: Vec<u16> = match std::env::var("BRIDGE_SIGNER_SIGN_SIGNERS") {
         Ok(s) => s.split(',').filter_map(|x| x.trim().parse().ok()).collect(),
         Err(_) => (0..committee.threshold as u16).collect(),
@@ -1520,10 +2798,6 @@ fn build_live_signers(cfg: &Config) -> Result<LiveSigners, String> {
         return Err(format!("this node ({self_index}) is not in the signer set {signers:?}"));
     }
 
-    let port_base: u16 = std::env::var("BRIDGE_SIGNER_MESH_PORT_BASE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or("set BRIDGE_SIGNER_MESH_PORT_BASE (single-host devnet)")?;
     let pevm_offset: u16 = std::env::var("BRIDGE_SIGNER_MESH_PEVM_OFFSET")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1685,7 +2959,10 @@ fn classify_release_build_error(
 /// so a retry goes out exactly the way the first attempt did.
 #[cfg(feature = "omq-client")]
 struct MintHandoff {
-    bus: Option<beldex_bridge_signer::omq_client::OmqCommitteeClient>,
+    /// Every bus daemon to publish to (BRIDGE_SIGNER_MINT_BUS_ENDPOINT, comma-separated): a
+    /// daemon fans a payload out to its own subscribers only, so one daemon down must not be
+    /// the bus down. Receivers drop the duplicates.
+    bus: Vec<(String, beldex_bridge_signer::omq_client::OmqCommitteeClient)>,
     bus_genesis: [u8; 32],
     bus_sign_key: [u8; 64],
     /// This node's master node pubkey, named in every publication so the daemon can
@@ -1701,19 +2978,7 @@ impl MintHandoff {
     /// Best effort on every path: the payload is already saved, and the sweep re-delivers
     /// anything that has not minted, so a failure here is logged and nothing more.
     fn deliver(&self, payload: &str) {
-        if let Some(bus) = &self.bus {
-            use beldex_bridge_signer::omq_client::mint_publish_message;
-            let msg = mint_publish_message(&self.bus_genesis, payload);
-            match beldex_bridge_signer::ffi::ed25519_sign_detached(&self.bus_sign_key, &msg) {
-                Ok(pub_sig) => match bus.publish_mint_payload(payload, self.self_index, &pub_sig, &self.bus_master_node) {
-                    // `DUPLICATE` = a peer in the same quorum published it moments ago.
-                    // Expected and desirable: one fan-out per deposit, not t+1.
-                    Ok(status) => println!("  published to mint bus: {status}"),
-                    Err(e) => eprintln!("  mint-bus publish failed ({e}) — kept for re-delivery"),
-                },
-                Err(e) => eprintln!("  mint-bus signing failed ({e}) — kept for re-delivery"),
-            }
-        }
+        self.publish(payload);
         if let Some(cmd) = &self.relay_cmd {
             if self.relay_stagger_ms > 0 && self.self_index > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(
@@ -1723,6 +2988,23 @@ impl MintHandoff {
             match pipe_to_relay(cmd, payload) {
                 Ok(out) => println!("  relayed: {}", out.trim()),
                 Err(e) => eprintln!("  RELAY FAILED ({e}) — kept for re-delivery"),
+            }
+        }
+    }
+
+    /// The bus half of [`Self::deliver`] alone: for a payload no EVM relayer carries.
+    fn publish(&self, payload: &str) {
+        for (endpoint, bus) in &self.bus {
+            use beldex_bridge_signer::omq_client::mint_publish_message;
+            let msg = mint_publish_message(&self.bus_genesis, payload);
+            match beldex_bridge_signer::ffi::ed25519_sign_detached(&self.bus_sign_key, &msg) {
+                Ok(pub_sig) => match bus.publish_mint_payload(payload, self.self_index, &pub_sig, &self.bus_master_node) {
+                    // `DUPLICATE` = a peer in the same quorum published it moments ago.
+                    // Expected and desirable: one fan-out per deposit, not t+1.
+                    Ok(status) => println!("  published to mint bus {endpoint}: {status}"),
+                    Err(e) => eprintln!("  mint-bus publish to {endpoint} failed ({e}) — kept for re-delivery"),
+                },
+                Err(e) => eprintln!("  mint-bus signing failed ({e}) — kept for re-delivery"),
             }
         }
     }
@@ -1740,6 +3022,8 @@ struct EvmTakeoverState {
     cooldown_until: u64,
     /// The latest block's timestamp: the contract's clock.
     now: u64,
+    /// A rotation is pending (`pendingActivateAt` != 0): its activation clears the standby.
+    rotation_pending: bool,
 }
 
 #[cfg(feature = "serve-live")]
@@ -1850,6 +3134,7 @@ impl TakeoverReader {
             delay: Self::low_u64(&Self::word(client, contract, "standbyTakeoverDelayOrDefault()")?),
             cooldown_until: Self::low_u64(&Self::word(client, contract, "takeoverCooldownUntil()")?),
             now,
+            rotation_pending: Self::low_u64(&Self::word(client, contract, "pendingActivateAt()")?) != 0,
         })
     }
 
@@ -1955,7 +3240,11 @@ impl TakeoverReader {
             let gw_unnamed =
                 gw.as_ref().is_ok_and(|g| g.owner == ours_vk && g.started == 0 && (g.standby.is_empty() || g.stale));
             let evm_ours = evm.iter().any(|(_, _, _, st)| st.as_ref().is_ok_and(|st| st.signer == self.pevm_address && !st.running()));
-            if evm_ours || gw_unnamed {
+            // Not while this committee's key is being handed off: naming spends the rotation
+            // nonce the hand-off was signed with, and the hand-off drops the standby on every
+            // chain and on the gateway anyway. The incoming committee names its own.
+            let handing_off = evm.iter().any(|(_, _, _, st)| st.as_ref().is_ok_and(|st| st.rotation_pending));
+            if (evm_ours || gw_unnamed) && !handing_off {
                 if let Some(cand) = self.standby_target() {
                     for (chain_id, client, contract, st) in &evm {
                         let Ok(st) = st else { continue };
@@ -1999,7 +3288,14 @@ impl TakeoverReader {
         let evm_settled = |st: &EvmTakeoverState| st.signer == self.pevm_address || (st.standby == self.pevm_address && st.ready());
         let all_ready = evm.iter().all(|(_, _, _, st)| st.as_ref().is_ok_and(|st| evm_settled(st)))
             && gw.as_ref().is_ok_and(|g| g.owner == ours_vk || (g.standby == ours_vk && g.ready()));
-        let outage = self.outage.get();
+        // Begin only while every half still names this standby (or is already ours): a chain that
+        // dropped it, as a hand-off to the next committee does, could never be completed, so a
+        // begin anywhere would only cost its fee and hold off a real takeover by its cooldown.
+        let named_everywhere = evm
+            .iter()
+            .all(|(_, _, _, st)| st.as_ref().is_ok_and(|st| st.standby == self.pevm_address || st.signer == self.pevm_address))
+            && gw.as_ref().is_ok_and(|g| g.standby == ours_vk || g.owner == ours_vk);
+        let outage = self.outage.get() && named_everywhere;
         let steps_before = out.len();
         for (chain_id, client, contract, st) in &evm {
             let Ok(st) = st else { continue };
@@ -2335,7 +3631,9 @@ where
         observe_reconciled, DualReconciler, DutyReconciler, EvmMintReconciler,
         GatewayReleaseReconciler, ObserveOutcome,
     };
-    use beldex_bridge_signer::release_policy::{DualPolicy, ReleasePolicy, ReleaseProposal};
+    use beldex_bridge_signer::release_policy::{
+        DescriptorUpdateView, DualPolicy, HandoverPolicy, ReleasePolicy, ReleaseProposal, RotatePolicy, RotationState,
+    };
     use beldex_bridge_signer::transport::Leg;
     use beldex_bridge_signer::watch::ReleaseEvent;
     use beldex_bridge_signer::wire_auth::{LibsodiumEd25519, LibsodiumSigner};
@@ -2365,6 +3663,11 @@ where
     }
     enforce_network_policy(cfg, &settings)?;
 
+    // The role: `live` (the default) serves the key the chains name, mints, releases and
+    // cancels takeovers begun against it; `standby` serves a standby key, and only begins
+    // and completes a takeover by it when this node sees the live key failing.
+    let standby_role = std::env::var("BRIDGE_SIGNER_ROLE").is_ok_and(|r| r.trim() == "standby");
+
     // Run under a supervisor that restarts this process (share_watch): with no share set in
     // its directory (a node not on the current committee, a standby with none named yet)
     // it waits for one rather than exiting into a restart loop, and it remembers which set
@@ -2372,17 +3675,45 @@ where
     let share_dir = std::path::PathBuf::from(
         std::env::var("BRIDGE_SIGNER_SHARE_DIR").map_err(|_| "set BRIDGE_SIGNER_SHARE_DIR".to_string())?,
     );
+    // A successor key that is live on both legs goes in before anything loads the shares.
+    // (Live role only: a standby process's tree is its standby key, never the live successor.)
+    let key_probe = LiveKeyProbe::new(
+        configs,
+        beldexd_rpc,
+        &std::env::var("BRIDGE_SIGNER_RELEASE_GATEWAY").unwrap_or_else(|_| gateway_id.to_string()),
+    );
+    let status = StatusBoard::start(if standby_role { "serve-standby" } else { "serve" });
+    if !standby_role {
+        if let Some(m) = install_successor(&key_probe, &share_dir)? {
+            println!("{m}");
+            status.set("installed", m);
+        }
+    }
     if beldex_bridge_signer::share_watch::fingerprint(&share_dir).is_none() {
         println!("serve: no share set in {} yet: waiting for one", share_dir.display());
         // A standby signer with no key generates the next standby itself, when a standby round
         // draws it (BRIDGE_SIGNER_AUTO_DKG=0 turns this off).
-        let auto_dkg = std::env::var("BRIDGE_SIGNER_ROLE").is_ok_and(|r| r.trim() == "standby")
-            && !std::env::var("BRIDGE_SIGNER_AUTO_DKG").is_ok_and(|v| v.trim() == "0");
+        let auto_dkg = standby_role && !std::env::var("BRIDGE_SIGNER_AUTO_DKG").is_ok_and(|v| v.trim() == "0");
         if auto_dkg {
             println!("  standby key generation: automatic, when a standby round draws this node");
         }
+        // A member joining at a hand-off has only its successor tree: it waits for that key to go
+        // live on both legs instead of failing, and serves it from then on.
+        if !standby_role {
+            println!("  live role: waiting for this node's successor key to go live on both legs");
+        }
         let mut auto = AutoStandbyDkg { last_round: 0, last_reason: String::new() };
         while beldex_bridge_signer::share_watch::fingerprint(&share_dir).is_none() {
+            status.set("state", "no share set yet: waiting for one");
+            // A standby DKG holds this loop for up to its timeout.
+            status.beat(std::time::Duration::from_secs(if auto_dkg { 1200 } else { poll_secs.max(1) * 10 }));
+            if !standby_role {
+                if let Some(m) = install_successor(&key_probe, &share_dir)? {
+                    println!("{m}");
+                    status.set("installed", m);
+                    continue;
+                }
+            }
             if auto_dkg {
                 auto.maybe_run(cfg, &share_dir, beldexd_rpc);
             }
@@ -2391,8 +3722,13 @@ where
         println!("serve: a share set appeared in {}", share_dir.display());
     }
     let loaded_share_set = beldex_bridge_signer::share_watch::fingerprint(&share_dir);
+
     let ls = Rc::new(build_live_signers(cfg)?);
     let committee = ls.committee.clone();
+    status.set("state", "serving");
+    status.set("key_epoch", ls.committee.epoch);
+    status.set("self_index", ls.self_index);
+    status.set("pgw", hex(&ls.pgw_group_vk));
     let self_index = ls.self_index;
 
     // --- Coordinator mesh: its own port range (the per-session sign meshes bind
@@ -2431,9 +3767,21 @@ where
         &committee,
     )
     .ok_or("bridge.committee returned no signer_keys — cannot authenticate the coordinator mesh")?;
-    let mut net = OmqPeerTransport::bind(&mesh_cfg)
-        .map_err(|e| format!("coordinator mesh bind: {e:?}"))?
-        .with_auth(auth);
+    // A port can still be held for a moment by the process this one replaces (just restarted
+    // on a successor key, or a peer on the same host whose committee index this one now has),
+    // so a bind that fails is tried again for two minutes before it counts.
+    let mut bound = OmqPeerTransport::bind(&mesh_cfg);
+    for _ in 0..24 {
+        match &bound {
+            Err(e) if format!("{e:?}").contains("in use") => {
+                eprintln!("coordinator mesh port busy ({e:?}); trying again in 5s");
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                bound = OmqPeerTransport::bind(&mesh_cfg);
+            }
+            _ => break,
+        }
+    }
+    let mut net = bound.map_err(|e| format!("coordinator mesh bind: {e:?}"))?.with_auth(auth);
 
     // --- Policies. One shared daemon RPC client for build / inspect / submit (the loop is
     // single-threaded; the closures never call each other, so RefCell borrows never nest).
@@ -2586,10 +3934,6 @@ where
 
     // The guard (takeover_guard): this node's own view of any standby takeover begun against
     // its key, shared by detection, the cancel policy and its reconciler.
-    // The role: `live` (the default) serves the key the chains name, mints, releases and
-    // cancels takeovers begun against it; `standby` serves a standby key, and only begins
-    // and completes a takeover by it when this node sees the live key failing.
-    let standby_role = std::env::var("BRIDGE_SIGNER_ROLE").is_ok_and(|r| r.trim() == "standby");
     let takeover = Rc::new(TakeoverReader {
         evm: configs.iter().map(|c| (c.chain_id, HttpJsonRpc::new(c.rpc_url.clone()), c.contract)).collect(),
         gateway_rpc: HttpJsonRpc::new(format!("{}/json_rpc", beldexd_rpc.trim_end_matches('/'))),
@@ -2600,6 +3944,62 @@ where
         outage: std::cell::Cell::new(false),
     });
     let policy_view = takeover.clone();
+    // Key hand-offs: each member reads the contract's rotation state from its own RPC, the
+    // clock included, so the deadline it accepts is the chain's and not its own.
+    let rotation_rpcs: BTreeMap<u64, (HttpJsonRpc, [u8; 20])> =
+        configs.iter().map(|c| (c.chain_id, (HttpJsonRpc::new(c.rpc_url.clone()), c.contract))).collect();
+    let read_rotation = move |chain_id: u64| -> Result<RotationState, String> {
+        let (client, contract) = rotation_rpcs.get(&chain_id).ok_or("no RPC for that chain")?;
+        read_rotation_state(client, contract)
+    };
+    // How long a signed rotateSigner stays valid on chain. Long enough to be relayed, short
+    // enough that an authorization nobody sent cannot be dug out later.
+    let rotation_valid_secs: u64 =
+        std::env::var("BRIDGE_SIGNER_ROTATION_VALID_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(6 * 3600);
+
+    // The gateway hand-over: the leader asks the hand-over submitter (whose wallet builds and
+    // pays for it) for the unsigned update; every member reads it with its own daemon.
+    let handover_builder = std::env::var("BRIDGE_SIGNER_HANDOVER_BUILDER").ok().filter(|s| !s.trim().is_empty());
+    match &handover_builder {
+        Some(u) => println!("  gateway hand-over: built by {u}, checked on this node's daemon"),
+        None => println!("  gateway hand-over: no BRIDGE_SIGNER_HANDOVER_BUILDER, so this node leads none"),
+    }
+    let fetch_handover = move |owner: &[u8; 32]| -> Result<Vec<u8>, String> {
+        let base = handover_builder.as_deref().ok_or("no BRIDGE_SIGNER_HANDOVER_BUILDER")?;
+        let v: serde_json::Value = beldex_bridge_signer::http_agent()
+            .get(&format!("{}/build?owner={}", base.trim_end_matches('/'), hex(owner)))
+            .call()
+            .map_err(|e| e.to_string())?
+            .into_json()
+            .map_err(|e| e.to_string())?;
+        let blob = v.get("tx_blob").and_then(|b| b.as_str()).ok_or(format!("no tx_blob in {v}"))?;
+        (0..blob.len()).step_by(2).map(|i| blob.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok())).collect::<Option<Vec<u8>>>().ok_or("tx_blob: not hex".into())
+    };
+    let decode_rpc = HttpJsonRpc::new(format!("{}/json_rpc", beldexd_rpc.trim_end_matches('/')));
+    let decode_handover = move |blob: &[u8]| -> Result<DescriptorUpdateView, String> {
+        use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
+        let r = decode_rpc
+            .call("gateway_decode_descriptor_update", serde_json::json!({ "tx_blob": hex(blob) }))
+            .map_err(|e| format!("{e:?}"))?;
+        let field = |k: &str| r.get(k).and_then(|v| v.as_str()).ok_or(format!("no {k} in {r}"));
+        let bytes = |k: &str| -> Result<Vec<u8>, String> {
+            let h = field(k)?;
+            (0..h.len()).step_by(2).map(|i| h.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok())).collect::<Option<_>>().ok_or(format!("{k}: not hex"))
+        };
+        Ok(DescriptorUpdateView {
+            gateway_id: bytes("gateway_id")?.try_into().map_err(|_| "gateway_id: not 32 bytes")?,
+            owner_key_type: field("owner_key_type")?.to_string(),
+            owner_key: bytes("owner_key")?,
+            bridge_reserve: r.get("bridge_reserve").and_then(|v| v.as_bool()).unwrap_or(false),
+            // A daemon that does not say is taken to name one: nothing it cannot vouch for is signed.
+            has_standby: r
+                .get("has_standby")
+                .and_then(|v| v.as_bool().or_else(|| v.as_u64().map(|n| n != 0)))
+                .unwrap_or(true),
+            hash_to_sign: bytes("hash_to_sign")?.try_into().map_err(|_| "hash_to_sign: not 32 bytes")?,
+        })
+    };
+    let reserve_gateway: [u8; 32] = config::parse_hex32(&release_gateway).unwrap_or([0u8; 32]);
 
     let policy = DualPolicy {
         cancel: beldex_bridge_signer::takeover_guard::TakeoverPolicy {
@@ -2613,6 +4013,8 @@ where
             fees,
             per_tx_cap,
         },
+        rotate: RotatePolicy { read: read_rotation, contracts: contracts.clone(), valid_secs: rotation_valid_secs },
+        handover: HandoverPolicy { fetch: fetch_handover, decode: decode_handover, gateway_id: reserve_gateway },
     };
 
     // --- The per-duty threshold signers: one mesh round per duty among the session's
@@ -2680,15 +4082,19 @@ where
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| cfg.oxenmq_endpoint.clone());
-    let bus_client = if publish_bus {
+    let activation_bus = bus_endpoint.clone();
+    let bus_client: Vec<_> = if publish_bus {
         println!("  mint hand-off: publishing to bridge.mint_payload at {bus_endpoint}");
         if bus_genesis == [0u8; 32] {
             println!("    WARNING: no BRIDGE_SIGNER_GENESIS_HASH — publications will not verify \
                       against a daemon that binds a real genesis");
         }
-        Some(beldex_bridge_signer::omq_client::OmqCommitteeClient::new(bus_endpoint))
+        bus_endpoints(&bus_endpoint)
+            .into_iter()
+            .map(|e| (e.clone(), beldex_bridge_signer::omq_client::OmqCommitteeClient::new(e)))
+            .collect()
     } else {
-        None
+        Vec::new()
     };
     let bus_sign_key = ls.ed25519_secret;
     // Named in every publication, so the daemon can authenticate a member of a committee
@@ -2766,6 +4172,7 @@ where
     let mint_outbox_for_sweep = mint_outbox_dir.clone();
 
     let done_rpc = rpc.clone();
+    let done_contracts_for_rotation = contracts.clone();
     let done_contracts = contracts;
     let done_view = takeover.clone();
     let done_pgw_vk = ls.pgw_group_vk;
@@ -2881,6 +4288,9 @@ where
                     )
                 };
                 println!("TAKEOVER-STEP-PAYLOAD {payload}");
+                // On the bus too, as mints and hand-offs are: the runner's relayer (relay-watch)
+                // pays EVM gas, and the signers need hold no gas key of their own.
+                mint_handoff.publish(&payload);
                 match &cancel_relay_cmd {
                     Some(cmd) => match pipe_to_relay(cmd, &payload) {
                         Ok(out) => {
@@ -2900,9 +4310,9 @@ where
                         }
                     },
                     None => {
-                        eprintln!(
-                            "!! no relay command (BRIDGE_SIGNER_RELAY_CMD) for the wBDX {kind}: relay the \
-                             payload above NOW (beldex-bridge-relayer relay -)"
+                        println!(
+                            "  {kind} published for the relayer (no BRIDGE_SIGNER_RELAY_CMD here); signed \
+                             again if it is still wanted once it should have landed"
                         );
                         ExecOutcome::Submitted
                     }
@@ -2940,6 +4350,45 @@ where
                     }
                 }
                 mint_handoff.deliver(&payload);
+                ExecOutcome::Submitted
+            }
+            // The outgoing committee's rotateSigner, for a relayer to send like a mint. The
+            // nonce and deadline are the ones in the accepted proposal.
+            Duty::Rotate(r) => {
+                let word = |i: usize| u64::from_be_bytes(proposal[i * 32 + 24..i * 32 + 32].try_into().expect("8 bytes"));
+                if proposal.len() != 7 * 32 || sig.len() != 65 {
+                    return ExecOutcome::Abandon;
+                }
+                let payload = format!(
+                    r#"{{"kind":"rotate","contract":"{}","chain_id":{},"new_signer":"{}","new_key_epoch":{},"nonce":{},"deadline":"{}","sig":"{}"}}"#,
+                    hex(&r.contract),
+                    r.chain_id,
+                    hex(&r.new_signer),
+                    r.new_key_epoch,
+                    word(5),
+                    word(6),
+                    hex(sig)
+                );
+                println!("ROTATE-PAYLOAD {payload}");
+                mint_handoff.deliver(&payload);
+                ExecOutcome::Submitted
+            }
+            // The outgoing committee's owner signature on the gateway hand-over, for the
+            // submitter whose wallet built it (bus only: no EVM relayer carries it).
+            Duty::Handover(h) => {
+                if sig.len() != 64 || proposal.len() <= 32 {
+                    return ExecOutcome::Abandon;
+                }
+                let payload = format!(
+                    r#"{{"kind":"handover","gateway_id":"{}","owner":"{}","key_epoch":{},"hash_to_sign":"{}","sig":"{}"}}"#,
+                    hex(&h.gateway_id),
+                    hex(&h.new_owner),
+                    h.key_epoch,
+                    hex(&proposal[..32]),
+                    hex(sig)
+                );
+                println!("HANDOVER-PAYLOAD {payload}");
+                mint_handoff.publish(&payload);
                 ExecOutcome::Submitted
             }
             Duty::Release(_) => {
@@ -3080,6 +4529,8 @@ where
         .collect();
     let key_probe_gw = HttpJsonRpc::new(format!("{}/json_rpc", beldexd_rpc.trim_end_matches('/')));
     let mut mint_key_replaced: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    // The key each replaced chain's wBDX now answers to (see the gateway hand-over below).
+    let mut replaced_by: BTreeMap<u64, [u8; 20]> = BTreeMap::new();
     let mut release_key_replaced = false;
     // A key that differs from the contract's before this process ever saw it live is not
     // replaced but incoming: promoted and restarted while the change that names it (a
@@ -3124,8 +4575,8 @@ where
     match &ack_wallet {
         Some(_) => println!("  rotation acks: submitted and paid for by the configured wallet RPC"),
         None => println!(
-            "  rotation acks: NO wallet RPC (BRIDGE_SIGNER_ACK_WALLET_RPC); each one is printed \
-             for someone to submit with `bridge_rotation_ack`"
+            "  rotation acks: no wallet RPC (BRIDGE_SIGNER_ACK_WALLET_RPC); each one is published on \
+             the bus for the runner's submitter to pay for, and printed"
         ),
     }
     // L1's observed key epoch per chain, refreshed with the ack sweep.
@@ -3304,6 +4755,17 @@ where
         );
     }
 
+    // A rotation handed off but not taken by the contract is signed again after this long
+    // (see the hand-offs below), read on its own clients.
+    const ROTATE_LAND_GRACE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+    let mut rotate_done_since: BTreeMap<beldex_bridge_signer::orchestrator::DutyKey, std::time::Instant> = BTreeMap::new();
+    let rotation_check_rpcs: BTreeMap<u64, (HttpJsonRpc, [u8; 20])> =
+        configs.iter().map(|c| (c.chain_id, (HttpJsonRpc::new(c.rpc_url.clone()), c.contract))).collect();
+    // The bus the incoming committee publishes its activations to (the mint bus).
+    let mut activation_subs: Vec<_> =
+        bus_endpoints(&activation_bus).into_iter().map(beldex_bridge_signer::omq_client::OmqMintSubscriber::new).collect();
+    let rotation_contracts = done_contracts_for_rotation;
+
     let mut ticks = 0u64;
     loop {
         // The share set this process loaded was replaced on disk (a promotion after a
@@ -3315,6 +4777,12 @@ where
             );
             std::process::exit(beldex_bridge_signer::share_watch::RESTART_EXIT_CODE);
         }
+        status.beat(std::time::Duration::from_secs(poll_secs.max(1) * 10));
+        let (pending, in_flight, done) = orch.counts();
+        status.set("duties", serde_json::json!({ "pending": pending, "in_flight": in_flight, "done": done }));
+        status.set("wbdx_key_replaced_on", serde_json::json!(mint_key_replaced.iter().collect::<Vec<_>>()));
+        status.set("gateway_key_replaced", release_key_replaced);
+        status.problem("solvency_hold", coord.hold.clone());
         // Re-read the committee about once a minute. A transport error is not a change —
         // only a view that parses and differs counts, or a blip would stall the node.
         if !committee_changed && ticks % 12 == 0 {
@@ -3422,6 +4890,10 @@ where
                     }
                 } else {
                     mint_key_replaced.insert(*chain_id);
+                    let a = (0..20).map(|i| live.get(2 + 2 * i..4 + 2 * i).and_then(|b| u8::from_str_radix(b, 16).ok())).collect::<Option<Vec<u8>>>();
+                    if let Some(a) = a.and_then(|v| <[u8; 20]>::try_from(v).ok()) {
+                        replaced_by.insert(*chain_id, a);
+                    }
                     eprintln!(
                         "!! KEY REPLACED on chain {chain_id}: the wBDX signer is now {live}, not this \
                          share set's {ours}. Not opening further mints for it; in-flight work will \
@@ -3457,6 +4929,27 @@ where
                         }
                     }
                 }
+            }
+        }
+        // Both legs handed over and nothing left in flight: this key's work is done. With a
+        // successor live, exit for the supervisor to restart this process on it (installed at
+        // start, `install_successor`). Without one this node is not on the incoming committee:
+        // retire the tree, kept, and stop.
+        if ticks % 12 == 0
+            && release_key_replaced
+            && key_probe_evm.iter().all(|(id, ..)| mint_key_replaced.contains(id))
+            && orch.counts().1 == 0
+        {
+            if key_probe.live_successor(&share_dir).is_some() {
+                println!("both legs are on this node's successor key: exiting to be restarted on it");
+                std::process::exit(RESTART_ON_SUCCESSOR);
+            }
+            if key_probe.is_live(&share_dir) == Some(false) {
+                match key_probe.archive(&share_dir) {
+                    Ok(to) => println!("this node holds no share of the live key: retired its tree to {}, stopping", to.display()),
+                    Err(e) => eprintln!("this node holds no share of the live key, and retiring its tree failed: {e}"),
+                }
+                std::process::exit(0);
             }
         }
 
@@ -3687,6 +5180,109 @@ where
                 ingest(orch, Duty::Release(r));
             }
         }
+        // The gateway hand-over, from the chain alone: once every wBDX chain answers to one newer
+        // committee's attested key and the gateway is still this key's, hand it over to that
+        // key's Pgw. The incoming committee's activations raise it too, but they stop once wBDX
+        // has moved, so a member restarted after that would otherwise never sign it.
+        if !standby_role
+            && !release_key_replaced
+            && ticks % ack_sweep_ticks == 0
+            && !key_probe_evm.is_empty()
+            && key_probe_evm.iter().all(|(id, ..)| mint_key_replaced.contains(id))
+        {
+            use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
+            use beldex_bridge_signer::key_attestation as ka;
+            let signers: std::collections::BTreeSet<[u8; 20]> = replaced_by.values().copied().collect();
+            if let (1, Some(to)) = (signers.len(), signers.iter().next().copied()) {
+                let next = key_probe_gw
+                    .call("bridge_get_standby", serde_json::json!({}))
+                    .ok()
+                    .and_then(|v| ka::parse_records(&v))
+                    .and_then(|recs| {
+                        recs.into_iter()
+                            .filter(|r| r.attested_height != 0 && r.round_height == 0 && r.pevm_address == to)
+                            .filter(|r| r.epoch > ls.committee.epoch)
+                            .min_by_key(|r| r.attested_height)
+                    });
+                if let Some(r) = next {
+                    let d = Duty::Handover(beldex_bridge_signer::orchestrator::HandoverRequest {
+                        gateway_id: reserve_gateway,
+                        new_owner: r.pgw_vk,
+                        key_epoch: r.epoch,
+                    });
+                    if orch.status(&d.key()).is_none() {
+                        println!(
+                            "gateway hand-over requested from the chain: wBDX answers to the epoch {} key 0x{}, \
+                             attested with gateway key {}",
+                            r.epoch,
+                            hex(&to),
+                            hex(&r.pgw_vk)
+                        );
+                    }
+                    ingest(orch, d);
+                }
+            }
+        }
+        // Hand-offs: the incoming committee's activations, each checked here before it can
+        // become a rotation to sign (rotation_from_activation).
+        let mut arrived = Vec::new();
+        for sub in activation_subs.iter_mut() {
+            while let Ok(Some(p)) = sub.poll(std::time::Duration::from_millis(20)) {
+                arrived.push(p);
+            }
+        }
+        for p in arrived {
+            match rotation_from_activation(&p, ls.committee.epoch, &rotation_contracts, &committee_probe, &key_probe_gw) {
+                Ok(Some((r, pgw, key_epoch))) if !mint_key_replaced.contains(&r.chain_id) => {
+                    // The gateway follows the same key: one hand-over per certificate.
+                    if !release_key_replaced {
+                        ingest(
+                            orch,
+                            Duty::Handover(beldex_bridge_signer::orchestrator::HandoverRequest {
+                                gateway_id: reserve_gateway,
+                                new_owner: pgw,
+                                key_epoch,
+                            }),
+                        );
+                    }
+                    let d = Duty::Rotate(r.clone());
+                    // Signed and handed off, but the contract never took it: its nonce was spent
+                    // first (a standby naming) or its deadline passed. Sign it again, on the
+                    // contract's state now, once it has had time to land.
+                    if orch.status(&d.key()) == Some(beldex_bridge_signer::orchestrator::DutyStatus::Done) {
+                        let since = *rotate_done_since.entry(d.key()).or_insert_with(std::time::Instant::now);
+                        let landed = rotation_check_rpcs
+                            .get(&r.chain_id)
+                            .map(|(c, a)| read_rotation_state(c, a))
+                            .and_then(Result::ok)
+                            .map(|st| st.pending_activate_at != 0 || st.key_epoch >= r.new_key_epoch);
+                        if landed == Some(true) {
+                            rotate_done_since.remove(&d.key());
+                        } else if landed == Some(false) && since.elapsed() >= ROTATE_LAND_GRACE && orch.reopen(&d.key()) {
+                            rotate_done_since.remove(&d.key());
+                            eprintln!(
+                                "!! rotateSigner for chain {} key epoch {} not taken {}s after it was handed off \
+                                 (its nonce was spent or its deadline passed): signing it again",
+                                r.chain_id,
+                                r.new_key_epoch,
+                                since.elapsed().as_secs()
+                            );
+                        }
+                    }
+                    if orch.status(&d.key()).is_none() {
+                        if let Duty::Rotate(r) = &d {
+                            println!(
+                                "hand-off requested: chain {} key epoch {} -> 0x{} (certificate and activation check out)",
+                                r.chain_id, r.new_key_epoch, hex(&r.new_signer)
+                            );
+                        }
+                    }
+                    ingest(orch, d);
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("  activation on the bus not taken: {e}"),
+            }
+        }
         // Observe: a settled key change on any watched chain. Sign it and tell the mesh.
         if !standby_role && bus_genesis != [0u8; 32] {
             for r in src.poll_rotations() {
@@ -3811,11 +5407,20 @@ where
                                 "  rotation ack chain {chain} key epoch {epoch}: wallet did not submit ({e:?}); will retry"
                             ),
                         },
-                        None => println!(
-                            "rotation ack chain {chain} key epoch {epoch} is ready but no wallet RPC is configured; \
-                             submit it with `bridge_rotation_ack {rotation_hex}` from any funded wallet. \
-                             Until it is mined, departing members' bonds stay locked."
-                        ),
+                        // No wallet here, as on a member that pays no fees: the runner's
+                        // submitter (handover-submit) pays for it, off the bus. Published
+                        // every sweep until L1 applies it, like the wallet path retries.
+                        None => {
+                            let payload = format!(
+                                r#"{{"kind":"ack","chain_id":{chain},"key_epoch":{epoch},"rotation_hex":"{rotation_hex}"}}"#
+                            );
+                            handoff_for_sweep.publish(&payload);
+                            println!(
+                                "rotation ack chain {chain} key epoch {epoch} is ready and published for a submitter to pay for \
+                                 (or submit it with `bridge_rotation_ack {rotation_hex}` from any funded wallet). \
+                                 Until it is mined, departing members' bonds stay locked."
+                            );
+                        }
                     }
                 }
             }
@@ -4174,6 +5779,19 @@ fn main() -> ExitCode {
     // full signer identity to ask "which payouts are outstanding" would make it unusable
     // from an operator's laptop, or on a node whose config is the thing that broke. It
     // needs exactly one setting: where the signed releases are kept.
+    // `verify-keycert <file>`: whether a key certificate is the selected committee's — the
+    // committee beldexd (BRIDGE_SIGNER_OXENMQ_ENDPOINT) reports at the certificate's height.
+    // Needs no signer identity, so anyone can check a key before trusting it.
+    if subcommand.as_deref() == Some("verify-keycert") {
+        return match run_verify_keycert(std::env::args().nth(2)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("verify-keycert: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     if subcommand.as_deref() == Some("list-stuck") {
             // The daily sweep: every release still outstanding, and whether it is still
             // being retried or is waiting for a person.
@@ -4254,6 +5872,16 @@ fn main() -> ExitCode {
         };
     }
 
+    if subcommand.as_deref() == Some("handover-submit") {
+        return match run_handover_submit() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("handover-submit: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     if subcommand.as_deref() == Some("relay-watch") {
         return match run_relay_watch_standalone() {
             Ok(()) => ExitCode::SUCCESS,
@@ -4278,6 +5906,13 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("dkg: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("dkg-auto") => match run_dkg_auto(&cfg) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("dkg-auto: {e}");
                 ExitCode::FAILURE
             }
         },
@@ -4482,5 +6117,38 @@ mod key_committee_tests {
         let (_, idx) = load_key_committee(&cfg(&"b2".repeat(32)), d).unwrap();
         assert_eq!(idx, 1);
         let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+#[cfg(all(test, feature = "serve-live"))]
+mod status_board_tests {
+    use super::StatusBoard;
+    use std::time::Duration;
+
+    #[test]
+    fn health_reports_problems_and_a_job_that_stopped_beating() {
+        let b = StatusBoard::start("test");
+        b.set("key_epoch", 7u64);
+        assert_eq!(b.answer("/health"), (200, "ok\n".to_string()));
+
+        b.problem("acks", Some("unpaid for over 30 minutes".into()));
+        let (code, body) = b.answer("/health");
+        assert_eq!(code, 503);
+        assert!(body.contains("acks: unpaid"), "{body}");
+        b.problem("acks", None);
+        assert_eq!(b.answer("/health").0, 200);
+
+        // A heartbeat that is overdue is a problem by itself.
+        b.beat(Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(1100));
+        let (code, body) = b.answer("/health");
+        assert_eq!(code, 503);
+        assert!(body.contains("stalled"), "{body}");
+
+        let (_, status) = b.answer("/status");
+        let v: serde_json::Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(v["role"], "test");
+        assert_eq!(v["key_epoch"], 7);
+        assert!(v["problems"]["stalled"].is_string());
     }
 }

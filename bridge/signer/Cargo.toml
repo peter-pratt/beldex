@@ -111,7 +111,7 @@ autonomy = ["beldex-watcher-http", "evm-watcher-http", "tss-integration"]
 # coordination* (deterministic session-id, release-tx coordinator, join handshake) is a
 # separate, still-open task — see HANDOFF.md. Until that lands, live mode works only under a
 # single-coordinator / manual-trigger convention.
-serve-live = ["autonomy", "live-dkg", "live-pevm-dkg"]
+serve-live = ["autonomy", "live-dkg", "live-pevm-dkg", "dep:tiny_http"]
 
 [dependencies]
 # All optional; pulled in only by the features above (verified 2026-07).
@@ -146,6 +146,9 @@ rand_core            = { version = "0.6", optional = true }
 # Blocking HTTP client for the EVM watcher's real JSON-RPC backend (opt-in via
 # `evm-watcher-http`). `rustls` avoids a system OpenSSL build dependency.
 ureq                 = { version = "2", default-features = false, features = ["tls", "json"], optional = true }
+# The gateway hand-over submitter's one endpoint (`handover-submit`): the outgoing committee's
+# leader asks it to build the hand-over its wallet pays for.
+tiny_http            = { version = "0.12", optional = true }
 
 [dev-dependencies]
 rand         = "0.8"
