@@ -45,6 +45,7 @@
 #   HANDOFF_TXID    32-byte txid for the step-8 mint  (default: fresh random)
 #   PROBE_BYTES     throwaway 32 bytes for step 2     (default: 0xabab…ab)
 #   CEREMONY_YES=1  answer every gate "yes" — for unattended runs ONLY
+#   SKIP_HANDOFF_PROOF=1  skip step 8 (its proof mint is unbacked wBDX; see the run loop)
 #   CEREMONY_WORK   transcript directory              (default: ./.ceremony)
 
 set -euo pipefail
@@ -357,6 +358,7 @@ fi
 step1() {
   banner "1 — fresh Pevm DKG into devnet/shares-next"
   STEP_TITLE="step 1, the DKG"; FAILED_AT=1
+  lock_successor
 
   local existing
   existing="$(ls "$TESTDATA"/beldex-127.0.0.1-*/devnet/shares-next/pevm-*.keyshare 2>/dev/null | wc -l | tr -d ' ' || true)"
@@ -372,6 +374,7 @@ If you actually want a fresh key, stop, remove those trees by hand, and start ag
 Nothing here will overwrite share material.
 EOF
     ok "reusing the existing devnet/shares-next"
+    check_successor
     return 0
   fi
 
@@ -391,6 +394,7 @@ EOF
 
   echo "$KEYGEN" >> "$USED_GENS"
   if ! run_logged "01-dkg.log" "$LOCAL/dkg-next.sh" "$KEYGEN"; then
+    unlock_successor
     # Whether the generation is spent depends on whether the protocol ever STARTED. A signer
     # that refused at the door -- wrong build, bad config, off the committee -- never derived
     # an ExecutionId, so $KEYGEN is still free, and telling you to skip it burns a generation
@@ -419,15 +423,39 @@ EOF
    and retry with $(( KEYGEN + 1 )): an ExecutionId may not be reused."
   fi
 
-  local n
-  n="$(ls "$TESTDATA"/beldex-127.0.0.1-*/devnet/shares-next/pevm-*.keyshare 2>/dev/null | wc -l | tr -d ' ' || true)"
-  [ "$n" -ge "$THRESHOLD" ] || fail "the DKG wrote only $n keyshare(s), below the threshold of $THRESHOLD.
-   The successor committee could never reach threshold, so rotating to it would brick
-   the bridge. devnet/shares is untouched; nothing on chain has moved."
-  ok "$n node(s) hold a share of the successor key"
+  check_successor
   state_put DKG_DONE "$KEYGEN"
 }
 skip1() { note "step 1 skipped — using the devnet/shares-next already on disk"; }
+
+# Every member of the incoming committee holds both legs, and all hold the same two keys
+# (dkg-next.sh --check). Not "at least the threshold": a key that goes live with only t of
+# n holders has no member to spare, so one more offline halts the bridge.
+check_successor() {
+  local r
+  r="$("$LOCAL/dkg-next.sh" --check shares-next 2>&1)" || { unlock_successor; fail "the successor tree is not one whole key:
+   $r
+   Do NOT rotate to it. devnet/shares is untouched; nothing on chain has moved."; }
+  ok "every member holds the successor key ($r)"
+
+  # And that its certificate is the selected committee's: every signature checked against the
+  # member keys consensus publishes, not only compared between nodes on this one disk.
+  local node sock signer
+  node="$(ls -d "$TESTDATA"/beldex-127.0.0.1-*/devnet/shares-next | head -1 | sed 's#.*/\(beldex-127.0.0.1-[0-9]*\)/.*#\1#')"
+  sock="$(cd "$TESTDATA" && . ../sockbase.sh && sockbase_init >/dev/null 2>&1 && echo "$SOCKBASE/$node/devnet/beldexd.sock")"
+  signer="${SIGNER:-$(git -C "$LOCAL" rev-parse --show-toplevel)/bridge/signer/target/release/beldex-bridge-signer}"
+  r="$(BRIDGE_SIGNER_OXENMQ_ENDPOINT="ipc://$sock" "$signer" verify-keycert "$TESTDATA/$node/devnet/shares-next/keycert" 2>&1)" \
+    || { unlock_successor; fail "the successor key's certificate does not check out against consensus:
+   $r
+   Do NOT rotate to it. devnet/shares is untouched; nothing on chain has moved."; }
+  ok "$(printf '%s' "$r" | head -1)"
+}
+
+# From step 1 until step 7 has installed it, the successor tree is this rotation's: a
+# `dkg-auto` that finishes a newer committee's key meanwhile keeps it aside instead of
+# replacing shares-next (see `beldex-bridge-signer dkg-auto`).
+lock_successor()   { local d; for d in "$TESTDATA"/beldex-127.0.0.1-*/devnet; do : > "$d/shares-next.lock"; done; }
+unlock_successor() { rm -f "$TESTDATA"/beldex-127.0.0.1-*/devnet/shares-next.lock; }
 
 # ===========================================================================================
 # step 2 — the successor's Ethereum address
@@ -461,6 +489,22 @@ step2() {
 
   SUCCESSOR="$(scrape_signer probe)"
   [ -n "$SUCCESSOR" ] || fail "the probe produced no 'wBDX signer' line — see $WORK/02-probe.log"
+
+  # The same for Pgw: step 4c hands the gateway to this key, and a committee that cannot sign
+  # with it can mint but never pay a release.
+  ( export SHARE_SUBDIR=shares-next LOG_PREFIX=probe-pgw
+    run_logged "02-probe-pgw.log" "$LOCAL/sign-pevm.sh" pgw "$PROBE_BYTES" ) \
+    || fail "the incoming committee could not produce a Pgw signature — see $WORK/02-probe-pgw.log.
+   Do NOT rotate to this key: the gateway would be handed to a key nobody can spend with."
+  local owners
+  owners="$(grep -h 'owner_key' "$TESTDATA"/probe-pgw-sign-*.log 2>/dev/null | sed 's/.*: *//' | tr -d ' \r' | sort -u || true)"
+  if grep -qh 'libsodium   : REJECTED' "$TESTDATA"/probe-pgw-sign-*.log 2>/dev/null \
+     || ! grep -qh 'libsodium   : VERIFIED' "$TESTDATA"/probe-pgw-sign-*.log 2>/dev/null \
+     || [ "$owners" != "$(incoming_pgw)" ]; then
+    fail "the Pgw probe did not verify against the incoming Pgw $(incoming_pgw) — see
+   $WORK/02-probe-pgw.log (signed for: ${owners:-nothing}). Do NOT rotate to this key."
+  fi
+  ok "the incoming committee signs with its Pgw too ($owners)"
   finish_step2
 }
 skip2() {
@@ -565,6 +609,11 @@ skip3() {
 step4() {
   banner "4 — the outgoing committee signs the rotation"
   STEP_TITLE="step 4, the rotation signature"; FAILED_AT=4
+  if [ "${HANDOFF_BY_SIGNERS:-0}" = 1 ]; then
+    note "HANDOFF_BY_SIGNERS=1: the outgoing committee's signers sign rotateSigner themselves,
+   once each has checked the incoming committee's key certificate and activation (serve)"
+    return 0
+  fi
 
   ( unset SHARE_SUBDIR LOG_PREFIX SHARE_GLOB
     run_logged "04-sign-rotate.log" "$LOCAL/sign-rotate.sh" "$ROTATE_PREIMAGE" ) \
@@ -604,6 +653,11 @@ step4() {
 step4b() {
   banner "4b — the incoming committee signs the activation"
   STEP_TITLE="step 4b, the activation signature"; FAILED_AT=4
+  if [ "${HANDOFF_BY_SIGNERS:-0}" = 1 ]; then
+    note "HANDOFF_BY_SIGNERS=1: the incoming committee signed its activation right after its DKG
+   (dkg-auto), and published it with the key certificate"
+    return 0
+  fi
 
   ( export SHARE_SUBDIR=shares-next ACTIVATE=1
     unset SHARE_GLOB
@@ -649,6 +703,11 @@ HANDOVER_SAVED="$WORK/06b-gateway-handover.signed"
 step4c() {
   banner "4c — the outgoing committee signs the gateway hand-over (sent at step 6b)"
   STEP_TITLE="step 4c, the gateway hand-over signature"; FAILED_AT=4
+  if [ "${HANDOFF_BY_SIGNERS:-0}" = 1 ]; then
+    note "HANDOFF_BY_SIGNERS=1: the outgoing committee's signers sign the gateway hand-over
+   themselves, on a build from the hand-over submitter each checked on its own daemon"
+    return 0
+  fi
   local newvk
   newvk="$(incoming_pgw)"
   rm -f "$HANDOVER_SAVED"
@@ -661,6 +720,10 @@ step4c() {
 skip4c() { note "step 4c skipped"; }
 
 skip4() {
+  if [ "${HANDOFF_BY_SIGNERS:-0}" = 1 ]; then
+    note "step 4 skipped — the outgoing committee's signers signed rotateSigner themselves"
+    return 0
+  fi
   ls "$TESTDATA"/rotate-sign-*.log >/dev/null 2>&1 \
     || fail "step 4 was skipped but there are no rotate-sign-*.log files in $TESTDATA.
    04-rotate.sh scrapes the committee's signature out of them. Re-run from step 4."
@@ -674,6 +737,28 @@ step5() {
   banner "5 — propose, challenge window, activate (04-rotate.sh)"
   STEP_TITLE="step 5, the on-chain rotation"; FAILED_AT=5
   CURRENT_STEP=5
+
+  # The production order: nothing here signs or sends. The outgoing committee's rotateSigner
+  # and the incoming one's activation reach the contract through a relayer (relay-watch),
+  # which holds the activation until the challenge window is over.
+  if [ "${HANDOFF_BY_SIGNERS:-0}" = 1 ]; then
+    local waited=0 limit="${HANDOFF_WAIT:-900}" sgn
+    note "waiting for the signers and the relayer to hand over to $NEW_SIGNER (up to ${limit}s)"
+    while :; do
+      sgn="$(lc "$(onchain 'currentSigner()(address)')")"
+      [ "$sgn" = "$(lc "$NEW_SIGNER")" ] && break
+      [ "$waited" -ge "$limit" ] && fail "the contract is still on $sgn after ${limit}s, not $NEW_SIGNER.
+   Look at the outgoing committee's serve-*.log (hand-off requested / ROTATE-PAYLOAD), and
+   .demo/relay-watch.log (rotate / activate held or relayed)."
+      # anvil makes a block only when a transaction arrives, so its clock stands still
+      # and the relayer's activation would never see the window end. A block every round
+      # keeps chain time with the wall clock, as a real chain's does.
+      cast rpc evm_mine --rpc-url "$RPC" >/dev/null 2>&1 || true
+      sleep 10; waited=$(( waited + 10 ))
+    done
+    ok "handed over by the signers and the relayer after ${waited}s: currentSigner is $sgn"
+    return 0
+  fi
 
   gate "hand the bridge over, on chain" <<EOF
 04-rotate.sh will now submit the rotation the outgoing committee signed, warp anvil past
@@ -758,6 +843,28 @@ skip6() { note "step 6 skipped"; }
 # This must run BEFORE step 7. The authorisation has to be signed by the outgoing Pgw, and
 # step 7 moves that tree off the path every sign-* script defaults to.
 # ===========================================================================================
+# The gateway's owner key as consensus has it now.
+gateway_owner() {
+  local gid
+  gid="$(envget "$LOCAL/devnet-bridge.env" GATEWAY_ID)"
+  curl -s --max-time 10 http://127.0.0.1:19191/json_rpc -H 'Content-Type: application/json' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":\"0\",\"method\":\"get_gateway_info\",\"params\":{\"gateway_address\":\"$gid\"}}" \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin).get("result",{}).get("owner_key",""))' 2>/dev/null
+}
+
+# Wait until the hand-over is MINED, not just sent. Step 7 restarts the signers on the new
+# shares, and a signer that finds the gateway still answering to the old key concludes its
+# own gateway key was replaced and stops paying releases. Sent-but-not-yet-mined is exactly
+# that state, for the one block it takes, so step 7 must not start inside it.
+wait_gateway_owner() {
+  local want="$1" i
+  for i in $(seq 1 60); do
+    [ "$(gateway_owner)" = "$want" ] && return 0
+    sleep 5
+  done
+  return 1
+}
+
 step6b() {
   banner "6b — hand the gateway to the incoming committee"
   STEP_TITLE="step 6b, the gateway handover"; FAILED_AT=6
@@ -766,10 +873,29 @@ step6b() {
   newvk="$(incoming_pgw)"
   printf '  incoming Pgw : %s\n' "$newvk"
 
+  # A resumed ceremony whose hand-over already landed has nothing left to send.
+  if [ "$(gateway_owner)" = "$newvk" ]; then
+    rm -f "$HANDOVER_SAVED"
+    ok "the gateway already answers to the incoming committee's Pgw"
+    return 0
+  fi
+
+  # The production order: the hand-over submitter (handover-submit) sends what the signers
+  # signed, once the wBDX key has moved. Nothing to send from here; wait for it to land.
+  if [ "${HANDOFF_BY_SIGNERS:-0}" = 1 ]; then
+    wait_gateway_owner "$newvk" || fail "the gateway still does not answer to $newvk after 5 minutes.
+   Look at .demo/handover-submit.log (built / signed / sent) and the outgoing committee's
+   serve-*.log (HANDOVER-PAYLOAD). Do NOT run step 7 until the gateway answers to $newvk."
+    ok "the gateway now answers to the incoming committee's Pgw (signed by the signers, sent by the submitter)"
+    return 0
+  fi
+
   # Signed at step 4c for exactly this key: send it, no key needed.
   if [ -s "$HANDOVER_SAVED" ] && [ "$(envget "$HANDOVER_SAVED" NEW_VK)" = "$newvk" ]; then
     if run_logged "06b-gateway-handover.log" "$LOCAL/gateway-handover.sh" --submit "$HANDOVER_SAVED"; then
       rm -f "$HANDOVER_SAVED"
+      wait_gateway_owner "$newvk" || fail "the hand-over was sent but is not on chain after 5 minutes — see
+   $WORK/06b-gateway-handover.log. Do NOT run step 7 until the gateway answers to $newvk."
       ok "the gateway now answers to the incoming committee's Pgw (address unchanged; signed at step 4c)"
       return 0
     fi
@@ -784,6 +910,8 @@ step6b() {
     || fail "the gateway handover failed — see $WORK/06b-gateway-handover.log.
    Do NOT run step 7. The outgoing Pgw is still the only key that can authorise this, and
    promoting the shares now puts it out of reach of every sign-* script."
+  wait_gateway_owner "$newvk" || fail "the hand-over was sent but is not on chain after 5 minutes — see
+   $WORK/06b-gateway-handover.log. Do NOT run step 7 until the gateway answers to $newvk."
   ok "the gateway now answers to the incoming committee's Pgw (address unchanged)"
 }
 skip6b() { note "step 6b skipped"; }
@@ -798,6 +926,25 @@ step7() {
   STEP_TITLE="step 7, the share promotion"; FAILED_AT=7
   CURRENT_STEP=7
 
+  local before after archive
+  before=" $(gen_dirs | tr '\n' ' ') "
+  # The production order: each member's signer installs its successor key itself once both
+  # legs show it, and one not on the incoming committee retires its tree (serve, A26).
+  # Nothing is moved from here; wait until every incoming member holds the live key.
+  if [ "${HANDOFF_BY_SIGNERS:-0}" = 1 ]; then
+    local newvk i r
+    newvk="$(incoming_pgw 2>/dev/null || gateway_owner)"
+    for i in $(seq 1 60); do
+      r="$("$LOCAL/dkg-next.sh" --check shares 2>&1 || true)"
+      case "$r" in *" pgw $newvk "*) break ;; esac
+      sleep 5
+    done
+    case "$r" in *" pgw $newvk "*) ;; *) fail "the members did not install the successor key within 5 minutes:
+   $r
+   Look at testdata/serve-*.log (installed the successor key / exiting to be restarted)." ;; esac
+    unlock_successor
+    ok "every incoming member installed the successor key itself ($r)"
+  else
   run_logged "07-promote-dryrun.log" "$LOCAL/promote-shares.sh" --dry-run \
     || fail "the dry run failed — see $WORK/07-promote-dryrun.log. Nothing was moved."
 
@@ -814,13 +961,13 @@ is a gate: a half-applied swap leaves some nodes signing with one key and some w
 another, and the resulting threshold signature is garbage.
 EOF
 
-  local before after archive
-  before=" $(gen_dirs | tr '\n' ' ') "
   run_logged "07-promote.log" "$LOCAL/promote-shares.sh" \
     || fail "the promotion failed — see $WORK/07-promote.log.
    Check each node's devnet/ directory by hand before retrying: some may have been swapped
    and some not. The contract is already on the new key, so the nodes that DID swap are the
    correct ones."
+  unlock_successor
+  fi
   after="$(gen_dirs)"
 
   # Discover the archive rather than assuming shares-gen0. That assumption is right exactly
@@ -856,7 +1003,9 @@ EOF
   # The signers still running hold the retired trees in memory: the old key's say KEY
   # REPLACED and stop, and nothing serves the new key until they are started on the
   # promoted trees. Restart them with the settings they were launched with.
-  if [ -s "$TESTDATA/serve-live.last" ]; then
+  if [ "${HANDOFF_BY_SIGNERS:-0}" = 1 ]; then
+    ok "the signers restarted themselves on the successor key"
+  elif [ -s "$TESTDATA/serve-live.last" ]; then
     ( set -a; . "$TESTDATA/serve-live.last"; set +a
       run_logged "07-serve-restart.log" "$LOCAL/serve-live.sh" ) \
       && ok "signers restarted on the promoted share trees" \
@@ -973,6 +1122,13 @@ skip8() { note "step 8 skipped"; }
 # ===========================================================================================
 for n in 1 2 3 4 5 6 7 8; do
   CURRENT_STEP="$n"
+  # SKIP_HANDOFF_PROOF=1 (unattended rotations on a live bridge): step 8's proof mints wBDX
+  # against a made-up deposit, i.e. wBDX no BDX backs, and the signers' solvency check then
+  # holds every mint and release. Steps 1-7 already leave the hand-off verified on chain.
+  if [ "$n" = 8 ] && [ "${SKIP_HANDOFF_PROOF:-0}" = "1" ]; then
+    note "step 8 skipped (SKIP_HANDOFF_PROOF=1): its proof mint would be unbacked wBDX"
+    continue
+  fi
   if [ "$FROM" -le "$n" ]; then "step$n"; else "skip$n"; fi
   # The gateway handover sits between verification and promotion — it is signed by the
   # OUTGOING key, which step 7 moves. Resuming --from 7 deliberately skips it.

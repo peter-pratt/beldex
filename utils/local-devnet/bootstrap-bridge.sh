@@ -8,7 +8,9 @@
 # What it does, in order:
 #   1. waits for an ACTIVE 6-member bridge committee
 #   2. starts the background miner (finality needs a moving chain)
-#   3. runs the initial dual DKG (dkg-init.sh) → PGW_GROUP_VK
+#   3. starts `dkg-auto` on every node (dkg-init.sh --auto; it stays running and makes every
+#      later committee's key too), waits for the first key and installs it
+#      (promote-shares.sh) → PGW_GROUP_VK
 #   4. derives the Pevm signer address (pure-python point decompression + `cast keccak`)
 #   5. deploys WrappedBDX on anvil with that signer → WBDX
 #   6. generates VIEW_SECRET and registers ONE bridge gateway (owner = Pgw key,
@@ -80,11 +82,33 @@ echo "committee active (6 members)"
 
 # ── 3. dual DKG ──────────────────────────────────────────────────────────────
 say "dual DKG"
+pgrep -f 'beldex-bridge-signer dkg-auto' >/dev/null 2>&1 || ./dkg-init.sh --auto
 if ls testdata/beldex-127.0.0.1-*/devnet/shares/pgw-*.groupvk >/dev/null 2>&1; then
   echo "shares already present — skipping (wipe testdata to force a fresh DKG)"
 else
-  ./dkg-init.sh
+  # The first key is made like every later one, into shares-next on every member, and
+  # installed the same way. Under the lock, so dkg-auto cannot replace it mid-install.
+  echo "waiting for dkg-auto's first key (follow: tail -f testdata/dkg-auto-*.log)"
+  for i in $(seq 1 180); do
+    ./dkg-next.sh --check shares-next >/dev/null 2>&1 && break
+    sleep 10
+  done
+  for d in testdata/beldex-127.0.0.1-*/devnet; do : > "$d/shares-next.lock"; done
+  ./dkg-next.sh --check shares-next \
+    || { echo "!! no complete first key after 30min — see testdata/dkg-auto-*.log"; rm -f testdata/beldex-127.0.0.1-*/devnet/shares-next.lock; exit 1; }
+  ./promote-shares.sh
+  rm -f testdata/beldex-127.0.0.1-*/devnet/shares-next.lock
 fi
+# Pgw files alone are not a key: both legs, on every member, one key each.
+./dkg-next.sh --check shares || { echo "!! the shares tree is not one whole key — wipe testdata and re-run"; exit 1; }
+# wBDX and the gateway are created with this key, so it must be the selected committee's:
+# its certificate checked against the member keys consensus publishes.
+NODE="$(ls -d testdata/beldex-127.0.0.1-*/devnet/shares | head -1 | cut -d/ -f2)"
+SOCK="$(cd testdata && . ../sockbase.sh && sockbase_init >/dev/null 2>&1 && echo "$SOCKBASE/$NODE/devnet/beldexd.sock")"
+BRIDGE_SIGNER_OXENMQ_ENDPOINT="ipc://$SOCK" \
+  "${SIGNER:-$(git rev-parse --show-toplevel)/bridge/signer/target/release/beldex-bridge-signer}" \
+  verify-keycert "testdata/$NODE/devnet/shares/keycert" \
+  || { echo "!! the first key's certificate does not check out against consensus — do not deploy with it"; exit 1; }
 GVK_FILE="$(ls testdata/beldex-127.0.0.1-*/devnet/shares/pgw-*.groupvk | head -1)"
 PGW_GROUP_VK="$(od -An -v -tx1 < "$GVK_FILE" | tr -d ' \n')"
 # all nodes must agree
@@ -191,6 +215,9 @@ EOF
 echo "wrote $ENVFILE"
 
 GATEWAY_ID="$GATEWAY_ID" VIEW_SECRET="$VIEW_SECRET" WBDX="$WBDX" ./serve-live.sh
+# dkg-auto again, now that serve-live.sh has recorded the bridge: from here each new key
+# signs its activation for this wBDX (dkg-init.sh --auto reads serve-live.last).
+./dkg-init.sh --auto
 (cd testdata && . "$PWD/../sockbase.sh" && sockbase_init >/dev/null 2>&1 \
    && echo "$SOCKBASE/beldex-127.0.0.1-19191/devnet/beldexd.sock") \
   > /tmp/.bdx-relay-sock.$$ 2>/dev/null || true

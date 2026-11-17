@@ -461,9 +461,16 @@ class MNNetwork:
                     len(self.operators), op_funding * 1e-9
                 )
             )
-            self.mike.transfer_many([(op, op_funding) for op in self.operators])
-            self.sync_nodes(self.mine(11))  # confirm + pass DEFAULT_TX_SPENDABLE_AGE
-            self.refresh_wallets()
+            # In batches that fit one transaction (16 outputs, one of them change). Nearly
+            # all of Mike's BDX is the single premine output, so a second transaction in the
+            # same batch would have nothing unlocked to spend: each batch is confirmed, and
+            # its change unlocked, before the next.
+            batch = 15
+            for start in range(0, len(self.operators), batch):
+                chunk = self.operators[start:start + batch]
+                self.mike.transfer_many([(op, op_funding) for op in chunk])
+                self.sync_nodes(self.mine(11))  # confirm + pass DEFAULT_TX_SPENDABLE_AGE
+                self.refresh_wallets()
 
         vprint(
             "Submitting master node registrations (10,000 BDX stake each): ",

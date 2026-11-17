@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Beldex Bridge Demo</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --fg:#1b1f24; --muted:#5b6470; --line:#dde1e6; --acc:#0b6bcb; --ok:#1a7f37; --bad:#c62828; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#111418; --card:#1a1f25; --fg:#e8ebef; --muted:#9aa4b0; --line:#2b323a; --acc:#4ea1ff; --ok:#3fb950; --bad:#f85149; } }
+  :root[data-theme="dark"] { --bg:#111418; --card:#1a1f25; --fg:#e8ebef; --muted:#9aa4b0; --line:#2b323a; --acc:#4ea1ff; --ok:#3fb950; --bad:#f85149; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { font-size:22px; margin:0 0 4px; } h2 { font-size:17px; margin:0 0 12px; }
+  .sub { color:var(--muted); margin:0 0 20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px; margin-bottom:16px; }
+  .row { display:flex; justify-content:space-between; gap:12px; padding:4px 0; flex-wrap:wrap; }
+  .row span:first-child { color:var(--muted); }
+  code, .mono { font-family:ui-monospace, monospace; font-size:13px; overflow-wrap:anywhere; }
+  button { background:var(--acc); color:#fff; border:0; border-radius:8px; padding:9px 16px; font-size:15px; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--acc); border:1px solid var(--acc); }
+  button:disabled { opacity:.5; cursor:default; }
+  input { width:100%; padding:9px 10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--fg); font-size:15px; margin:4px 0 12px; }
+  label { color:var(--muted); font-size:13px; }
+  .msg { margin-top:10px; font-size:14px; overflow-wrap:anywhere; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+  .cmd { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:10px; margin:8px 0; }
+  .btns { display:flex; gap:8px; flex-wrap:wrap; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Beldex Bridge Demo</h1>
+  <p class="sub">BDX ⇄ wBDX on a local devnet. Test keys and test money only.</p>
+
+  <div class="card">
+    <h2>1. Wallet</h2>
+    <div class="btns">
+      <button id="connect">Connect MetaMask</button>
+      <button id="addToken" class="secondary" disabled>Add wBDX to MetaMask</button>
+    </div>
+    <div class="row"><span>Account</span><span id="account" class="mono">—</span></div>
+    <div class="row"><span>wBDX balance</span><span id="balance">—</span></div>
+    <div id="walletMsg" class="msg"></div>
+  </div>
+
+  <div class="card">
+    <h2>2. Get wBDX (deposit BDX)</h2>
+    <p>From your Beldex wallet, send BDX to the bridge gateway with your MetaMask address as the memo:</p>
+    <div class="cmd mono" id="depositCmd">connect MetaMask first</div>
+    <button id="copyDeposit" class="secondary">Copy command</button>
+    <p class="sub" style="margin-top:10px">The wBDX appears here about 2 minutes later, once the deposit is final and the committee has signed the mint.</p>
+  </div>
+
+  <div class="card">
+    <h2>3. Burn wBDX → get BDX</h2>
+    <label for="amount">Amount (wBDX)</label>
+    <input id="amount" type="number" min="0" step="0.001" placeholder="10">
+    <label for="dest">Your Beldex address</label>
+    <input id="dest" type="text" placeholder="the address your beldex-wallet-cli shows">
+    <button id="burn" disabled>Burn and release</button>
+    <div id="burnMsg" class="msg"></div>
+    <p class="sub" style="margin-top:10px">You receive the amount minus the release fee. The BDX arrives about 2 minutes later.</p>
+  </div>
+
+  <div class="card">
+    <h2>Bridge</h2>
+    <div class="row"><span>wBDX contract</span><span id="contract" class="mono">—</span></div>
+    <div class="row"><span>Gateway address</span><span id="gateway" class="mono">—</span></div>
+    <div class="row"><span>Release fee</span><span id="fee">—</span></div>
+    <div class="row"><span>Minimum burn</span><span id="minRedeem">—</span></div>
+    <div class="row"><span>Committee key (wBDX signer)</span><span id="signer" class="mono">—</span></div>
+    <div class="row"><span>Key epoch (rotations)</span><span id="keyEpoch">—</span></div>
+    <div class="row"><span>Total wBDX supply</span><span id="supply">—</span></div>
+  </div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.4/ethers.umd.min.js"></script>
+<script>
+const ABI = [
+  "function balanceOf(address) view returns (uint256)",
+  "function totalSupply() view returns (uint256)",
+  "function redemptionFee() view returns (uint256)",
+  "function minRedeemAmount() view returns (uint256)",
+  "function currentSigner() view returns (address)",
+  "function keyEpoch() view returns (uint64)",
+  "function redeemToNative(uint256 amount, string beldexAddress)"
+];
+const $ = (id) => document.getElementById(id);
+let cfg, provider, signer, account, contract;
+const fmt = (v) => (Number(v) / 1e9).toLocaleString(undefined, { maximumFractionDigits: 9 }) + " wBDX";
+
+async function load() {
+  cfg = await (await fetch("config.json", { cache: "no-store" })).json();
+  $("contract").textContent = cfg.wbdx;
+  $("gateway").textContent = cfg.gateway;
+  const ro = new ethers.JsonRpcProvider(cfg.rpc);
+  const c = new ethers.Contract(cfg.wbdx, ABI, ro);
+  const refresh = async () => {
+    try {
+      const [fee, min, s, e, sup] = await Promise.all([c.redemptionFee(), c.minRedeemAmount(), c.currentSigner(), c.keyEpoch(), c.totalSupply()]);
+      $("fee").textContent = fmt(fee); $("minRedeem").textContent = fmt(min);
+      $("signer").textContent = s; $("keyEpoch").textContent = e.toString(); $("supply").textContent = fmt(sup);
+      if (account) $("balance").textContent = fmt(await c.balanceOf(account));
+    } catch (err) { /* node restarting; next tick */ }
+  };
+  refresh(); setInterval(refresh, 5000);
+}
+
+$("connect").onclick = async () => {
+  if (!window.ethereum) { $("walletMsg").innerHTML = '<span class="bad">MetaMask is not installed in this browser.</span>'; return; }
+  try {
+    const chainId = "0x" + cfg.chainId.toString(16);
+    try {
+      await ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId }] });
+    } catch (e) {
+      await ethereum.request({ method: "wallet_addEthereumChain", params: [{
+        chainId, chainName: "Beldex bridge devnet (anvil)", rpcUrls: [cfg.rpc],
+        nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 } }] });
+    }
+    provider = new ethers.BrowserProvider(window.ethereum);
+    signer = await provider.getSigner();
+    account = await signer.getAddress();
+    contract = new ethers.Contract(cfg.wbdx, ABI, signer);
+    $("account").textContent = account;
+    $("depositCmd").textContent = `transfer ${cfg.gateway} <amount> ${cfg.chainId}:${account}`;
+    $("addToken").disabled = false; $("burn").disabled = false;
+    $("walletMsg").innerHTML = '<span class="ok">Connected.</span>';
+  } catch (e) { $("walletMsg").innerHTML = `<span class="bad">${e.shortMessage || e.message}</span>`; }
+};
+
+$("addToken").onclick = () => ethereum.request({ method: "wallet_watchAsset",
+  params: { type: "ERC20", options: { address: cfg.wbdx, symbol: "wBDX", decimals: 9 } } });
+
+$("copyDeposit").onclick = () => navigator.clipboard.writeText($("depositCmd").textContent);
+
+$("burn").onclick = async () => {
+  const amount = $("amount").value.trim(), dest = $("dest").value.trim();
+  if (!amount || !dest) { $("burnMsg").innerHTML = '<span class="bad">Enter an amount and your Beldex address.</span>'; return; }
+  try {
+    $("burn").disabled = true; $("burnMsg").textContent = "Confirm in MetaMask…";
+    const tx = await contract.redeemToNative(ethers.parseUnits(amount, 9), dest);
+    $("burnMsg").textContent = `Burn sent: ${tx.hash} — waiting for it to be mined…`;
+    await tx.wait();
+    $("burnMsg").innerHTML = `<span class="ok">Burned ${amount} wBDX. The BDX release is on its way to ${dest.slice(0, 12)}… (about 2 minutes).</span>`;
+  } catch (e) {
+    $("burnMsg").innerHTML = `<span class="bad">Refused: ${e.shortMessage || e.reason || e.message}</span>`;
+  } finally { $("burn").disabled = false; }
+};
+
+load();
+</script>
+</body>
+</html>

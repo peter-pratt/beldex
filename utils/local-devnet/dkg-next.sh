@@ -34,6 +34,63 @@ cd "$(dirname "$0")"
 
 SUBDIR="${SHARE_SUBDIR:-shares-next}"
 
+# --- whether a tree holds one whole key -------------------------------------------------------
+# Every member of the committee saved beside the tree must hold both legs under its own index,
+# and all of them the same Pgw and the same Pevm group key, and the same key certificate
+# (every member's signature on that key; `beldex-bridge-signer verify-keycert` checks them). "At least the threshold" is not
+# enough: with only t of n holders the bridge goes live with no member to spare, and one more
+# offline halts it. Nor is agreeing on Pevm alone: a member holding a different Pgw means the
+# gateway gets handed to a key the committee cannot sign with, and releases stop.
+#
+#   ./dkg-next.sh --check [subdir]    prints "epoch <e> members <n> pgw <hex> pevm <hex>"
+check_tree() {
+  python3 - "$1" <<'EOF'
+import glob, json, os, sys
+sub = sys.argv[1]
+trees = [d for d in sorted(glob.glob(f"testdata/beldex-127.0.0.1-*/devnet/{sub}")) if os.listdir(d)]
+def die(msg):
+    sys.exit(f"!! {sub}: {msg}")
+if not trees:
+    die("no node holds this tree")
+committee, held, pgw, pevm, certs = None, {}, set(), set(), set()
+for d in trees:
+    try:
+        c = json.load(open(os.path.join(d, "committee.json")))
+    except (OSError, ValueError) as e:
+        die(f"{d} has no readable committee.json ({e}) — which committee is this key for?")
+    if committee is None:
+        committee = (c.get("epoch"), c.get("members"))
+    elif (c.get("epoch"), c.get("members")) != committee:
+        die(f"{d} was made for a different committee than {trees[0]} — not one key")
+    i = c.get("self_index", -1)
+    files = [f"pgw-{i}.keypackage", f"pgw-{i}.groupvk", f"pevm-{i}.keyshare", f"pevm-{i}.groupkey", "keycert"]
+    missing = [f for f in files if not os.path.isfile(os.path.join(d, f))]
+    if i < 0 or missing:
+        die(f"{d} is incomplete (index {i}, missing {missing or 'its index'})")
+    if i in held:
+        die(f"{d} and {held[i]} both hold share {i}")
+    held[i] = d
+    pgw.add(open(os.path.join(d, files[1]), "rb").read().hex())
+    pevm.add(open(os.path.join(d, files[3]), "rb").read().hex())
+    certs.add(open(os.path.join(d, files[4]), "rb").read())
+epoch, members = committee
+if len(held) != len(members):
+    absent = sorted(set(range(len(members))) - set(held))
+    die(f"only {len(held)} of the {len(members)} members hold their share (absent: {absent})")
+if len(pgw) != 1:
+    die(f"members disagree on the Pgw group key ({len(pgw)} different keys)")
+if len(pevm) != 1:
+    die(f"members disagree on the Pevm group key ({len(pevm)} different keys)")
+if len(certs) != 1:
+    die(f"members hold different key certificates ({len(certs)})")
+print(f"epoch {epoch} members {len(members)} pgw {pgw.pop()} pevm {pevm.pop()}")
+EOF
+}
+if [ "${1:-}" = "--check" ]; then
+  check_tree "${2:-$SUBDIR}"
+  exit
+fi
+
 # --- the key generation number ------------------------------------------------------------
 # Fed into the cggmp21 ExecutionId, which is the transcript's domain separator. Reusing the
 # generation of an existing key would run a second, different protocol under an identity the
@@ -134,7 +191,7 @@ echo ""
 # --- fan the DKG out across the nodes ------------------------------------------------------------
 # Match the invocation shape, not the bare binary name — `pkill -f` sees whole command lines,
 # so the bare name also matches the shell that launched this script. Same trap as sign-pevm.sh.
-pkill -f 'beldex-bridge-signer dkg' 2>/dev/null || true
+pkill -f 'beldex-bridge-signer dkg$' 2>/dev/null || true
 sleep 1
 rm -f dkg-next-*.log
 
@@ -257,6 +314,8 @@ if [ "$MISMATCH" -ne 0 ]; then
   echo "   Do NOT rotate to it. Check testdata/dkg-next-*.log for who diverged." >&2
   exit 1
 fi
+
+( cd .. && check_tree "$SUBDIR" > /dev/null ) || { echo "   Do NOT rotate to it." >&2; exit 1; }
 
 GKS="$(od -An -v -tx1 < "$FIRST" | tr -d ' \n')"
 echo "  group key         : 0x$GKS"

@@ -216,7 +216,8 @@ started=0
 PIDS=()
 for d in beldex-127.0.0.1-*/; do
   sock="$SOCKBASE/${d}devnet/beldexd.sock"; key="$SOCKBASE/${d}devnet/key_ed25519"
-  # Each signer reads its own daemon, as on a real network. The node's directory names its RPC port.
+  # Each signer reads its own daemon, as on a real network. The node's directory names its RPC port,
+  # which also numbers its status port.
   rpc_port="${d%/}"; rpc_port="${rpc_port##*-}"
   # SHARE_SUBDIR: which per-node share tree the signer loads from (default `shares`).
   # `shares-pool` is the devnet-only workaround for EPOCH_RESHUFFLE_ORPHANS_SHARES.md —
@@ -237,9 +238,11 @@ for d in beldex-127.0.0.1-*/; do
   # (A standby signer reads it from its own standby tree: the node may hold no live share.)
   own="$SOCKBASE/${d}devnet/shares"; [ "$ROLE" = standby ] && own="$share"
   idx=$(ls "$own"/pgw-*.keypackage 2>/dev/null | sed -E 's/.*pgw-([0-9]+)\.keypackage/\1/' | head -1) || true
-  if [ -z "$idx" ] && [ "${SUPERVISE:-0}" = 1 ]; then
+  if [ -z "$idx" ] && { [ "${SUPERVISE:-0}" = 1 ] || { [ "${SHARE_SUBDIR:-shares}" = shares ] && [ "$NODES" = all ]; }; }; then
     # Supervised: it waits for this node's first share set. A standby signer waiting with
     # the rest of the current committee generates the next standby key itself (AUTO_DKG).
+    # A seat with no live share yet still gets a signer, as every seat does in production: it
+    # waits for its successor key to go live, installs it and serves it (serve, A26).
     idx=waiting
   fi
   [ -n "$idx" ] || { echo "skip ${d%/}: no pgw share (did dkg run here?)"; continue; }
@@ -270,7 +273,7 @@ for d in beldex-127.0.0.1-*/; do
   while :; do
   BRIDGE_SIGNER_SHARE_KEY_FILE="$SHARE_KEY_FILE" \
   BRIDGE_SIGNER_GENESIS_HASH="$BRIDGE_SIGNER_GENESIS_HASH" \
-  BRIDGE_SIGNER_MINT_BUS_ENDPOINT="ipc://$SOCKBASE/beldex-127.0.0.1-19191/devnet/beldexd.sock" \
+  BRIDGE_SIGNER_MINT_BUS_ENDPOINT="ipc://$SOCKBASE/beldex-127.0.0.1-19191/devnet/beldexd.sock,ipc://$SOCKBASE/beldex-127.0.0.1-19205/devnet/beldexd.sock" \
   BRIDGE_SIGNER_RELAY_CMD="$node_relay" \
   BRIDGE_SIGNER_RELAY_STAGGER_MS="$RELAY_STAGGER_MS" \
   BRIDGE_SIGNER_SERVE_LIVE=1 \
@@ -299,6 +302,8 @@ for d in beldex-127.0.0.1-*/; do
   BRIDGE_SIGNER_PROBE_WALLET_RPC="${PROBE_WALLET_RPC:-}" BRIDGE_SIGNER_PROBE_EVERY_SECS="${PROBE_EVERY_SECS:-}" \
   BRIDGE_SIGNER_PROBE_CHAIN_ID="${PROBE_CHAIN_ID:-}" BRIDGE_SIGNER_PROBE_EVM_ADDRESS="${PROBE_EVM_ADDRESS:-}" \
   BRIDGE_SIGNER_ACK_WALLET_RPC="${ACK_WALLET_RPC:-}" \
+  BRIDGE_SIGNER_HANDOVER_BUILDER="${HANDOVER_BUILDER:-}" \
+  BRIDGE_SIGNER_STATUS_LISTEN="127.0.0.1:$(( 30000 + rpc_port - 19000 ))" \
   BRIDGE_SIGNER_WATCH_POLL_SECS="$POLL_SECS" \
   BRIDGE_SIGNER_RELEASE_GATEWAY="$RELEASE_GATEWAY" \
   BRIDGE_SIGNER_RELEASE_FEE="$RELEASE_FEE" \
@@ -307,9 +312,16 @@ for d in beldex-127.0.0.1-*/; do
   # Supervised like systemd's Restart=always: 75 (the signer's share set moved) restarts at
   # once, any other failure after a pause (on this one host a port can still be held by the
   # signer it replaces). Killed by a signal (>= 128) means stopped on purpose: end the loop.
-  [ "${SUPERVISE:-0}" = 1 ] && [ "$rc" -lt 128 ] || exit "$rc"
+  # Unsupervised, serve still restarts on 75 (both legs of its key handed over and this node's
+  # successor key live: started again, it installs and serves it) and on 0 (it retired a key
+  # no longer live: started again, it waits for a later one). Any other exit is final there,
+  # so a fault shows.
+  case "$rc" in
+    0|75) ;;
+    *) [ "${SUPERVISE:-0}" = 1 ] && [ "$rc" -lt 128 ] || exit "$rc" ;;
+  esac
   echo "-- supervisor: restarting after exit $rc" >> "$TAG-${d%/}.log"
-  [ "$rc" -eq 75 ] && sleep 2 || sleep 10
+  [ "$rc" -eq 75 ] || [ "$rc" -eq 0 ] && sleep 2 || sleep 10
   done
   ) </dev/null >/dev/null 2>&1 &
   PIDS+=("$!:${d%/}")
@@ -351,8 +363,8 @@ fi
            PER_TX_MAX WINDOW_MINT_CAP WBDX_IMPLEMENTATION WBDX_IMPLEMENTATION_CODEHASH; do
     printf '%s=%q\n' "$v" "${!v}"
   done
-  printf 'ACK_WALLET_RPC=%q\nMESH_PORT_BASE=%q\nSHARE_SUBDIR=%q\nSTAGE_TIMEOUT_TICKS=%q\n' \
-    "${ACK_WALLET_RPC:-}" "${MESH_PORT_BASE:-6000}" "${SHARE_SUBDIR:-shares}" "${STAGE_TIMEOUT_TICKS:-4}"
+  printf 'ACK_WALLET_RPC=%q\nHANDOVER_BUILDER=%q\nMESH_PORT_BASE=%q\nSHARE_SUBDIR=%q\nSTAGE_TIMEOUT_TICKS=%q\n' \
+    "${ACK_WALLET_RPC:-}" "${HANDOVER_BUILDER:-}" "${MESH_PORT_BASE:-6000}" "${SHARE_SUBDIR:-shares}" "${STAGE_TIMEOUT_TICKS:-4}"
   printf 'ROLE=%q\nOUTAGE_WINDOW_SECS=%q\n' "$ROLE" "${OUTAGE_WINDOW_SECS:-60}"
 } > "$( [ "$ROLE" = standby ] && echo serve-standby.last || echo serve-live.last )"
 

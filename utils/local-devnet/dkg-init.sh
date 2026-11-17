@@ -4,6 +4,8 @@
 # `dkg-next.sh` (rotation, writes `shares-next`, refuses generation 0) is NOT.
 #
 #     runlog ./dkg-init.sh
+#     ./dkg-init.sh --auto        instead: leave `dkg-auto` running on every node (below)
+#     ./dkg-init.sh --stop-auto
 #
 # Produces per node:
 #   devnet/shares/pgw-<i>.{keypackage,pubkeypackage,groupvk}   Pgw  (ed25519 / FROST)
@@ -55,6 +57,67 @@ if strings "$SIGNER" 2>/dev/null | grep -q 'the Pevm leg needs a build with'; th
   exit 1
 fi
 
+# --- --auto: no one-shot run; a `dkg-auto` watcher stays on every node ---------------------
+# Each makes its node's share of every epoch's key once its committee is selected, retrying
+# within the epoch at heights every member derives from the chain. Every key goes to
+# devnet/shares-next on every member and is installed separately: ./promote-shares.sh (the
+# first key too) or the rotation ceremony. Its own mesh ports (DKG_PORT_BASE, default 8000)
+# keep it clear of serve-live.sh (6000) and the ceremony's dkg-next.sh (7000).
+if [ "${1:-}" = "--stop-auto" ]; then
+  pkill -f 'beldex-bridge-signer dkg-auto' && echo "dkg-auto stopped" || echo "no dkg-auto was running"
+  exit 0
+fi
+if [ "${1:-}" = "--auto" ]; then
+  pkill -f 'beldex-bridge-signer dkg-auto' 2>/dev/null || true
+  # Each new key signs its activation for the deployed wBDX, so once serve-live.sh has
+  # recorded the bridge (serve-live.last) the watcher gets the contract and the genesis too;
+  # before the deploy there is nothing to activate. bootstrap-bridge.sh restarts it then.
+  EVM_CHAINS=""
+  if [ -s serve-live.last ]; then
+    EVM_CHAINS="$( . ./serve-live.last
+      printf '[{"chain_id":%s,"rpc":"%s","contract":"%s","confirmations":1,"per_epoch_cap":"%s","per_tx_max":"%s"}]' \
+        "$CHAIN_ID" "$EVM_RPC" "$WBDX" "$WINDOW_MINT_CAP" "$PER_TX_MAX")"
+    # The fee wallet that pays each key's attestation, as the fleet was started with.
+    [ -n "${ACK_WALLET_RPC:-}" ] || ACK_WALLET_RPC="$( . ./serve-live.last; echo "${ACK_WALLET_RPC:-}" )"
+  fi
+  # The genesis binds each key's attestation to this chain: needed from the first key on,
+  # before anything is deployed.
+  GENESIS=$(curl -s http://127.0.0.1:19191/json_rpc -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","id":"0","method":"get_block_header_by_height","params":{"height":0}}' \
+    | sed -n 's/.*"hash": *"\([0-9a-f]*\)".*/\1/p' | head -1)
+  STARTED=0
+  for d in beldex-127.0.0.1-*/; do
+    nport="${d%/}"; nport="${nport##*-}"   # the node's RPC port, which numbers its status port
+    sock="$SOCKBASE/${d}devnet/beldexd.sock"
+    key="$SOCKBASE/${d}devnet/key_ed25519"
+    [ -S "$sock" ] && [ -f "$key" ] || continue
+    share_key_ready "$SOCKBASE/${d}devnet" "$SOCKBASE/${d}devnet/shares" || exit 1
+    ANY32=$(printf '11%.0s' {1..32})
+    BRIDGE_SIGNER_SHARE_KEY_FILE="$SHARE_KEY_FILE" \
+    BRIDGE_SIGNER_BELDEXD_RPC_URL="http://127.0.0.1:19191" \
+    BRIDGE_SIGNER_OXENMQ_ENDPOINT="ipc://$sock" \
+    BRIDGE_SIGNER_GATEWAY_ID="$ANY32" BRIDGE_SIGNER_SELF_MN_PUBKEY="$ANY32" \
+    BRIDGE_SIGNER_BRIDGE_EPOCH_BLOCKS=120 \
+    BRIDGE_SIGNER_COMMITTEE_THRESHOLD="${BRIDGE_SIGNER_COMMITTEE_THRESHOLD:-4}" \
+    BRIDGE_SIGNER_MN_KEY_FILE="$key" BRIDGE_SIGNER_DKG_PORT_BASE="${DKG_PORT_BASE:-8000}" \
+    BRIDGE_SIGNER_MESH_USE_CURVE="${MESH_USE_CURVE:-true}" \
+    BRIDGE_SIGNER_DKG_TIMEOUT_SECS="${BRIDGE_SIGNER_DKG_TIMEOUT_SECS:-1800}" \
+    BRIDGE_SIGNER_DKG_RETRY_BLOCKS="${DKG_RETRY_BLOCKS:-40}" \
+    BRIDGE_SIGNER_DKG_CUTOFF_BLOCKS="${DKG_CUTOFF_BLOCKS:-30}" \
+    BRIDGE_SIGNER_SHARE_DIR="$SOCKBASE/${d}devnet/shares" \
+    BRIDGE_SIGNER_EVM_CHAINS="$EVM_CHAINS" BRIDGE_SIGNER_GENESIS_HASH="$GENESIS" \
+    BRIDGE_SIGNER_ACK_WALLET_RPC="${ACK_WALLET_RPC:-}" \
+    BRIDGE_SIGNER_STATUS_LISTEN="127.0.0.1:$(( 31000 + nport - 19000 ))" \
+    BRIDGE_SIGNER_MINT_BUS_ENDPOINT="ipc://$SOCKBASE/beldex-127.0.0.1-19191/devnet/beldexd.sock,ipc://$SOCKBASE/beldex-127.0.0.1-19205/devnet/beldexd.sock" \
+      nohup "$SIGNER" dkg-auto >> "dkg-auto-${d%/}.log" 2>&1 &
+    STARTED=$(( STARTED + 1 ))
+  done
+  [ "$STARTED" -gt 0 ] || { echo "!! no node had both a live beldexd.sock and a key_ed25519 — is the devnet up?" >&2; exit 1; }
+  echo "  dkg-auto running on $STARTED node(s)$([ -n "$EVM_CHAINS" ] && echo ", signing activations for $(. ./serve-live.last; echo "$WBDX")"); follow with:  tail -f testdata/dkg-auto-*.log"
+  echo "  stop with:  ./dkg-init.sh --stop-auto"
+  exit 0
+fi
+
 # --- refuse to clobber existing shares ----------------------------------------------------
 # These are the keys the committee is USING: the contract's signer address and the gateway's
 # owner key are derived from them. Overwriting means the deployed wBDX and the registered
@@ -78,9 +141,9 @@ echo "  threshold  : $THRESHOLD"
 echo "  timeout    : ${TIMEOUT}s"
 echo ""
 
-pkill -f 'beldex-bridge-signer dkg' 2>/dev/null || true
+pkill -f 'beldex-bridge-signer dkg$' 2>/dev/null || true
 sleep 1
-rm -f dkg-*.log
+rm -f dkg-beldex-*.log
 
 PIDS=""
 for d in beldex-127.0.0.1-*/; do
@@ -114,9 +177,9 @@ for p in $PIDS; do wait "$p" || true; done
 
 echo ""
 echo "── per-node results ─────────────────────────────────────────────────"
-grep -h "Pgw DKG complete"          dkg-*.log 2>/dev/null | sort | uniq -c || true
-grep -h "Pevm keygen complete"      dkg-*.log 2>/dev/null | sed 's/.*address //' | sort | uniq -c || true
-grep -h "Pevm complete share ready" dkg-*.log 2>/dev/null | sort | uniq -c || true
+grep -h "Pgw DKG complete"          dkg-beldex-*.log 2>/dev/null | sort | uniq -c || true
+grep -h "Pevm keygen complete"      dkg-beldex-*.log 2>/dev/null | sed 's/.*address //' | sort | uniq -c || true
+grep -h "Pevm complete share ready" dkg-beldex-*.log 2>/dev/null | sort | uniq -c || true
 
 NPGW="$(ls beldex-127.0.0.1-*/devnet/shares/pgw-*.groupvk 2>/dev/null | wc -l | tr -d ' ' || true)"
 NPEVM="$(ls beldex-127.0.0.1-*/devnet/shares/pevm-*.keyshare 2>/dev/null | wc -l | tr -d ' ' || true)"
