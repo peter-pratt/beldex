@@ -1316,6 +1316,12 @@ fn sign_activation(cfg: &Config, next: &std::path::Path, port_base: u16, attempt
         Err(e) if e.contains("not in the signer set") => return Ok("not in the activation's signer set".into()),
         Err(e) => return Err(e),
     };
+    // CGGMP21 signs with exactly a threshold of the key's members. Which ones moves with the
+    // slot (every signer derives the same set from it), so a member that is down holds up only
+    // the slots that pick it.
+    let n = live.signers.len();
+    let set: Vec<u16> =
+        (0..live.committee.threshold.min(n)).map(|k| live.signers[(attempt as usize + k) % n]).collect();
     let genesis: Option<[u8; 32]> =
         std::env::var("BRIDGE_SIGNER_GENESIS_HASH").ok().and_then(|h| config::parse_hex32(&h)).filter(|g| *g != [0; 32]);
     let bus_endpoint = std::env::var("BRIDGE_SIGNER_MINT_BUS_ENDPOINT")
@@ -1353,8 +1359,12 @@ fn sign_activation(cfg: &Config, next: &std::path::Path, port_base: u16, attempt
             .filter(|p| p.contains(&format!(r#""pending_key_epoch":{pending_key_epoch},"#)));
         let payload = match kept {
             Some(p) => p,
+            None if !set.contains(&live.self_index) => {
+                done.push(format!("chain {}: not in this slot's activation signer set {set:?}", c.chain_id));
+                continue;
+            }
             None => {
-                let sig = live.pevm_sign(&preimage, &live.signers, attempt)?;
+                let sig = live.pevm_sign(&preimage, &set, attempt)?;
                 if pevm_signer(&preimage, &sig) != Some(signer) {
                     return Err(format!(
                         "chain {}: the activation does not recover to the new key 0x{}",
@@ -3052,9 +3062,11 @@ fn build_live_signers_for(cfg: &Config, dir: &str, port_base: u16) -> Result<Liv
     use std::time::Duration;
 
     let (committee, self_index) = load_key_committee(cfg, dir)?;
+    // Every member by default: each duty's session signs with whichever threshold of them
+    // acknowledged it, so a member left out here is one less to spare when others are down.
     let signers: Vec<u16> = match std::env::var("BRIDGE_SIGNER_SIGN_SIGNERS") {
         Ok(s) => s.split(',').filter_map(|x| x.trim().parse().ok()).collect(),
-        Err(_) => (0..committee.threshold as u16).collect(),
+        Err(_) => (0..committee.size() as u16).collect(),
     };
     if !signers.contains(&self_index) {
         return Err(format!("this node ({self_index}) is not in the signer set {signers:?}"));
