@@ -4,7 +4,7 @@
 # has signed it and the wBDX key has moved. Rotation acknowledgements are paid by each member's
 # own fee wallet, not here. It holds no bridge key.
 #
-#   /etc/beldex/bridge-submitter.env:
+#   /etc/beldex/bridge-runner.env (bridge-runner.env.example), at least:
 #     BRIDGE_SIGNER_OXENMQ_ENDPOINT        the bus daemons, comma-separated
 #     BRIDGE_SIGNER_BELDEXD_RPC_URL        a beldexd HTTP RPC
 #     BRIDGE_SIGNER_HANDOVER_WALLET_RPC    http://127.0.0.1:PORT/json_rpc, for nothing else
@@ -25,7 +25,8 @@ After=network-online.target
 Type=simple
 User=beldex
 Group=beldex
-EnvironmentFile=/etc/beldex/bridge-submitter.env
+EnvironmentFile=/etc/beldex/bridge-runner.env
+WorkingDirectory=/var/lib/beldex-bridge/handover
 ExecStart=/usr/bin/beldex-bridge-signer handover-submit
 Restart=always
 RestartSec=5

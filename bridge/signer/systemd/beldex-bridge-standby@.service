@@ -1,0 +1,48 @@
+# beldex-bridge-standby@<seat>.service — a bridge seat's standby signer. While the bridge has no
+# working standby, consensus draws a standby committee every round; when this seat is drawn, it
+# makes the standby key with the others, attests it, and proves on L1 once per slot that the key
+# can still sign. If the live key stops minting (a deposit final and unminted for
+# BRIDGE_SIGNER_OUTAGE_WINDOW_SECS), it begins the takeover on every chain and completes it after
+# the delay; its shares then become the seat's live set (BRIDGE_SIGNER_PROMOTE_TO) and the seat's
+# serve signs with them.
+#
+# Every seat runs it, beside beldex-bridge-serve@<seat> and beldex-bridge-dkg@<seat>.
+# Same settings file as those, then its own overrides (read after, so they win):
+#   /etc/beldex/bridge-standby-<seat>.env   at least (see bridge-signer.env.example):
+#     BRIDGE_SIGNER_ROLE=standby
+#     BRIDGE_SIGNER_SHARE_DIR=/var/lib/beldex/bridge-<seat>/shares-standby
+#     BRIDGE_SIGNER_PROMOTE_TO=/var/lib/beldex/bridge-<seat>/shares
+#     BRIDGE_SIGNER_MESH_PORT_BASE=8000   (its own ports, apart from the live signer's)
+#     BRIDGE_SIGNER_STATUS_LISTEN=127.0.0.1:9102
+# It exits with status 75 when its share set changes (promoted, or stepped aside); Restart=always
+# starts it again.
+
+[Unit]
+Description=Beldex bridge standby signer for seat %i
+Wants=network-online.target
+After=network-online.target
+# Start after the seat's own beldexd, e.g.:  After=beldexd@%i.service
+
+[Service]
+Type=simple
+User=beldex
+Group=beldex
+EnvironmentFile=/etc/beldex/bridge-signer-%i.env
+EnvironmentFile=/etc/beldex/bridge-standby-%i.env
+# The key that seals this seat's shares, readable by root only and handed to the service alone.
+LoadCredential=bridge-share-key:/etc/beldex/bridge-share-%i.key
+WorkingDirectory=/var/lib/beldex/bridge-%i/standby
+ExecStart=/usr/bin/beldex-bridge-signer serve
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ReadWritePaths=/var/lib/beldex
+
+[Install]
+WantedBy=multi-user.target
