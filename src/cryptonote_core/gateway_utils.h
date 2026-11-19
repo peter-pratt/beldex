@@ -109,6 +109,22 @@ bool verify_bridge_key_attestation(const tx_extra_bridge_key_attestation& att,
                                    const std::vector<crypto::ed25519_public_key>& signer_keys,
                                    network_type nettype, std::string& reason);
 
+// What every reporter of an absence report signs (the reporters are not in it: all sign the
+// same statement): DOMAIN || genesis(32) || version(u8) || epoch(u64 LE) || count(u16 LE) ||
+// each absent index (u16 LE).
+std::string bridge_absence_message(network_type nettype, const tx_extra_bridge_absence& report);
+// An absence report against its committee's signer keys (by committee index): 1 to
+// size - threshold absent members, ascending and distinct; at least `threshold` reporters,
+// ascending, distinct, none of them absent, each signature valid.
+bool verify_bridge_absence_report(const tx_extra_bridge_absence& report,
+                                  const std::vector<crypto::ed25519_public_key>& signer_keys,
+                                  size_t threshold, network_type nettype, std::string& reason);
+// What a paused seat's signer key signs to end its pause: DOMAIN || genesis(32) ||
+// master node pubkey(32) || paused_height(u64 LE).
+std::string bridge_resume_message(network_type nettype, const tx_extra_bridge_resume& resume);
+bool verify_bridge_resume(const tx_extra_bridge_resume& resume, const crypto::ed25519_public_key& signer_key,
+                          network_type nettype, std::string& reason);
+
 // What the STANDBY signs to complete the takeover that began at `started_height`.
 crypto::hash gateway_takeover_complete_message(network_type nettype, const crypto::public_key& gateway_id,
                                                uint64_t started_height);

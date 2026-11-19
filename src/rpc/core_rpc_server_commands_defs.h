@@ -3098,6 +3098,10 @@ namespace cryptonote::rpc {
   ///   `serving_key_epoch` (the per-chain baseline `observed_key_epoch` must pass first).
   ///   A successful unbond logs nothing and leaves the seat seated, so these are the only
   ///   way to tell an accepted leave request from a silently refused one.
+  /// - a seat an absence report paused also carries `paused_height` (the report's height) and
+  ///   `paused_until`: it is not drawn for a committee below that height, unless too few
+  ///   others are left. Its signer ends the pause early (a resume) once it is back.
+  /// - `seat_cap` refuses registrations past it: a freed seat opens a place again.
   /// - `observed_key_epoch` -- per-chain {chain_id, key_epoch} this chain has observed,
   ///   advanced only by mined rotation acknowledgements. A departing seat's bond is gated
   ///   on this having moved past the baseline taken when it asked to leave, so it is what

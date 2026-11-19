@@ -125,6 +125,13 @@ struct extra_printer {
     std::cout << "Bridge rotation ack: chain " << x.chain_id << " -> key epoch " << x.key_epoch
               << " (" << x.observers.size() << " observers)";
   }
+  void operator()(const tx_extra_bridge_absence& x) {
+    std::cout << "bridge absence report: epoch " << x.epoch << ", " << x.absent.size() << " absent, "
+              << x.reporters.size() << " reporters";
+  }
+  void operator()(const tx_extra_bridge_resume& x) {
+    std::cout << "bridge resume: MN " << x.master_node_pubkey << " back from the pause at " << x.paused_height;
+  }
   void operator()(const tx_extra_bridge_key_attestation& x) {
     std::cout << "bridge key attestation: epoch " << x.epoch << " generated " << x.pgw_vk << " (member "
               << x.voter_index << ")";

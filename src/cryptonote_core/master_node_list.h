@@ -361,6 +361,22 @@ namespace master_nodes
     END_SERIALIZE()
   };
 
+  // HF23: a bridge seat paused by an absence report (tx_extra_bridge_absence): it is not drawn
+  // for a committee, of an epoch or a standby round, at a height below `until_height`, unless
+  // there are too few other seats. Its resume (tx_extra_bridge_resume) ends the pause early.
+  struct bridge_pause_record
+  {
+    crypto::public_key master_node_pubkey{};
+    uint64_t           paused_height = 0; // the height of the report that paused it
+    uint64_t           until_height = 0;
+
+    BEGIN_SERIALIZE_OBJECT()
+      FIELD(master_node_pubkey)
+      VARINT_FIELD(paused_height)
+      VARINT_FIELD(until_height)
+    END_SERIALIZE()
+  };
+
   // How exposed committee `b` is to a failure of committee `a`: the members of `b` whose
   // operator (`operator_of`) also runs a member of `a`. One operator's trouble (an outage, a
   // bad upgrade, a compromise) takes all of its nodes at once, so that is how many of `b`'s
@@ -790,6 +806,17 @@ namespace master_nodes
     std::optional<bridge_key_attestation_record> attested_bridge_key(const crypto::eddsa_public_key& pgw_vk) const;
     /// HF23: whether `gateway_id` is THE bridge gateway (whose owner changes are hand-overs).
     bool is_bridge_gateway(const crypto::public_key& gateway_id) const;
+    /// HF23: the bridge seats an absence report paused, with the heights their pauses end.
+    std::vector<bridge_pause_record> get_bridge_pauses() const
+    {
+      std::lock_guard lock{m_mn_mutex};
+      return m_state.bridge_pauses;
+    }
+    /// HF23: whether `resume` ends a current pause of its seat, signed by the seat's signer key.
+    bool check_bridge_resume(const cryptonote::tx_extra_bridge_resume& resume, std::string& reason) const;
+    /// HF23: whether a new bridge seat may register: fewer than BRIDGE_SEAT_CAP seats are
+    /// registered and not leaving. Past the cap a registration is refused, not queued.
+    bool bridge_seat_open() const;
     /// HF23: may the bridge gateway's owner move from `current` to `next`? (check_bridge_owner_change)
     bool check_owner_change(const cryptonote::gateway_owner_key_v& current,
                             const cryptonote::gateway_owner_key_v& next,
@@ -1011,8 +1038,8 @@ namespace master_nodes
 
     struct state_serialized
     {
-      enum struct version_t : uint8_t { version_0, version_1_serialize_hash, version_2_bridge_rotation, version_3_bridge_gateway_owner, version_4_bridge_chain_contract, version_5_bridge_departed_bond, version_6_bridge_key_attestation, version_7_bridge_standby_liveness, version_8_bridge_standby_rounds, count, };
-      static version_t get_version(cryptonote::hf /*hf_version*/) { return version_t::version_8_bridge_standby_rounds; }
+      enum struct version_t : uint8_t { version_0, version_1_serialize_hash, version_2_bridge_rotation, version_3_bridge_gateway_owner, version_4_bridge_chain_contract, version_5_bridge_departed_bond, version_6_bridge_key_attestation, version_7_bridge_standby_liveness, version_8_bridge_standby_rounds, version_9_bridge_pauses, count, };
+      static version_t get_version(cryptonote::hf /*hf_version*/) { return version_t::version_9_bridge_pauses; }
 
       version_t                              version;
       uint64_t                               height;
@@ -1029,6 +1056,7 @@ namespace master_nodes
       std::vector<bridge_standby_liveness_record> bridge_standby_liveness;      // HF23: the standby's last sign of life
       std::vector<bridge_key_attestation_committee> bridge_key_attestation_committees; // HF23: parallel to bridge_key_attestations
       std::vector<bridge_standby_round>      bridge_standby_rounds;   // HF23: open standby rounds
+      std::vector<bridge_pause_record>       bridge_pauses;           // HF23: seats paused by an absence report
 
       BEGIN_SERIALIZE()
         ENUM_FIELD(version, version < version_t::count)
@@ -1057,6 +1085,8 @@ namespace master_nodes
           FIELD(bridge_key_attestation_committees);
           FIELD(bridge_standby_rounds);
         }
+        if (version >= version_t::version_9_bridge_pauses)
+          FIELD(bridge_pauses);
       END_SERIALIZE()
     };
 
@@ -1108,6 +1138,8 @@ namespace master_nodes
       std::vector<bridge_standby_liveness_record>   bridge_standby_liveness;
       // Standby rounds whose attestation window is still open (bridge_standby_round).
       std::vector<bridge_standby_round>      bridge_standby_rounds;
+      // Seats an absence report paused (bridge_pause_record), until their pause ends.
+      std::vector<bridge_pause_record>       bridge_pauses;
       master_node_list*                     mn_list;
 
       state_t(master_node_list* mnl) : mn_list{mnl} {}
@@ -1211,6 +1243,15 @@ namespace master_nodes
                                           const master_node_info& info, uint64_t block_height);
       // Number of currently seated (not merely queued) bridge operators.
       size_t bridge_seated_count() const;
+      // Number of registered seats not leaving, seated or queued: what the cap counts.
+      size_t bridge_active_seat_count() const;
+      // Whether `pk`'s seat is paused for a draw at `at_height` (bridge_pause_record).
+      bool bridge_paused(const crypto::public_key& pk, uint64_t at_height) const;
+      // HF23: an absence report pauses the seats it names; a seat's resume ends its pause.
+      bool process_bridge_absence_tx(cryptonote::network_type nettype, const cryptonote::block& block,
+                                     const cryptonote::transaction& tx, const bridge_committee_resolver& resolve_committee);
+      bool process_bridge_resume_tx(cryptonote::network_type nettype, const cryptonote::block& block,
+                                    const cryptonote::transaction& tx);
       // Deterministically (re)assign seats from the registered set: the first
       // BRIDGE_SEAT_CAP entries in FIFO order (registration height, then txid —
       // never by stake) are seated, the rest queued. Idempotent and reorg-safe;

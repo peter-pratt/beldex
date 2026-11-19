@@ -31,6 +31,7 @@
 #include "cryptonote_core/master_node_quorum_cop.h" // quorum / quorum_manager
 #include "cryptonote_core/uptime_proof.h"          // complete uptime_proof::Proof for master_node_info's proof dtor
 #include "cryptonote_config.h"
+#include "beldex_economy.h"
 #include "crypto/crypto.h"
 #include "crypto/eddsa_signature.h"
 
@@ -807,6 +808,34 @@ TEST(GatewayBridgeSlash, forfeit_frees_seat_for_queue_head)
 // candidate again: the next committee generates the next key, and a member that asked to
 // leave must hold no share of it. It keeps serving the key it already holds — from that
 // key's saved committee, which needs no slot — until the key is retired.
+// Past the cap a registration is refused (Blockchain::check_tx_inputs and
+// process_bridge_registration_tx compare this count with BRIDGE_SEAT_CAP): every registered
+// seat not leaving counts, seated or queued, and a seat leaving opens a place again.
+TEST(GatewayBridgeSeats, the_cap_counts_every_seat_not_leaving)
+{
+  master_node_list::state_t cur(nullptr);
+  const size_t CAP = cryptonote::BRIDGE_SEAT_CAP;
+  std::vector<crypto::public_key> seats;
+  for (size_t i = 0; i < CAP - 1; ++i)
+  {
+    crypto::public_key pk; crypto::secret_key sk; crypto::generate_keys(pk, sk);
+    seat_member(cur, pk, crypto::ed25519_public_key::null(), 100 + i);
+    seats.push_back(pk);
+  }
+  EXPECT_EQ(cur.bridge_active_seat_count(), CAP - 1) << "one place still open";
+
+  // A seat still queued from before the cap was enforced counts like a seated one.
+  crypto::public_key queued; { crypto::secret_key sk; crypto::generate_keys(queued, sk); }
+  seat_member(cur, queued, crypto::ed25519_public_key::null(), 100 + CAP, /*seated=*/false);
+  EXPECT_EQ(cur.bridge_active_seat_count(), CAP) << "full: the next registration is refused";
+
+  // One leaving opens a place.
+  auto leaving = std::make_shared<master_node_info>(*cur.master_nodes_infos.at(seats.front()));
+  leaving->bridge_seat.requested_unbond_height = 500;
+  cur.master_nodes_infos[seats.front()] = leaving;
+  EXPECT_EQ(cur.bridge_active_seat_count(), CAP - 1);
+}
+
 TEST(GatewayBridgeSlash, exiting_seat_frees_its_slot_and_is_not_a_candidate)
 {
   const size_t CAP = cryptonote::BRIDGE_SEAT_CAP;
@@ -2848,6 +2877,12 @@ TEST(GatewayBridgeKeyAttestation, attestations_survive_state_serialization)
   r.voters = {0, 2, 5};
   r.attested_height = 90;
   s.bridge_key_attestations.push_back(r);
+  // An absence report's pause rides along (version 9).
+  master_nodes::bridge_pause_record pause{};
+  pause.master_node_pubkey = rand_pubkey();
+  pause.paused_height = 370;
+  pause.until_height = 600;
+  s.bridge_pauses.push_back(pause);
 
   master_node_list::state_serialized got{};
   ASSERT_NO_THROW(serialization::parse_binary(serialization::dump_binary(s), got));
@@ -2855,12 +2890,17 @@ TEST(GatewayBridgeKeyAttestation, attestations_survive_state_serialization)
   EXPECT_EQ(got.bridge_key_attestations[0].pgw_vk, r.pgw_vk);
   EXPECT_EQ(got.bridge_key_attestations[0].voters, r.voters);
   EXPECT_EQ(got.bridge_key_attestations[0].attested_height, 90u);
+  ASSERT_EQ(got.bridge_pauses.size(), 1u);
+  EXPECT_EQ(got.bridge_pauses[0].master_node_pubkey, pause.master_node_pubkey);
+  EXPECT_EQ(got.bridge_pauses[0].paused_height, 370u);
+  EXPECT_EQ(got.bridge_pauses[0].until_height, 600u);
 
   // A state saved before the field loads with none.
   s.version = master_node_list::state_serialized::version_t::version_5_bridge_departed_bond;
   master_node_list::state_serialized older{};
   ASSERT_NO_THROW(serialization::parse_binary(serialization::dump_binary(s), older));
   EXPECT_TRUE(older.bridge_key_attestations.empty());
+  EXPECT_TRUE(older.bridge_pauses.empty());
 }
 
 // A standby may be named only when both keys are attested and their committees share at most
@@ -3514,7 +3554,7 @@ TEST(GatewayStandbyRounds, rounds_and_record_committees_survive_state_serializat
 {
   master_node_list::state_serialized s{};
   s.version = master_node_list::state_serialized::get_version(hf::hf23_bridge);
-  ASSERT_EQ(s.version, master_node_list::state_serialized::version_t::version_8_bridge_standby_rounds);
+  ASSERT_GE(s.version, master_node_list::state_serialized::version_t::version_8_bridge_standby_rounds);
   master_nodes::bridge_standby_round round{};
   round.round_height = 130;
   round.members = {rand_pubkey(), rand_pubkey()};
@@ -4043,4 +4083,161 @@ TEST(GatewayStandbyRounds, a_rotation_ack_is_judged_against_the_rounds_committee
   ASSERT_TRUE(run(v2));
   ASSERT_EQ(cur.observed_key_epoch.size(), 1u);
   EXPECT_EQ(cur.observed_key_epoch[0].key_epoch, 1u);
+}
+
+// Testnet runs the bridge at a small scale (15 seats, 5 sign with 3, 3-hour epochs, 10k bond);
+// mainnet keeps its governance values. Every network's timings must still fit together.
+TEST(GatewayBridgeNetworkParams, testnet_runs_a_small_bridge_and_mainnet_is_unchanged)
+{
+  using namespace cryptonote;
+  EXPECT_EQ(bridge_committee_size(network_type::TESTNET), 5u);
+  EXPECT_EQ(bridge_committee_threshold(network_type::TESTNET), 3u);
+  EXPECT_EQ(bridge_activation_floor(network_type::TESTNET), 10u);
+  EXPECT_EQ(bridge_epoch_blocks(network_type::TESTNET), 360u);
+  EXPECT_EQ(bridge_bond(network_type::TESTNET), 10'000 * beldex::COIN);
+
+  EXPECT_EQ(bridge_committee_size(network_type::MAINNET), 20u);
+  EXPECT_EQ(bridge_committee_threshold(network_type::MAINNET), 14u);
+  EXPECT_EQ(bridge_activation_floor(network_type::MAINNET), 60u);
+  EXPECT_EQ(bridge_epoch_blocks(network_type::MAINNET), 2880u);
+  EXPECT_EQ(bridge_bond(network_type::MAINNET), 100'000 * beldex::COIN);
+  EXPECT_EQ(bridge_bond(network_type::DEVNET), 100'000 * beldex::COIN);
+
+  for (const auto n : {network_type::MAINNET, network_type::TESTNET, network_type::DEVNET, network_type::FAKECHAIN})
+  {
+    SCOPED_TRACE(static_cast<int>(n));
+    EXPECT_LE(bridge_committee_threshold(n), bridge_committee_size(n));
+    EXPECT_GT(2 * bridge_committee_threshold(n), bridge_committee_size(n)); // a majority signs
+    EXPECT_GE(bridge_activation_floor(n), bridge_committee_size(n));
+    EXPECT_EQ(bridge_epoch_blocks(n) % bridge_standby_round_blocks(n), 0u);
+    EXPECT_LE(bridge_standby_round_window_blocks(n), bridge_standby_round_blocks(n));
+    EXPECT_GE(bridge_standby_max_rounds(n), 1u);
+    EXPECT_LE(gateway_standby_alive_slot_blocks(n), gateway_standby_alive_window_blocks(n));
+    EXPECT_LE(gateway_standby_alive_window_blocks(n), gateway_standby_stale_blocks(n));
+    EXPECT_LT(gateway_standby_takeover_blocks(n), bridge_epoch_blocks(n));
+  }
+}
+
+namespace
+{
+  using master_nodes::bridge_pause_record;
+
+  tx_extra_bridge_absence sign_absence(const committee_keys& c, uint64_t epoch, std::vector<uint16_t> absent,
+                                       std::vector<uint16_t> reporters)
+  {
+    tx_extra_bridge_absence r{};
+    r.epoch = epoch;
+    r.absent = std::move(absent);
+    const std::string msg = bridge_absence_message(NET_FC, r);
+    for (const auto i : reporters)
+    {
+      bridge_slash_signature s{};
+      s.voter_index = i;
+      crypto_sign_detached(s.signature.data, nullptr, reinterpret_cast<const unsigned char*>(msg.data()), msg.size(),
+                           c.ed_sec[i].data);
+      r.reporters.push_back(s);
+    }
+    return r;
+  }
+
+  bool run_absence(master_node_list::state_t& cur, const committee_keys& c, const tx_extra_bridge_absence& r,
+                   uint64_t block_height, uint64_t committee_epoch)
+  {
+    master_nodes::bridge_committee_resolver resolver =
+      [&](uint64_t eh, std::vector<crypto::public_key>& members,
+          std::vector<crypto::ed25519_public_key>& signer_keys, size_t& threshold) -> bool {
+        if (eh != committee_epoch * cryptonote::bridge_epoch_blocks(NET_FC))
+          return false;
+        members = c.mn;
+        signer_keys = c.ed_pub;
+        threshold = cryptonote::bridge_committee_threshold(NET_FC);
+        return true;
+      };
+    block blk{};
+    blk.major_version = hf::hf23_bridge;
+    blk.miner_tx.vin.push_back(txin_gen{block_height});
+    transaction tx{};
+    tx.type = txtype::bridge_registration;
+    EXPECT_TRUE(add_bridge_absence_to_tx_extra(tx.extra, r));
+    return cur.process_bridge_absence_tx(NET_FC, blk, tx, resolver);
+  }
+}
+
+// An absence report needs the threshold of present members' signatures and names at most the
+// members the committee can do without; none of the absent may sign it.
+TEST(GatewayBridgeAbsence, a_report_is_checked_against_its_committee)
+{
+  const size_t n = cryptonote::bridge_committee_size(NET_FC), t = cryptonote::bridge_committee_threshold(NET_FC);
+  auto c = make_committee(n); // 6, threshold 4: up to 2 absent
+  std::string reason;
+
+  auto good = sign_absence(c, 3, {1}, {0, 2, 3, 4});
+  EXPECT_TRUE(verify_bridge_absence_report(good, c.ed_pub, t, NET_FC, reason)) << reason;
+
+  EXPECT_FALSE(verify_bridge_absence_report(sign_absence(c, 3, {1}, {0, 2, 3}), c.ed_pub, t, NET_FC, reason));
+  EXPECT_NE(reason.find("too few reporters"), std::string::npos) << reason;
+  EXPECT_FALSE(verify_bridge_absence_report(sign_absence(c, 3, {0, 1, 2}, {3, 4, 5, 3}), c.ed_pub, t, NET_FC, reason));
+  EXPECT_NE(reason.find("1 to 2"), std::string::npos) << reason;
+  EXPECT_FALSE(verify_bridge_absence_report(sign_absence(c, 3, {1}, {0, 1, 2, 3}), c.ed_pub, t, NET_FC, reason));
+  EXPECT_NE(reason.find("cannot report"), std::string::npos) << reason;
+  EXPECT_FALSE(verify_bridge_absence_report(sign_absence(c, 3, {2, 1}, {0, 3, 4, 5}), c.ed_pub, t, NET_FC, reason));
+  EXPECT_NE(reason.find("ascending"), std::string::npos) << reason;
+
+  // Signed for another member set: a reporter's signature covers exactly the absent list.
+  auto changed = good;
+  changed.absent = {5};
+  EXPECT_FALSE(verify_bridge_absence_report(changed, c.ed_pub, t, NET_FC, reason));
+  EXPECT_NE(reason.find("does not verify"), std::string::npos) << reason;
+}
+
+// A report pauses the absent seats for the next epoch's draw only, counts only in its own
+// epoch, and the seat's own resume ends its pause.
+TEST(GatewayBridgeAbsence, a_report_pauses_for_the_next_draw_and_a_resume_ends_it)
+{
+  const uint64_t E = cryptonote::bridge_epoch_blocks(NET_FC);
+  auto c = make_committee(cryptonote::bridge_committee_size(NET_FC));
+  master_node_list::state_t cur(nullptr);
+  for (size_t i = 0; i < c.mn.size(); ++i)
+    seat_member(cur, c.mn[i], c.ed_pub[i], 100 + i);
+
+  // A report for an earlier epoch pauses no one.
+  EXPECT_FALSE(run_absence(cur, c, sign_absence(c, 2, {1}, {0, 2, 3, 4}), 3 * E + 10, 2));
+  EXPECT_TRUE(cur.bridge_pauses.empty());
+
+  ASSERT_TRUE(run_absence(cur, c, sign_absence(c, 3, {1}, {0, 2, 3, 4}), 3 * E + 10, 3));
+  ASSERT_EQ(cur.bridge_pauses.size(), 1u);
+  EXPECT_EQ(cur.bridge_pauses[0].master_node_pubkey, c.mn[1]);
+  EXPECT_EQ(cur.bridge_pauses[0].until_height, 5 * E);
+  EXPECT_TRUE(cur.bridge_paused(c.mn[1], 4 * E)) << "not drawn for epoch 4";
+  EXPECT_FALSE(cur.bridge_paused(c.mn[1], 5 * E)) << "drawn again from epoch 5";
+  EXPECT_FALSE(cur.bridge_paused(c.mn[0], 4 * E));
+
+  // The resume: only the seat's own signer key, and only for the pause it really has.
+  tx_extra_bridge_resume resume{};
+  resume.master_node_pubkey = c.mn[1];
+  resume.paused_height = 3 * E + 10;
+  auto sign_resume = [&](size_t key) {
+    const std::string msg = bridge_resume_message(NET_FC, resume);
+    crypto_sign_detached(resume.signature.data, nullptr, reinterpret_cast<const unsigned char*>(msg.data()), msg.size(),
+                         c.ed_sec[key].data);
+  };
+  auto run_resume = [&]() {
+    block blk{};
+    blk.major_version = hf::hf23_bridge;
+    blk.miner_tx.vin.push_back(txin_gen{3 * E + 20});
+    transaction tx{};
+    tx.type = txtype::bridge_registration;
+    EXPECT_TRUE(add_bridge_resume_to_tx_extra(tx.extra, resume));
+    return cur.process_bridge_resume_tx(NET_FC, blk, tx);
+  };
+  sign_resume(2); // another seat's key
+  EXPECT_FALSE(run_resume());
+  resume.paused_height = 3 * E + 11; // not its pause
+  sign_resume(1);
+  EXPECT_FALSE(run_resume());
+  resume.paused_height = 3 * E + 10;
+  sign_resume(1);
+  EXPECT_TRUE(run_resume());
+  EXPECT_TRUE(cur.bridge_pauses.empty());
+  EXPECT_FALSE(cur.bridge_paused(c.mn[1], 4 * E));
 }

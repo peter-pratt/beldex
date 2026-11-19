@@ -1073,6 +1073,22 @@ namespace cryptonote
     return result;
   }
   //---------------------------------------------------------------
+  bool add_bridge_absence_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_bridge_absence& op)
+  {
+    tx_extra_field field = op;
+    bool result = add_tx_extra_field_to_tx_extra(tx_extra, field);
+    CHECK_AND_NO_ASSERT_MES_L1(result, false, "failed to serialize bridge absence report");
+    return result;
+  }
+  //---------------------------------------------------------------
+  bool add_bridge_resume_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_bridge_resume& op)
+  {
+    tx_extra_field field = op;
+    bool result = add_tx_extra_field_to_tx_extra(tx_extra, field);
+    CHECK_AND_NO_ASSERT_MES_L1(result, false, "failed to serialize bridge resume");
+    return result;
+  }
+  //---------------------------------------------------------------
   bool add_gateway_freeze_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_gateway_freeze& op)
   {
     tx_extra_field field = op;

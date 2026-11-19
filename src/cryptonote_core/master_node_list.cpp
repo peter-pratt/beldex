@@ -2094,6 +2094,11 @@ namespace master_nodes
           std::mt19937_64 rng = quorum_rng(hf_version, state.block_hash, type);
           tools::shuffle_portable(seats.begin(), seats.end(), rng);
 
+          // Seats paused by an absence report go last, after the shuffle: drawn only if there
+          // are too few others to fill the committee. The floor above still counted them.
+          std::stable_partition(seats.begin(), seats.end(),
+                                [&](const pubkey_and_mninfo &s) { return !state.bridge_paused(s.first, state.height); });
+
           std::vector<cryptonote::account_public_address> used_ops;
           quorum->validators.reserve(cryptonote::bridge_committee_size(nettype));
           for (const auto &s : seats)
@@ -2153,6 +2158,128 @@ namespace master_nodes
     return n;
   }
 
+  size_t master_node_list::state_t::bridge_active_seat_count() const
+  {
+    size_t n = 0;
+    for (const auto &[pk, info] : master_nodes_infos)
+      if (info->bridge_seat.registered && info->bridge_seat.requested_unbond_height == 0)
+        ++n;
+    return n;
+  }
+
+  bool master_node_list::state_t::bridge_paused(const crypto::public_key &pk, uint64_t at_height) const
+  {
+    for (const auto &p : bridge_pauses)
+      if (p.master_node_pubkey == pk && at_height < p.until_height)
+        return true;
+    return false;
+  }
+
+  bool master_node_list::state_t::process_bridge_absence_tx(cryptonote::network_type nettype,
+                                                            const cryptonote::block &block,
+                                                            const cryptonote::transaction &tx,
+                                                            const bridge_committee_resolver &resolve_committee)
+  {
+    const uint64_t block_height = cryptonote::get_block_height(block);
+    if (block.major_version < cryptonote::hf::hf23_bridge || !resolve_committee)
+      return false;
+    cryptonote::tx_extra_bridge_absence report{};
+    if (!cryptonote::get_field_from_tx_extra(tx.extra, report))
+      return false;
+    // Only within the epoch it names: an old report never pauses anyone later.
+    const uint64_t epoch_blocks = cryptonote::bridge_epoch_blocks(nettype);
+    if (report.epoch != block_height / epoch_blocks)
+    {
+      LOG_PRINT_L1("Bridge absence report for epoch " << report.epoch << " is not for this epoch");
+      return false;
+    }
+    std::vector<crypto::public_key> members;
+    std::vector<crypto::ed25519_public_key> signer_keys;
+    size_t threshold = 0;
+    std::string reason;
+    if (!resolve_committee(report.epoch * epoch_blocks, members, signer_keys, threshold) || members.empty()
+        || members.size() != signer_keys.size())
+    {
+      LOG_PRINT_L1("Bridge absence report: no bridge committee for epoch " << report.epoch);
+      return false;
+    }
+    if (!cryptonote::verify_bridge_absence_report(report, signer_keys, threshold, nettype, reason))
+    {
+      LOG_PRINT_L1("Bridge absence report rejected: " << reason);
+      return false;
+    }
+    // Paused for the next epoch's draw, and the standby rounds until then.
+    const uint64_t until = (report.epoch + 2) * epoch_blocks;
+    for (const auto index : report.absent)
+    {
+      const auto &pk = members[index];
+      auto it = std::find_if(bridge_pauses.begin(), bridge_pauses.end(),
+                             [&](const bridge_pause_record &p) { return p.master_node_pubkey == pk; });
+      if (it == bridge_pauses.end())
+        bridge_pauses.push_back(bridge_pause_record{pk, block_height, until});
+      else
+      {
+        it->paused_height = block_height;
+        it->until_height = std::max(it->until_height, until);
+      }
+      MGINFO("Bridge seat " << pk << " paused until height " << until << ": absent from committee epoch "
+             << report.epoch << "'s key generation (" << report.reporters.size() << " members say so)");
+    }
+    return true;
+  }
+
+  bool master_node_list::state_t::process_bridge_resume_tx(cryptonote::network_type nettype,
+                                                           const cryptonote::block &block,
+                                                           const cryptonote::transaction &tx)
+  {
+    if (block.major_version < cryptonote::hf::hf23_bridge)
+      return false;
+    cryptonote::tx_extra_bridge_resume resume{};
+    if (!cryptonote::get_field_from_tx_extra(tx.extra, resume))
+      return false;
+    auto info = master_nodes_infos.find(resume.master_node_pubkey);
+    auto pause = std::find_if(bridge_pauses.begin(), bridge_pauses.end(), [&](const bridge_pause_record &p) {
+      return p.master_node_pubkey == resume.master_node_pubkey && p.paused_height == resume.paused_height;
+    });
+    std::string reason;
+    if (info == master_nodes_infos.end() || pause == bridge_pauses.end()
+        || !cryptonote::verify_bridge_resume(resume, info->second->bridge_seat.signer_ed25519, nettype, reason))
+    {
+      LOG_PRINT_L1("Bridge resume for " << resume.master_node_pubkey << " ignored: "
+                   << (reason.empty() ? "no such pause" : reason));
+      return false;
+    }
+    bridge_pauses.erase(pause);
+    MGINFO("Bridge seat " << resume.master_node_pubkey << " is back: its pause ended");
+    return true;
+  }
+
+  bool master_node_list::check_bridge_resume(const cryptonote::tx_extra_bridge_resume &resume, std::string &reason) const
+  {
+    std::lock_guard lock(m_mn_mutex);
+    auto info = m_state.master_nodes_infos.find(resume.master_node_pubkey);
+    if (info == m_state.master_nodes_infos.end())
+    {
+      reason = "no such master node";
+      return false;
+    }
+    const bool paused = std::any_of(m_state.bridge_pauses.begin(), m_state.bridge_pauses.end(), [&](const bridge_pause_record &p) {
+      return p.master_node_pubkey == resume.master_node_pubkey && p.paused_height == resume.paused_height;
+    });
+    if (!paused)
+    {
+      reason = "no pause of that seat at height " + std::to_string(resume.paused_height);
+      return false;
+    }
+    return cryptonote::verify_bridge_resume(resume, info->second->bridge_seat.signer_ed25519, m_blockchain.nettype(), reason);
+  }
+
+  bool master_node_list::bridge_seat_open() const
+  {
+    std::lock_guard lock(m_mn_mutex);
+    return m_state.bridge_active_seat_count() < cryptonote::BRIDGE_SEAT_CAP;
+  }
+
   // Message the operating masternode key signs to authorize a bridge
   // registration and bind the bridge-signer (TSS transport) identity:
   //   H("BRIDGE_REGISTER_V1" || master_node_pubkey || signer_ed25519 || expiration_timestamp).
@@ -2192,6 +2319,14 @@ namespace master_nodes
     if (curinfo.bridge_seat.registered)
     {
       LOG_PRINT_L1("Bridge reg TX: master node " << reg.master_node_pubkey << " already holds a bridge seat");
+      return false;
+    }
+
+    // Every seat taken: refused, not queued. A freed seat (one leaving) opens one again.
+    if (bridge_active_seat_count() >= cryptonote::BRIDGE_SEAT_CAP)
+    {
+      LOG_PRINT_L1("Bridge reg TX: all " << cryptonote::BRIDGE_SEAT_CAP << " bridge seats are taken; "
+                   << reg.master_node_pubkey << " not registered");
       return false;
     }
 
@@ -3200,8 +3335,11 @@ namespace master_nodes
     for (const auto &[pk, info] : master_nodes_infos)
       if (info->is_bridge_seated())
       {
-        candidates.push_back(bridge_standby_candidate{pk, bridge_operator_id(master_nodes_infos, pk)});
-        operators.insert(candidates.back().op);
+        const auto op = bridge_operator_id(master_nodes_infos, pk);
+        operators.insert(op);
+        // A seat paused by an absence report is not drawn for a standby round.
+        if (!bridge_paused(pk, height))
+          candidates.push_back(bridge_standby_candidate{pk, op});
       }
     // Below the activation floor the bridge is dormant: no committee of any kind.
     if (operators.size() < cryptonote::bridge_activation_floor(nettype))
@@ -3793,6 +3931,8 @@ namespace master_nodes
         cryptonote::tx_extra_bridge_key_attestation attestation{};
         cryptonote::tx_extra_gateway_repoint     repoint{};
         cryptonote::tx_extra_gateway_freeze      freeze{};
+        cryptonote::tx_extra_bridge_absence      absence{};
+        cryptonote::tx_extra_bridge_resume       resume{};
         if (cryptonote::get_field_from_tx_extra(tx.extra, takeover)
             || cryptonote::get_field_from_tx_extra(tx.extra, repoint)
             || cryptonote::get_field_from_tx_extra(tx.extra, freeze))
@@ -3805,6 +3945,10 @@ namespace master_nodes
           process_bridge_slash_tx(nettype, block, tx, resolve_bridge_committee);
         else if (cryptonote::get_field_from_tx_extra(tx.extra, unbond))
           process_bridge_unbond_tx(nettype, block, tx);
+        else if (cryptonote::get_field_from_tx_extra(tx.extra, absence))
+          process_bridge_absence_tx(nettype, block, tx, resolve_bridge_committee);
+        else if (cryptonote::get_field_from_tx_extra(tx.extra, resume))
+          process_bridge_resume_tx(nettype, block, tx);
         else
           process_bridge_registration_tx(nettype, block, tx, index);
       }
@@ -3825,6 +3969,10 @@ namespace master_nodes
     {
       finalize_bridge_unbonds(block_height);
       refresh_bridge_seats();
+      // A pause that has run its course is gone.
+      bridge_pauses.erase(std::remove_if(bridge_pauses.begin(), bridge_pauses.end(),
+                                         [&](const bridge_pause_record &p) { return p.until_height <= block_height; }),
+                          bridge_pauses.end());
     }
 
     // Filtered pubkey-sorted vector of master nodes that are active (fully funded and *not* decommissioned).
@@ -4434,6 +4582,7 @@ namespace master_nodes
       result.bridge_key_attestation_committees.push_back(bridge_key_attestation_committee{r.round_height, r.members});
     result.bridge_standby_liveness = state.bridge_standby_liveness;
     result.bridge_standby_rounds = state.bridge_standby_rounds;
+    result.bridge_pauses = state.bridge_pauses;
     return result;
   }
 
@@ -5083,6 +5232,7 @@ namespace master_nodes
   , bridge_key_attestations{std::move(state.bridge_key_attestations)}
   , bridge_standby_liveness{std::move(state.bridge_standby_liveness)}
   , bridge_standby_rounds{std::move(state.bridge_standby_rounds)}
+  , bridge_pauses{std::move(state.bridge_pauses)}
   , mn_list{mnl}
   {
     if (!mn_list)

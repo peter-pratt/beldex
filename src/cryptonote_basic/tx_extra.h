@@ -74,6 +74,8 @@ constexpr uint8_t
   TX_EXTRA_TAG_GATEWAY_RELEASE_REF          = 0x84, // HF23 (release replay guard, §6a)
   TX_EXTRA_TAG_GATEWAY_TAKEOVER             = 0x85, // HF23 (standby owner takeover)
   TX_EXTRA_TAG_BRIDGE_KEY_ATTESTATION       = 0x86, // HF23 (which committee generated a key)
+  TX_EXTRA_TAG_BRIDGE_ABSENCE               = 0x87, // HF23 (members absent from their committee's DKG)
+  TX_EXTRA_TAG_BRIDGE_RESUME                = 0x89, // HF23 (a paused bridge seat is back)
   TX_EXTRA_TAG_SECURITY_SIGNATURE          = 0x88,
   TX_EXTRA_MYSTERIOUS_MINERGATE_TAG       = 0xDE;
 
@@ -870,6 +872,45 @@ namespace cryptonote
     END_SERIALIZE()
   };
 
+  // Absence report (HF23). Members of an epoch's bridge committee name the members that did
+  // not take part in two of its DKG attempts in a row (no hello from them), each signing with
+  // its bridge-seat signer key. With the epoch's threshold of signatures, consensus pauses the
+  // named seats: they are not drawn for the next epoch's committee, nor for standby rounds
+  // until then, and are eligible again after. A pause costs nothing else: the seat, its bond
+  // and its master node are untouched. Accepted only within the epoch it names.
+  struct tx_extra_bridge_absence
+  {
+    uint8_t                             version = 0;
+    uint64_t                            epoch = 0;     // the committee's epoch (the current one)
+    std::vector<uint16_t>               absent;        // committee indices, ascending, distinct
+    std::vector<bridge_slash_signature> reporters;     // >= threshold present members, ascending
+
+    BEGIN_SERIALIZE()
+      FIELD(version)
+      VARINT_FIELD(epoch)
+      FIELD(absent)
+      FIELD(reporters)
+    END_SERIALIZE()
+  };
+
+  // A paused bridge seat says it is back (HF23): signed with the seat's bridge signer key over
+  // the pause it ends (the height the absence report paused it at), so it ends that pause only.
+  // The seat is drawn again from then on.
+  struct tx_extra_bridge_resume
+  {
+    uint8_t                   version = 0;
+    crypto::public_key        master_node_pubkey{};
+    uint64_t                  paused_height = 0;
+    crypto::ed25519_signature signature{};
+
+    BEGIN_SERIALIZE()
+      FIELD(version)
+      FIELD(master_node_pubkey)
+      VARINT_FIELD(paused_height)
+      FIELD(signature)
+    END_SERIALIZE()
+  };
+
   // One observer's ed25519 signature on a bridge rotation ack (HF23, H.6.3). The
   // observer is a bridge-committee member; `voter_index` is its index in the observing
   // epoch's committee. The signature is over the canonical, genesis-bound rotation-ack
@@ -1074,6 +1115,8 @@ namespace cryptonote
       tx_extra_gateway_release_ref,
       tx_extra_gateway_takeover,
       tx_extra_bridge_key_attestation,
+      tx_extra_bridge_absence,
+      tx_extra_bridge_resume,
       tx_extra_bridge_registration,
       tx_extra_bridge_unbond,
       tx_extra_bridge_slash,
@@ -1111,6 +1154,8 @@ BINARY_VARIANT_TAG(cryptonote::tx_extra_gateway_repoint,              cryptonote
 BINARY_VARIANT_TAG(cryptonote::tx_extra_gateway_release_ref,          cryptonote::TX_EXTRA_TAG_GATEWAY_RELEASE_REF);
 BINARY_VARIANT_TAG(cryptonote::tx_extra_gateway_takeover,             cryptonote::TX_EXTRA_TAG_GATEWAY_TAKEOVER);
 BINARY_VARIANT_TAG(cryptonote::tx_extra_bridge_key_attestation,       cryptonote::TX_EXTRA_TAG_BRIDGE_KEY_ATTESTATION);
+BINARY_VARIANT_TAG(cryptonote::tx_extra_bridge_absence,               cryptonote::TX_EXTRA_TAG_BRIDGE_ABSENCE);
+BINARY_VARIANT_TAG(cryptonote::tx_extra_bridge_resume,                cryptonote::TX_EXTRA_TAG_BRIDGE_RESUME);
 BINARY_VARIANT_TAG(cryptonote::tx_extra_bridge_registration,          cryptonote::TX_EXTRA_TAG_BRIDGE_REGISTRATION);
 BINARY_VARIANT_TAG(cryptonote::tx_extra_bridge_unbond,                cryptonote::TX_EXTRA_TAG_BRIDGE_UNBOND);
 BINARY_VARIANT_TAG(cryptonote::tx_extra_bridge_slash,                 cryptonote::TX_EXTRA_TAG_BRIDGE_SLASH);

@@ -3284,6 +3284,67 @@ namespace {
     return res;
   }
 
+  BRIDGE_ABSENCE_REPORT::response wallet_rpc_server::invoke(BRIDGE_ABSENCE_REPORT::request&& req)
+  {
+    require_open();
+    BRIDGE_ABSENCE_REPORT::response res{};
+    cryptonote::tx_extra_bridge_absence report{};
+    report.epoch = req.epoch;
+    report.absent = req.absent;
+    for (const auto& r : req.reporters)
+    {
+      cryptonote::bridge_slash_signature s{};
+      s.voter_index = r.voter_index;
+      if (!tools::hex_to_type(r.signature, s.signature))
+        throw wallet_rpc_error{error_code::WRONG_SIGNATURE, "each reporter signature must be 128-char hex"};
+      report.reporters.push_back(s);
+    }
+    std::vector<uint8_t> extra;
+    if (!cryptonote::add_bridge_absence_to_tx_extra(extra, report))
+      throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, "failed to serialize the absence report"};
+    tools::wallet2::bridge_rotation_ack_result built = m_wallet->create_bridge_op_tx(extra, "absence report", req.priority);
+    if (!built.success)
+      throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, built.msg};
+    try
+    {
+      m_wallet->commit_tx(built.ptx, false /*flash*/);
+    }
+    catch (const std::exception& e)
+    {
+      throw wallet_rpc_error{error_code::GENERIC_TRANSFER_ERROR, std::string("Failed to commit the absence report: ") + e.what()};
+    }
+    res.tx_hash = tools::type_to_hex(cryptonote::get_transaction_hash(built.ptx.tx));
+    return res;
+  }
+
+  BRIDGE_RESUME::response wallet_rpc_server::invoke(BRIDGE_RESUME::request&& req)
+  {
+    require_open();
+    BRIDGE_RESUME::response res{};
+    cryptonote::tx_extra_bridge_resume resume{};
+    if (!tools::hex_to_type(req.master_node_pubkey, resume.master_node_pubkey))
+      throw wallet_rpc_error{error_code::WRONG_KEY, "master_node_pubkey must be 64-char hex"};
+    resume.paused_height = req.paused_height;
+    if (!tools::hex_to_type(req.signature, resume.signature))
+      throw wallet_rpc_error{error_code::WRONG_SIGNATURE, "signature must be 128-char hex"};
+    std::vector<uint8_t> extra;
+    if (!cryptonote::add_bridge_resume_to_tx_extra(extra, resume))
+      throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, "failed to serialize the resume"};
+    tools::wallet2::bridge_rotation_ack_result built = m_wallet->create_bridge_op_tx(extra, "bridge resume", req.priority);
+    if (!built.success)
+      throw wallet_rpc_error{error_code::TX_NOT_POSSIBLE, built.msg};
+    try
+    {
+      m_wallet->commit_tx(built.ptx, false /*flash*/);
+    }
+    catch (const std::exception& e)
+    {
+      throw wallet_rpc_error{error_code::GENERIC_TRANSFER_ERROR, std::string("Failed to commit the resume: ") + e.what()};
+    }
+    res.tx_hash = tools::type_to_hex(cryptonote::get_transaction_hash(built.ptx.tx));
+    return res;
+  }
+
   GATEWAY_TAKEOVER_CANCEL::response wallet_rpc_server::invoke(GATEWAY_TAKEOVER_CANCEL::request&& req)
   {
     require_open();

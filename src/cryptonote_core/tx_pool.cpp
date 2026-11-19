@@ -227,12 +227,14 @@ namespace cryptonote
       //   * rotation-ack (H.6.3)   — committee-driven, keyed by (chain_id, key_epoch);
       //   * takeover step          — a gateway committee's, keyed by (gateway, step, height);
       //   * key attestation        — one committee member's, keyed by (key, epoch, member);
-      //   * governance freeze / re-point — the checkpoint quorum's, keyed by (gateway, nonce).
+      //   * governance freeze / re-point — the checkpoint quorum's, keyed by (gateway, nonce);
+      //   * absence report         — a committee's, keyed by its epoch;
+      //   * resume                 — a paused seat's, keyed by its master node pubkey.
       // The committee-driven ops are not signed by any operator, and any committee member
       // may submit them — so they are keyed by their subject, not a pubkey.
       //
       // Dedupe so at most one pending bridge op per subject sits in the pool.
-      enum class bridge_kind { op_pubkey, slash, rotation, takeover, attestation, governance };
+      enum class bridge_kind { op_pubkey, slash, rotation, takeover, attestation, governance, absence, resume };
       struct bridge_key {
         bridge_kind kind;
         crypto::public_key            mn_pubkey{};
@@ -241,6 +243,7 @@ namespace cryptonote
         std::tuple<crypto::public_key, uint8_t, uint64_t> takeover_key{};
         std::pair<crypto::public_key, uint64_t> attestation_key{}; // (key, epoch << 16 | voter)
         std::pair<crypto::public_key, uint64_t> governance_key{};  // (gateway, governance nonce)
+        uint64_t                      absence_epoch{};
       };
       auto bridge_op_key = [](const transaction& t, bridge_key& k) -> bool {
         tx_extra_bridge_rotation_ack rot{};
@@ -268,6 +271,12 @@ namespace cryptonote
         { k.kind = bridge_kind::rotation; k.rot_key = {rot.chain_id, rot.key_epoch}; return true; }
         if (cryptonote::get_field_from_tx_extra(t.extra, slash))
         { k.kind = bridge_kind::slash; k.slash_key = {slash.round_height ? slash.round_height : slash.epoch, slash.accused_index}; return true; }
+        tx_extra_bridge_absence absence{};
+        if (cryptonote::get_field_from_tx_extra(t.extra, absence))
+        { k.kind = bridge_kind::absence; k.absence_epoch = absence.epoch; return true; }
+        tx_extra_bridge_resume resume{};
+        if (cryptonote::get_field_from_tx_extra(t.extra, resume))
+        { k.kind = bridge_kind::resume; k.mn_pubkey = resume.master_node_pubkey; return true; }
         if (cryptonote::get_field_from_tx_extra(t.extra, reg))
         { k.kind = bridge_kind::op_pubkey; k.mn_pubkey = reg.master_node_pubkey; return true; }
         if (cryptonote::get_field_from_tx_extra(t.extra, unbond))
@@ -304,6 +313,8 @@ namespace cryptonote
           case bridge_kind::takeover:  same_subject = pool_key.takeover_key == key.takeover_key; break;
           case bridge_kind::attestation: same_subject = pool_key.attestation_key == key.attestation_key; break;
           case bridge_kind::governance: same_subject = pool_key.governance_key == key.governance_key; break;
+          case bridge_kind::absence:   same_subject = pool_key.absence_epoch == key.absence_epoch; break;
+          case bridge_kind::resume:    same_subject = pool_key.mn_pubkey == key.mn_pubkey; break;
         }
         if (same_subject)
         {

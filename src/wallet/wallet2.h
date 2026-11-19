@@ -1459,6 +1459,9 @@ private:
     bridge_rotation_ack_result create_gateway_governance_tx(const std::vector<uint8_t>& op_extra, uint32_t priority = 0, std::set<uint32_t> subaddr_indices = {});
     // HF23: carry one committee member's key attestation (tx_extra_bridge_key_attestation).
     bridge_rotation_ack_result create_bridge_key_attestation_tx(const cryptonote::tx_extra_bridge_key_attestation& att, uint32_t priority = 0, std::set<uint32_t> subaddr_indices = {});
+    // HF23: carry a bridge op already serialized into `extra` (an absence report, a resume): this
+    // wallet only pays the fee; consensus checks the signatures inside.
+    bridge_rotation_ack_result create_bridge_op_tx(const std::vector<uint8_t>& extra, const std::string& what, uint32_t priority = 0, std::set<uint32_t> subaddr_indices = {});
     bridge_rotation_ack_result create_gateway_takeover_step_tx(const cryptonote::tx_extra_gateway_takeover& step, uint32_t priority = 0, std::set<uint32_t> subaddr_indices = {});
 
     struct request_stake_unlock_result

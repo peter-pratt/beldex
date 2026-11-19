@@ -175,6 +175,8 @@ namespace cryptonote
   bool add_gateway_freeze_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_gateway_freeze& op);
   bool add_gateway_takeover_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_gateway_takeover& op);
   bool add_bridge_key_attestation_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_bridge_key_attestation& op);
+  bool add_bridge_absence_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_bridge_absence& op);
+  bool add_bridge_resume_to_tx_extra(std::vector<uint8_t>& tx_extra, const tx_extra_bridge_resume& op);
 
   // Parse the EVM address a bridge deposit mints to: 40 hex characters, optionally after 0x.
   // A wrong address mints to someone else for good, so beyond the shape: the zero address is

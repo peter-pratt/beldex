@@ -220,6 +220,10 @@ namespace hashkey {
   inline constexpr std::string_view GW_STANDBY_NAME      = "gateway_standby_name"sv;
   // A committee member's word that its committee generated a key (tx_extra_bridge_key_attestation).
   inline constexpr std::string_view BRIDGE_KEY_ATTESTATION = "bridge_key_attestation_v1"sv;
+  // Committee members naming the members absent from their DKG (tx_extra_bridge_absence).
+  inline constexpr std::string_view BRIDGE_ABSENCE = "bridge_absence_report_v1"sv;
+  // A paused bridge seat saying it is back (tx_extra_bridge_resume).
+  inline constexpr std::string_view BRIDGE_RESUME = "bridge_resume_v1"sv;
   inline constexpr std::string_view GW_STANDBY_ALIVE     = "gateway_standby_alive"sv;
   // Phase F accountability: the bridge-committee slash-report domain. MUST match the
   // off-chain signer's `slash::SLASH_REPORT_DOMAIN` byte-for-byte.

@@ -1044,7 +1044,8 @@ void omq_rpc::on_bridge_mint_payload(oxenmq::Message& m)
   // rotateSigner) and `activate` (the incoming committee's activateRotation), the gateway
   // hand-over's signature (`handover`), the completed rotation acknowledgement (`ack`), and the
   // standby's EVM calls, sent by the relayer too: `set_standby` (the live committee names its
-  // standby) and `takeover_begin` / `takeover_complete` / `takeover_cancel`.
+  // standby) and `takeover_begin` / `takeover_complete` / `takeover_cancel`, and the members'
+  // signatures on an absence report (`absence`), which they pool into one transaction.
   // Each is one per rotation or step, however many members publish it.
   std::string key, kind;
   try {
@@ -1084,9 +1085,13 @@ void omq_rpc::on_bridge_mint_payload(oxenmq::Message& m)
                || kind == "takeover_cancel") {
       // A standby step: its signature is single-use on chain, so it names the step.
       key = kind + ":" + num("chain_id") + ":" + j.value("sig", "");
+    } else if (kind == "absence") {
+      // One present member's signature on an absence report (the committee pools them into
+      // one tx_extra_bridge_absence): one per member and absent set.
+      key = "absence:" + num("epoch") + ":" + j.at("absent").dump() + ":" + num("voter_index");
     } else {
       m.send_reply(OMQ_BAD_REQUEST,
-                   "bridge.mint_payload: not a mint, rotate, activate, handover, ack, set_standby or takeover payload");
+                   "bridge.mint_payload: not a mint, rotate, activate, handover, ack, set_standby, takeover or absence payload");
       return;
     }
   } catch (const std::exception& e) {

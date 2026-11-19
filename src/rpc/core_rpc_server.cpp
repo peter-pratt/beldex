@@ -826,6 +826,16 @@ namespace cryptonote::rpc {
         json_binary_proxy{ack["new_signer"], format} =
             std::string_view{reinterpret_cast<const char*>(x.new_signer.data()), x.new_signer.size()};
       }
+      void operator()(const tx_extra_bridge_absence& x) {
+        json reporters = json::array();
+        for (const auto& r : x.reporters)
+          reporters.push_back(r.voter_index);
+        set("bridge_absence", json{{"epoch", x.epoch}, {"absent", x.absent}, {"reporters", std::move(reporters)}});
+      }
+      void operator()(const tx_extra_bridge_resume& x) {
+        set("bridge_resume", json{{"master_node_pubkey", tools::type_to_hex(x.master_node_pubkey)},
+                                  {"paused_height", x.paused_height}});
+      }
       void operator()(const tx_extra_bridge_key_attestation& x) {
         set("bridge_key_attestation", json{
             {"epoch", x.epoch},
@@ -4838,6 +4848,8 @@ namespace cryptonote::rpc {
   void core_rpc_server::invoke(BRIDGE_GET_SEATS& cmd, rpc_context context)
   {
     auto infos = m_core.get_master_node_list_state({});
+    // Seats an absence report paused: not drawn for a committee until `paused_until`.
+    const auto pauses = m_core.get_master_node_list().get_bridge_pauses();
     auto seats = json::array();
     size_t seated = 0, queued = 0;
     std::vector<cryptonote::account_public_address> ops; // distinct operator identities
@@ -4859,7 +4871,7 @@ namespace cryptonote::rpc {
       auto serving = json::array();
       for (const auto &ce : bs.serving_key_epoch)
         serving.push_back(json{{"chain_id", ce.chain_id}, {"key_epoch", ce.key_epoch}});
-      seats.push_back(json{
+      json seat{
           {"master_node_pubkey", tools::type_to_hex(e.pubkey)},
           {"seated", bs.seated},
           {"bond", bs.bond_amount},
@@ -4867,7 +4879,14 @@ namespace cryptonote::rpc {
           {"registration_height", bs.registration_height},
           {"requested_unbond_height", bs.requested_unbond_height},
           {"bond_unlock_height", bs.bond_unlock_height},
-          {"serving_key_epoch", std::move(serving)}});
+          {"serving_key_epoch", std::move(serving)}};
+      for (const auto &p : pauses)
+        if (p.master_node_pubkey == e.pubkey)
+        {
+          seat["paused_height"] = p.paused_height;
+          seat["paused_until"] = p.until_height;
+        }
+      seats.push_back(std::move(seat));
     }
     cmd.response["seats"]              = std::move(seats);
     cmd.response["seated_count"]       = seated;

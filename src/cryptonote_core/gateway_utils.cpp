@@ -426,6 +426,115 @@ bool verify_bridge_key_attestation(const tx_extra_bridge_key_attestation& att,
   return true;
 }
 
+std::string bridge_absence_message(network_type nettype, const tx_extra_bridge_absence& report)
+{
+  const crypto::hash& genesis = gateway_chain_binding(nettype);
+  std::string buf;
+  buf.append(hashkey::BRIDGE_ABSENCE);
+  buf.append(reinterpret_cast<const char*>(&genesis), sizeof(genesis));
+  buf.push_back(static_cast<char>(report.version));
+  append_u64_le(buf, report.epoch);
+  const auto u16 = [&](uint16_t v) {
+    buf.push_back(static_cast<char>(v & 0xff));
+    buf.push_back(static_cast<char>((v >> 8) & 0xff));
+  };
+  u16(static_cast<uint16_t>(report.absent.size()));
+  for (const auto i : report.absent)
+    u16(i);
+  return buf;
+}
+
+bool verify_bridge_absence_report(const tx_extra_bridge_absence& report,
+                                  const std::vector<crypto::ed25519_public_key>& signer_keys,
+                                  size_t threshold, network_type nettype, std::string& reason)
+{
+  if (report.version != 0)
+  {
+    reason = "unknown absence report version";
+    return false;
+  }
+  const size_t size = signer_keys.size();
+  if (threshold == 0 || size < threshold)
+  {
+    reason = "no committee to report absence from";
+    return false;
+  }
+  // Absent members are at most those the threshold can do without: a committee missing more
+  // could not have gathered the signatures.
+  if (report.absent.empty() || report.absent.size() > size - threshold)
+  {
+    reason = "an absence report names 1 to " + std::to_string(size - threshold) + " members, not "
+             + std::to_string(report.absent.size());
+    return false;
+  }
+  for (size_t i = 0; i < report.absent.size(); ++i)
+  {
+    if (report.absent[i] >= size || (i > 0 && report.absent[i] <= report.absent[i - 1]))
+    {
+      reason = "absent members must be distinct committee indices in ascending order";
+      return false;
+    }
+  }
+  if (report.reporters.size() < threshold)
+  {
+    reason = "too few reporters (" + std::to_string(report.reporters.size()) + " < " + std::to_string(threshold) + ")";
+    return false;
+  }
+  const std::string msg = bridge_absence_message(nettype, report);
+  for (size_t i = 0; i < report.reporters.size(); ++i)
+  {
+    const auto& r = report.reporters[i];
+    if (r.voter_index >= size || (i > 0 && r.voter_index <= report.reporters[i - 1].voter_index))
+    {
+      reason = "reporters must be distinct committee indices in ascending order";
+      return false;
+    }
+    if (std::binary_search(report.absent.begin(), report.absent.end(), r.voter_index))
+    {
+      reason = "a member reported absent cannot report";
+      return false;
+    }
+    if (signer_keys[r.voter_index] == crypto::ed25519_public_key::null()
+        || crypto_sign_verify_detached(r.signature.data, reinterpret_cast<const unsigned char*>(msg.data()), msg.size(),
+                                       signer_keys[r.voter_index].data) != 0)
+    {
+      reason = "absence report signature does not verify for reporter " + std::to_string(r.voter_index);
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string bridge_resume_message(network_type nettype, const tx_extra_bridge_resume& resume)
+{
+  const crypto::hash& genesis = gateway_chain_binding(nettype);
+  std::string buf;
+  buf.append(hashkey::BRIDGE_RESUME);
+  buf.append(reinterpret_cast<const char*>(&genesis), sizeof(genesis));
+  buf.append(reinterpret_cast<const char*>(resume.master_node_pubkey.data), sizeof(resume.master_node_pubkey.data));
+  append_u64_le(buf, resume.paused_height);
+  return buf;
+}
+
+bool verify_bridge_resume(const tx_extra_bridge_resume& resume, const crypto::ed25519_public_key& signer_key,
+                          network_type nettype, std::string& reason)
+{
+  if (resume.version != 0)
+  {
+    reason = "unknown bridge resume version";
+    return false;
+  }
+  const std::string msg = bridge_resume_message(nettype, resume);
+  if (signer_key == crypto::ed25519_public_key::null()
+      || crypto_sign_verify_detached(resume.signature.data, reinterpret_cast<const unsigned char*>(msg.data()), msg.size(),
+                                     signer_key.data) != 0)
+  {
+    reason = "bridge resume signature does not verify under the seat's signer key";
+    return false;
+  }
+  return true;
+}
+
 crypto::hash gateway_takeover_complete_message(network_type nettype, const crypto::public_key& gateway_id,
                                                uint64_t started_height)
 {

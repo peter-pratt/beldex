@@ -3437,6 +3437,53 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
     return false;
   }
 
+  // HF23: an absence report is authorised by its committee's signatures and counts only in the
+  // epoch it names; a resume by the paused seat's own signer key, for a pause it really has.
+  // Verified here so neither relays unless consensus would apply it.
+  if (hf_version >= hf::hf23_bridge && tx.type == txtype::bridge_registration)
+  {
+    std::string pause_reason;
+    tx_extra_bridge_absence absence{};
+    tx_extra_bridge_resume resume{};
+    if (cryptonote::get_field_from_tx_extra(tx.extra, absence))
+    {
+      const uint64_t epoch_blocks = bridge_epoch_blocks(m_nettype);
+      std::vector<crypto::public_key> members;
+      std::vector<crypto::ed25519_public_key> signer_keys;
+      size_t threshold = 0;
+      if (absence.epoch != (m_db->height()) / epoch_blocks)
+        pause_reason = "an absence report counts only in the epoch it names";
+      else if (!m_master_node_list.get_bridge_committee(absence.epoch * epoch_blocks, members, signer_keys, threshold))
+        pause_reason = "no bridge committee for epoch " + std::to_string(absence.epoch);
+      else
+        cryptonote::verify_bridge_absence_report(absence, signer_keys, threshold, m_nettype, pause_reason);
+    }
+    else if (cryptonote::get_field_from_tx_extra(tx.extra, resume))
+      m_master_node_list.check_bridge_resume(resume, pause_reason);
+    if (!pause_reason.empty())
+    {
+      MERROR_VER("Bridge pause tx " << get_transaction_hash(tx) << " refused: " << pause_reason);
+      tvc.m_verbose_error = std::move(pause_reason);
+      tvc.m_verifivation_failed = true;
+      return false;
+    }
+  }
+
+  // HF23: past the seat cap a bridge registration is refused, not queued: it never relays or
+  // gets mined, so it never locks a bond for a seat it cannot have.
+  if (hf_version >= hf::hf23_bridge && tx.type == txtype::bridge_registration)
+  {
+    tx_extra_bridge_registration reg{};
+    if (cryptonote::get_field_from_tx_extra(tx.extra, reg) && !m_master_node_list.bridge_seat_open())
+    {
+      MERROR_VER("Bridge registration refused for tx " << get_transaction_hash(tx) << ": all "
+                 << BRIDGE_SEAT_CAP << " bridge seats are taken");
+      tvc.m_verbose_error = "all " + std::to_string(BRIDGE_SEAT_CAP) + " bridge seats are taken";
+      tvc.m_verifivation_failed = true;
+      return false;
+    }
+  }
+
   // HF23 Phase F: a bridge slash report is authorised by *committee evidence*, not by
   // the accused's own signature, so validate that evidence here — otherwise an
   // unauthenticated accusation would relay and get mined before consensus silently

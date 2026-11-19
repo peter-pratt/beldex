@@ -2272,6 +2272,65 @@ BELDEX_RPC_DOC_INTROSPECT
   };
 
   BELDEX_RPC_DOC_INTROSPECT
+  // Submit a bridge committee's absence report (HF23): the members that did not take part in two
+  // of its DKG attempts in a row, signed by at least the threshold of the members that did.
+  // Consensus pauses the named seats for the next epoch's draw. This wallet only pays the fee.
+  struct BRIDGE_ABSENCE_REPORT : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("bridge_absence_report"); }
+
+    struct reporter
+    {
+      uint16_t    voter_index; // The reporter's index in the committee.
+      std::string signature;   // Its ed25519 signature over the report, hex.
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct request
+    {
+      uint64_t              epoch;     // The committee's epoch (the current one).
+      std::vector<uint16_t> absent;    // The absent members' committee indices, ascending.
+      std::vector<reporter> reporters; // The reporters, ascending by index.
+      uint32_t              priority;  // (Optional) Transaction priority (flash not allowed).
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response
+    {
+      std::string tx_hash;
+
+      KV_MAP_SERIALIZABLE
+    };
+  };
+
+  BELDEX_RPC_DOC_INTROSPECT
+  // Submit a paused bridge seat's resume (HF23): signed by the seat's bridge signer key over the
+  // pause it ends, so its seat is drawn again. This wallet only pays the fee.
+  struct BRIDGE_RESUME : RESTRICTED
+  {
+    static constexpr auto names() { return NAMES("bridge_resume"); }
+
+    struct request
+    {
+      std::string master_node_pubkey; // The seat's master node pubkey, hex.
+      uint64_t    paused_height;      // The pause it ends: bridge_get_seats' `paused_height`.
+      std::string signature;          // The seat signer key's ed25519 signature, hex.
+      uint32_t    priority;           // (Optional) Transaction priority (flash not allowed).
+
+      KV_MAP_SERIALIZABLE
+    };
+
+    struct response
+    {
+      std::string tx_hash;
+
+      KV_MAP_SERIALIZABLE
+    };
+  };
+
+  BELDEX_RPC_DOC_INTROSPECT
   // Submit a standalone gateway takeover step (HF23): the standby's `begin` or `complete`, or
   // the owner's `cancel`. The signer signs the matching message from the daemon's
   // get_gateway_info (takeover_begin_message with started_height = takeover_steps,
@@ -2979,6 +3038,8 @@ This command is only required if the open wallet is one of the owners of a BNS r
     GATEWAY_TAKEOVER_CANCEL,
     GATEWAY_TAKEOVER_STEP,
     BRIDGE_KEY_ATTESTATION,
+    BRIDGE_ABSENCE_REPORT,
+    BRIDGE_RESUME,
     GATEWAY_GOVERNANCE_SUBMIT,
     REQUEST_STAKE_UNLOCK,
     CAN_REQUEST_STAKE_UNLOCK,
