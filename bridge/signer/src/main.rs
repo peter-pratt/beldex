@@ -5042,9 +5042,14 @@ where
     let mut rotate_done_since: BTreeMap<beldex_bridge_signer::orchestrator::DutyKey, std::time::Instant> = BTreeMap::new();
     let rotation_check_rpcs: BTreeMap<u64, (HttpJsonRpc, [u8; 20])> =
         configs.iter().map(|c| (c.chain_id, (HttpJsonRpc::new(c.rpc_url.clone()), c.contract))).collect();
-    // The bus the incoming committee publishes its activations to (the mint bus).
-    let mut activation_subs: Vec<_> =
-        bus_endpoints(&activation_bus).into_iter().map(beldex_bridge_signer::omq_client::OmqMintSubscriber::new).collect();
+    // The bus the incoming committee publishes its activations to (the mint bus). A standby
+    // signer hands nothing off: its key is not the live one, and a rotateSigner it signed would
+    // only be refused (and could be relayed ahead of the live committee's).
+    let mut activation_subs: Vec<_> = if standby_role {
+        Vec::new()
+    } else {
+        bus_endpoints(&activation_bus).into_iter().map(beldex_bridge_signer::omq_client::OmqMintSubscriber::new).collect()
+    };
     let rotation_contracts = done_contracts_for_rotation;
 
     let mut ticks = 0u64;
