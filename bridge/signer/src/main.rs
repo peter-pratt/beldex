@@ -769,6 +769,7 @@ fn run_dkg_auto(cfg: &Config) -> Result<(), String> {
             status.$($call)*;
         }};
     }
+    let mut absence = Absence::new(cfg);
     loop {
         std::thread::sleep(poll);
         let (committee, tip) = match (client.fetch_committee(None), client.fetch_height()) {
@@ -779,6 +780,7 @@ fn run_dkg_auto(cfg: &Config) -> Result<(), String> {
                 continue;
             }
         };
+        absence.tick(&committee, tip);
         let epoch = committee.epoch;
         status!(beat(poll * 6));
         status!(problem("beldexd", None));
@@ -893,6 +895,7 @@ fn run_dkg_auto(cfg: &Config) -> Result<(), String> {
         status!(set("dkg_running", serde_json::Value::Null));
         if let Err(e) = result {
             eprintln!("epoch {epoch}: attempt {k} failed: {e}");
+            absence.attempt_failed(&committee, self_index as u16, &e);
             status!(set("last_attempt", format!("epoch {epoch} attempt {k}: failed: {e}")));
             status!(problem("dkg", Some(format!("epoch {epoch} attempt {k} failed: {e}"))));
             let _ = std::fs::remove_dir_all(&work);
@@ -900,6 +903,7 @@ fn run_dkg_auto(cfg: &Config) -> Result<(), String> {
         }
         status!(set("last_attempt", format!("epoch {epoch} attempt {k}: key made")));
         status!(problem("dkg", None));
+        absence.attempt_succeeded();
         if lock.exists() || key_in_use(&next) {
             // A rotation took the old key while this one was being made, or a hand-off is
             // under way to it on chain: leave it in place.
@@ -918,6 +922,264 @@ fn run_dkg_auto(cfg: &Config) -> Result<(), String> {
         std::fs::rename(&work, &target).map_err(|e| format!("move the key into {}: {e}", target.display()))?;
         println!("epoch {epoch}: key ready in {} (generation {k})", target.display());
     }
+}
+
+/// dkg-auto's part in pausing absent seats (key_attestation::absence): after two failed
+/// attempts in a row that never heard from the same members, this member signs a report naming
+/// them and publishes its signature on the bus; members pool the signatures, and once the
+/// epoch's threshold have signed, the lowest-indexed signer (or, two minutes on, any of them)
+/// puts the report on chain from its fee wallet. And for this node's own seat: if it was paused
+/// before this process started (it was restarted since, as fixing a stopped signer does), it
+/// sends its resume, once, so it is drawn again.
+#[cfg(feature = "serve-live")]
+struct Absence {
+    genesis: Option<[u8; 32]>,
+    sk: Option<[u8; 64]>,
+    daemon: beldex_bridge_signer::evm_watcher::HttpJsonRpc,
+    wallet: Option<beldex_bridge_signer::evm_watcher::HttpJsonRpc>,
+    bus: Vec<String>,
+    subs: Vec<beldex_bridge_signer::omq_client::OmqMintSubscriber>,
+    /// This node's own daemon (its OMQ socket): who this seat is.
+    own: beldex_bridge_signer::omq_client::OmqCommitteeClient,
+    tracker: beldex_bridge_signer::key_attestation::absence::Tracker,
+    collector: beldex_bridge_signer::key_attestation::absence::Collector,
+    /// Reports this member signed, and when it first saw the threshold of signatures on one.
+    mine: std::collections::BTreeMap<(u64, Vec<u16>), Option<std::time::Instant>>,
+    submitted: std::collections::BTreeSet<(u64, Vec<u16>)>,
+    started_height: Option<u64>,
+    resumed: std::collections::BTreeSet<u64>,
+    resume_checked: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "serve-live")]
+impl Absence {
+    fn new(cfg: &Config) -> Absence {
+        use beldex_bridge_signer::evm_watcher::HttpJsonRpc;
+        let nonempty = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        let wallet = nonempty("BRIDGE_SIGNER_ACK_WALLET_RPC").map(|url| {
+            match nonempty("BRIDGE_SIGNER_ACK_WALLET_LOGIN_FILE")
+                .and_then(|f| beldex_bridge_signer::rpc_login::read_login_file(std::path::Path::new(f.trim())).ok())
+            {
+                Some(login) => HttpJsonRpc::new(url).with_basic_auth(&login),
+                None => HttpJsonRpc::new(url),
+            }
+        });
+        let bus = bus_endpoints(&nonempty("BRIDGE_SIGNER_MINT_BUS_ENDPOINT").unwrap_or_else(|| cfg.oxenmq_endpoint.clone()));
+        Absence {
+            genesis: nonempty("BRIDGE_SIGNER_GENESIS_HASH").and_then(|h| config::parse_hex32(&h)).filter(|g| *g != [0; 32]),
+            sk: nonempty("BRIDGE_SIGNER_MN_KEY_FILE").and_then(|f| std::fs::read(f.trim()).ok()).and_then(|b| b.try_into().ok()),
+            daemon: HttpJsonRpc::new(format!("{}/json_rpc", cfg.beldexd_rpc_url.trim_end_matches('/'))),
+            wallet,
+            subs: bus.iter().cloned().map(beldex_bridge_signer::omq_client::OmqMintSubscriber::new).collect(),
+            own: beldex_bridge_signer::omq_client::OmqCommitteeClient::new(cfg.oxenmq_endpoint.clone()),
+            bus,
+            tracker: Default::default(),
+            collector: Default::default(),
+            mine: Default::default(),
+            submitted: Default::default(),
+            started_height: None,
+            resumed: Default::default(),
+            resume_checked: None,
+        }
+    }
+
+    /// A DKG attempt of `committee`'s epoch failed with `error`.
+    fn attempt_failed(&mut self, committee: &beldex_bridge_signer::committee::CommitteeView, self_index: u16, error: &str) {
+        use beldex_bridge_signer::key_attestation::absence;
+        let Some(absent) = self.tracker.failed(committee.epoch, absence::missing_peers(error)) else { return };
+        let (Some(genesis), Some(sk)) = (self.genesis, self.sk) else {
+            eprintln!("epoch {}: members {absent:?} absent twice, but no genesis / MN key to report them with", committee.epoch);
+            return;
+        };
+        // More absent than the committee can do without: no threshold of present members exists.
+        if absent.contains(&self_index) || absent.len() > committee.size().saturating_sub(committee.threshold) {
+            return;
+        }
+        let msg = absence::message(&genesis, committee.epoch, &absent);
+        let Ok(sig) = beldex_bridge_signer::ffi::ed25519_sign_detached(&sk, &msg) else { return };
+        self.collector.add(committee.epoch, &absent, self_index, sig);
+        self.mine.entry((committee.epoch, absent.clone())).or_insert(None);
+        let payload = format!(
+            r#"{{"kind":"absence","epoch":{},"absent":{:?},"voter_index":{self_index},"sig":"{}"}}"#,
+            committee.epoch,
+            absent,
+            hex(&sig)
+        );
+        println!("epoch {}: members {absent:?} absent from two attempts in a row: reporting them", committee.epoch);
+        self.publish(committee, self_index, &sk, &genesis, &payload);
+    }
+
+    fn publish(
+        &self,
+        committee: &beldex_bridge_signer::committee::CommitteeView,
+        self_index: u16,
+        sk: &[u8; 64],
+        genesis: &[u8; 32],
+        payload: &str,
+    ) {
+        use beldex_bridge_signer::omq_client::{mint_publish_message, OmqCommitteeClient};
+        let Ok(pub_sig) = beldex_bridge_signer::ffi::ed25519_sign_detached(sk, &mint_publish_message(genesis, payload)) else { return };
+        let member = committee.members[self_index as usize];
+        for e in &self.bus {
+            if let Err(err) = OmqCommitteeClient::new(e.clone()).publish_mint_payload(payload, self_index, &pub_sig, &member) {
+                eprintln!("  absence signature not published to {e}: {err}");
+            }
+        }
+    }
+
+    /// Every pass of the loop: pool peers' signatures, put a complete report on chain, and
+    /// resume this node's seat if it was paused before this process started.
+    fn tick(&mut self, committee: &beldex_bridge_signer::committee::CommitteeView, tip: u64) {
+        use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
+        use beldex_bridge_signer::key_attestation::absence;
+        let started = *self.started_height.get_or_insert(tip);
+        self.collector.prune(committee.epoch);
+        self.mine.retain(|(e, _), _| *e >= committee.epoch);
+
+        // Peers' signatures off the bus, each checked against the committee's signer key.
+        let mut arrived = Vec::new();
+        for sub in self.subs.iter_mut() {
+            while let Ok(Some(p)) = sub.poll(std::time::Duration::from_millis(20)) {
+                arrived.push(p);
+            }
+        }
+        if let Some(genesis) = self.genesis {
+            for p in arrived {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&p) else { continue };
+                if v.get("kind").and_then(|k| k.as_str()) != Some("absence")
+                    || v.get("epoch").and_then(|e| e.as_u64()) != Some(committee.epoch)
+                {
+                    continue;
+                }
+                let absent: Option<Vec<u16>> = v.get("absent").and_then(|a| a.as_array()).and_then(|a| {
+                    a.iter().map(|x| x.as_u64().and_then(|x| u16::try_from(x).ok())).collect()
+                });
+                let voter = v.get("voter_index").and_then(|x| x.as_u64()).and_then(|x| u16::try_from(x).ok());
+                let sig: Option<[u8; 64]> = v
+                    .get("sig")
+                    .and_then(|s| s.as_str())
+                    .and_then(|h| (0..h.len()).step_by(2).map(|i| h.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok())).collect::<Option<Vec<u8>>>())
+                    .and_then(|b| b.try_into().ok());
+                let (Some(absent), Some(voter), Some(sig)) = (absent, voter, sig) else { continue };
+                let Some(key) = committee.signer_key(voter as usize) else { continue };
+                if beldex_bridge_signer::ffi::ed25519_verify_consensus(&sig, &absence::message(&genesis, committee.epoch, &absent), &key) {
+                    self.collector.add(committee.epoch, &absent, voter, sig);
+                }
+            }
+        }
+
+        // A report this member signed that has the threshold: the lowest-indexed signer sends it
+        // at once, the others two minutes on if it has not landed.
+        let self_index = committee.daemon_self_index.map(|i| i as u16);
+        let keys: Vec<(u64, Vec<u16>)> = self.mine.keys().cloned().collect();
+        for key in keys {
+            if self.submitted.contains(&key) {
+                continue;
+            }
+            let sigs = self.collector.signatures(key.0, &key.1);
+            if sigs.len() < committee.threshold {
+                continue;
+            }
+            let since = *self.mine.get_mut(&key).expect("listed").get_or_insert_with(std::time::Instant::now);
+            let first = sigs.first().map(|(v, _)| *v) == self_index;
+            if !first && since.elapsed() < std::time::Duration::from_secs(120) {
+                continue;
+            }
+            // Stepping in for the first signer: not if its report already landed (every member
+            // named is paused in this epoch). Another copy would only cost another fee.
+            if !first {
+                // The report is this committee's: its epoch starts at the committee's height.
+                let epoch_start = committee.height;
+                let paused_now = self.daemon.call("bridge_get_seats", serde_json::json!({})).ok().is_some_and(|seats| {
+                    let rows = seats.get("seats").and_then(|s| s.as_array()).cloned().unwrap_or_default();
+                    key.1.iter().all(|i| {
+                        let Some(pk) = committee.members.get(*i as usize).map(|m| hex(m)) else { return false };
+                        rows.iter().any(|r| {
+                            r.get("master_node_pubkey").and_then(|k| k.as_str()).is_some_and(|k| k.eq_ignore_ascii_case(&pk))
+                                && r.get("paused_height").and_then(|h| h.as_u64()).is_some_and(|h| h >= epoch_start)
+                        })
+                    })
+                });
+                if paused_now {
+                    println!("epoch {}: absence report for {:?} already on chain", key.0, key.1);
+                    self.submitted.insert(key);
+                    continue;
+                }
+            }
+            let Some(wallet) = &self.wallet else {
+                eprintln!("epoch {}: absence report for {:?} is complete, but there is no fee wallet to send it", key.0, key.1);
+                self.submitted.insert(key);
+                continue;
+            };
+            let reporters: Vec<serde_json::Value> =
+                sigs.iter().map(|(v, s)| serde_json::json!({ "voter_index": v, "signature": hex(s) })).collect();
+            match wallet.call("bridge_absence_report", serde_json::json!({ "epoch": key.0, "absent": key.1, "reporters": reporters })) {
+                Ok(r) => println!(
+                    "epoch {}: absence report for {:?} sent ({} reporters): tx {}",
+                    key.0,
+                    key.1,
+                    sigs.len(),
+                    r.get("tx_hash").and_then(|t| t.as_str()).unwrap_or("?")
+                ),
+                // Another member's landed first (or is in the pool): nothing left to do.
+                Err(e) => println!("epoch {}: absence report for {:?} not sent ({e:?}); another member's may have landed", key.0, key.1),
+            }
+            self.submitted.insert(key);
+        }
+
+        // This node's own seat: paused before this process started? Then it was restarted since,
+        // and says it is back, once per pause.
+        if self.resume_checked.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60)) {
+            return;
+        }
+        self.resume_checked = Some(std::time::Instant::now());
+        let (Some(genesis), Some(sk), Some(wallet)) = (self.genesis, self.sk, &self.wallet) else { return };
+        let Ok(me) = self.own.fetch_master_node_pubkey() else { return };
+        let Some(seats) = self.daemon.call("bridge_get_seats", serde_json::json!({})).ok() else { return };
+        let paused = seats.get("seats").and_then(|s| s.as_array()).and_then(|s| {
+            s.iter()
+                .find(|x| x.get("master_node_pubkey").and_then(|k| k.as_str()).is_some_and(|k| k.eq_ignore_ascii_case(&me)))
+                .and_then(|x| x.get("paused_height").and_then(|h| h.as_u64()))
+        });
+        let Some(paused_height) = paused else { return };
+        if paused_height >= started || self.resumed.contains(&paused_height) {
+            return;
+        }
+        let Some(mn) = config::parse_hex32(&me) else { return };
+        let Ok(sig) = beldex_bridge_signer::ffi::ed25519_sign_detached(&sk, &absence::resume_message(&genesis, &mn, paused_height)) else {
+            return;
+        };
+        match wallet.call(
+            "bridge_resume",
+            serde_json::json!({ "master_node_pubkey": me, "paused_height": paused_height, "signature": hex(&sig) }),
+        ) {
+            Ok(r) => {
+                println!(
+                    "this seat was paused at height {paused_height} and this signer has restarted since: resume sent, tx {}",
+                    r.get("tx_hash").and_then(|t| t.as_str()).unwrap_or("?")
+                );
+                self.resumed.insert(paused_height);
+            }
+            Err(e) => eprintln!("  resume not sent ({e:?}); will try again"),
+        }
+    }
+
+    fn attempt_succeeded(&mut self) {
+        self.tracker.succeeded();
+    }
+}
+
+#[cfg(not(feature = "serve-live"))]
+struct Absence;
+
+#[cfg(not(feature = "serve-live"))]
+impl Absence {
+    fn new(_cfg: &Config) -> Absence {
+        Absence
+    }
+    fn attempt_failed(&mut self, _c: &beldex_bridge_signer::committee::CommitteeView, _i: u16, _e: &str) {}
+    fn tick(&mut self, _c: &beldex_bridge_signer::committee::CommitteeView, _tip: u64) {}
+    fn attempt_succeeded(&mut self) {}
 }
 
 /// The epoch of the committee consensus counts as holding the key (`pgw`, `pevm`), from this
@@ -1994,9 +2256,9 @@ fn run_relay_watch_standalone() -> Result<(), String> {
                         })
                     };
                     let kind = field("kind", true).unwrap_or_default();
-                    // The gateway hand-over's signature and a completed ack are for the Beldex
-                    // submitter, not EVM calls.
-                    if kind == "handover" || kind == "ack" {
+                    // The gateway hand-over's signature, a completed ack and an absence signature
+                    // are for Beldex, not EVM calls.
+                    if kind == "handover" || kind == "ack" || kind == "absence" {
                         continue;
                     }
                     let chain = field("chain_id", false).unwrap_or_default();

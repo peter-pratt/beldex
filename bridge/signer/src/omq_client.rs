@@ -92,6 +92,18 @@ impl OmqCommitteeClient {
             .map_err(|_| CommitteeError::Transport(format!("get_height reply has no height: {json}")))
     }
 
+    /// This node's own master node pubkey (`admin.get_master_keys`: the local socket has admin access), hex. Asked of the daemon on
+    /// this endpoint, which is the node's own: an HTTP RPC may be another node's.
+    pub fn fetch_master_node_pubkey(&self) -> Result<String, CommitteeError> {
+        let json = self.request(b"admin.get_master_keys", &[])?;
+        json.split("\"master_node_pubkey\":")
+            .nth(1)
+            .and_then(|s| s.split('"').nth(1))
+            .filter(|k| k.len() == 64 && k.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_ascii_lowercase)
+            .ok_or_else(|| CommitteeError::Transport(format!("get_master_keys reply has no master_node_pubkey: {json}")))
+    }
+
     /// One request/reply exchange: `command`, a correlation tag, and the data parts.
     fn request(&self, command: &[u8], data: &[&[u8]]) -> Result<String, CommitteeError> {
         let tx = |e: String| CommitteeError::Transport(e);

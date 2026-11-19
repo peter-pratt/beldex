@@ -289,6 +289,169 @@ pub fn parse_records(result: &serde_json::Value) -> Option<Vec<Record>> {
     Some(out)
 }
 
+/// Absence reports and resumes (consensus `tx_extra_bridge_absence` / `tx_extra_bridge_resume`).
+///
+/// When a member of an epoch's committee never answers in two of the epoch's DKG attempts in a
+/// row, the members that did answer each sign the same report naming it; with the epoch's
+/// threshold of signatures, consensus pauses its seat for the next epoch's draw. A seat whose
+/// signer comes back ends its pause with a resume, signed by its own signer key.
+pub mod absence {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// `hashkey::BRIDGE_ABSENCE` in beldexd.
+    pub const DOMAIN: &[u8] = b"bridge_absence_report_v1";
+    /// `hashkey::BRIDGE_RESUME` in beldexd.
+    pub const RESUME_DOMAIN: &[u8] = b"bridge_resume_v1";
+
+    /// What every reporter signs: `DOMAIN ‖ genesis(32) ‖ version(u8 = 0) ‖ epoch(u64 LE) ‖
+    /// count(u16 LE) ‖ each absent index (u16 LE)`. The reporters are not in it.
+    pub fn message(genesis: &[u8; 32], epoch: u64, absent: &[u16]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(DOMAIN.len() + 32 + 1 + 8 + 2 + 2 * absent.len());
+        v.extend_from_slice(DOMAIN);
+        v.extend_from_slice(genesis);
+        v.push(0);
+        v.extend_from_slice(&epoch.to_le_bytes());
+        v.extend_from_slice(&(absent.len() as u16).to_le_bytes());
+        for i in absent {
+            v.extend_from_slice(&i.to_le_bytes());
+        }
+        v
+    }
+
+    /// What a paused seat's signer key signs to end the pause recorded at `paused_height`:
+    /// `RESUME_DOMAIN ‖ genesis(32) ‖ master node pubkey(32) ‖ paused_height(u64 LE)`.
+    pub fn resume_message(genesis: &[u8; 32], master_node: &[u8; 32], paused_height: u64) -> Vec<u8> {
+        let mut v = Vec::with_capacity(RESUME_DOMAIN.len() + 32 + 32 + 8);
+        v.extend_from_slice(RESUME_DOMAIN);
+        v.extend_from_slice(genesis);
+        v.extend_from_slice(master_node);
+        v.extend_from_slice(&paused_height.to_le_bytes());
+        v
+    }
+
+    /// The members a failed DKG attempt never heard from, read from its error (the connection
+    /// barrier's "… from peers [3, 5] …"). None when the attempt failed for another reason.
+    pub fn missing_peers(error: &str) -> Option<BTreeSet<u16>> {
+        let rest = error.split("from peers [").nth(1)?;
+        let list = rest.split(']').next()?;
+        let set: BTreeSet<u16> = list.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        (!set.is_empty()).then_some(set)
+    }
+
+    /// Which members to report: those missing from two failed attempts in a row of the same
+    /// epoch. One failure alone is never reported (a member may just have been restarting).
+    #[derive(Debug, Default)]
+    pub struct Tracker {
+        last: Option<(u64, BTreeSet<u16>)>,
+    }
+
+    impl Tracker {
+        /// A failed attempt of `epoch` that heard nothing from `missing` (None: it failed for
+        /// another reason, which breaks the run). Returns the members to report, ascending.
+        pub fn failed(&mut self, epoch: u64, missing: Option<BTreeSet<u16>>) -> Option<Vec<u16>> {
+            let Some(missing) = missing else {
+                self.last = None;
+                return None;
+            };
+            let report = match &self.last {
+                Some((e, before)) if *e == epoch => {
+                    let both: Vec<u16> = before.intersection(&missing).copied().collect();
+                    (!both.is_empty()).then_some(both)
+                }
+                _ => None,
+            };
+            self.last = Some((epoch, missing));
+            report
+        }
+
+        /// An attempt that made a key: nobody is missing.
+        pub fn succeeded(&mut self) {
+            self.last = None;
+        }
+    }
+
+    /// The present members' signatures on one report, by (epoch, absent members).
+    #[derive(Debug, Default)]
+    pub struct Collector {
+        reports: BTreeMap<(u64, Vec<u16>), BTreeMap<u16, [u8; 64]>>,
+    }
+
+    impl Collector {
+        /// Adds `voter`'s signature; an absent member's own is never counted.
+        pub fn add(&mut self, epoch: u64, absent: &[u16], voter: u16, sig: [u8; 64]) {
+            if absent.contains(&voter) {
+                return;
+            }
+            self.reports.entry((epoch, absent.to_vec())).or_default().insert(voter, sig);
+        }
+
+        /// The signatures on (epoch, absent), ascending by voter.
+        pub fn signatures(&self, epoch: u64, absent: &[u16]) -> Vec<(u16, [u8; 64])> {
+            self.reports
+                .get(&(epoch, absent.to_vec()))
+                .map(|m| m.iter().map(|(v, s)| (*v, *s)).collect())
+                .unwrap_or_default()
+        }
+
+        /// Forgets every report older than `epoch`.
+        pub fn prune(&mut self, epoch: u64) {
+            self.reports.retain(|(e, _), _| *e >= epoch);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_messages_are_the_consensus_layout() {
+            let m = message(&[1; 32], 0x0102, &[3, 0x0105]);
+            assert!(m.starts_with(b"bridge_absence_report_v1"));
+            let tail = &m[DOMAIN.len() + 32..];
+            assert_eq!(tail, &[0, 0x02, 0x01, 0, 0, 0, 0, 0, 0, 2, 0, 3, 0, 0x05, 0x01]);
+            let r = resume_message(&[1; 32], &[2; 32], 7);
+            assert_eq!(r.len(), RESUME_DOMAIN.len() + 32 + 32 + 8);
+            assert!(r.ends_with(&[7, 0, 0, 0, 0, 0, 0, 0]));
+        }
+
+        #[test]
+        fn missing_peers_are_read_from_the_barrier_error() {
+            assert_eq!(
+                missing_peers("Protocol(\"connection barrier timed out: nothing from peers [3, 5]\")"),
+                Some(BTreeSet::from([3, 5]))
+            );
+            assert_eq!(missing_peers("connection barrier timed out: no HELLO from peers [1] (2 sends failed)"), Some(BTreeSet::from([1])));
+            assert_eq!(missing_peers("the committee moved on to epoch 4"), None);
+        }
+
+        #[test]
+        fn only_two_failures_in_a_row_of_one_epoch_report_the_members_missing_from_both() {
+            let mut t = Tracker::default();
+            assert_eq!(t.failed(3, Some(BTreeSet::from([2, 4]))), None, "one failure is not enough");
+            assert_eq!(t.failed(3, Some(BTreeSet::from([4, 5]))), Some(vec![4]), "missing from both");
+            // A new epoch starts over, and so does a failure for another reason or a success.
+            assert_eq!(t.failed(4, Some(BTreeSet::from([4]))), None);
+            assert_eq!(t.failed(4, None), None);
+            assert_eq!(t.failed(4, Some(BTreeSet::from([4]))), None);
+            t.succeeded();
+            assert_eq!(t.failed(4, Some(BTreeSet::from([4]))), None);
+            assert_eq!(t.failed(4, Some(BTreeSet::from([4]))), Some(vec![4]));
+        }
+
+        #[test]
+        fn the_collector_pools_one_report_and_ignores_the_absent() {
+            let mut c = Collector::default();
+            c.add(3, &[1], 0, [9; 64]);
+            c.add(3, &[1], 2, [8; 64]);
+            c.add(3, &[1], 1, [7; 64]); // the absent member itself
+            c.add(3, &[2], 0, [6; 64]); // another report
+            assert_eq!(c.signatures(3, &[1]).iter().map(|(v, _)| *v).collect::<Vec<_>>(), vec![0, 2]);
+            c.prune(4);
+            assert!(c.signatures(3, &[1]).is_empty());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
