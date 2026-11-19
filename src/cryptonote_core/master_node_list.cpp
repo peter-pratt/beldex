@@ -2235,9 +2235,9 @@ namespace master_nodes
     uint64_t bond = 0;
     for (const auto &c : stake.locked_contributions)
       bond += c.amount;
-    if (bond < cryptonote::BRIDGE_BOND)
+    if (bond < cryptonote::bridge_bond(nettype))
     {
-      LOG_PRINT_L1("Bridge reg TX: bond " << bond << " below required " << cryptonote::BRIDGE_BOND);
+      LOG_PRINT_L1("Bridge reg TX: bond " << bond << " below required " << cryptonote::bridge_bond(nettype));
       return false;
     }
 

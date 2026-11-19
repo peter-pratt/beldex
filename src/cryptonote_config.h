@@ -375,55 +375,68 @@ enum network_type : uint8_t
 // done is a 4-of-6 devnet committee), so the committee shape, epoch length and
 // bond-unlock period scale down there. BRIDGE_BOND and BRIDGE_SEAT_CAP are
 // deliberately NOT scaled: the height-1 premine makes the 100k bond affordable
-// on devnet, so devnet exercises the real bond rule. Mainnet/testnet use the
+// on devnet, so devnet exercises the real bond rule. Mainnet uses the
 // governance-approved constants above.
+//
+// Testnet runs the whole automation at a small scale before mainnet: ~15 seats with a
+// committee of 5 that signs with 3, an epoch of 360 blocks (~3 h) so a day sees several
+// rotations, a 10k bond, and standby and takeover timings shrunk to fit that epoch.
 constexpr bool is_local_bridge_net(network_type n)
 {
   return n == network_type::DEVNET || n == network_type::FAKECHAIN;
 }
+constexpr bool is_testnet_bridge(network_type n)
+{
+  return n == network_type::TESTNET;
+}
 constexpr uint64_t bridge_activation_floor(network_type n)
 {
-  return is_local_bridge_net(n) ? 6 : BRIDGE_ACTIVATION_FLOOR;
+  return is_local_bridge_net(n) ? 6 : is_testnet_bridge(n) ? 10 : BRIDGE_ACTIVATION_FLOOR;
 }
 constexpr uint64_t bridge_committee_size(network_type n) // n
 {
-  return is_local_bridge_net(n) ? 6 : BRIDGE_COMMITTEE_SIZE;
+  return is_local_bridge_net(n) ? 6 : is_testnet_bridge(n) ? 5 : BRIDGE_COMMITTEE_SIZE;
 }
 constexpr uint64_t bridge_committee_threshold(network_type n) // t+1
 {
-  return is_local_bridge_net(n) ? 4 : BRIDGE_COMMITTEE_THRESHOLD;
+  return is_local_bridge_net(n) ? 4 : is_testnet_bridge(n) ? 3 : BRIDGE_COMMITTEE_THRESHOLD;
 }
 constexpr uint64_t bridge_epoch_blocks(network_type n)
 {
-  return is_local_bridge_net(n) ? 120 : BRIDGE_EPOCH_BLOCKS;
+  return is_local_bridge_net(n) ? 120 : is_testnet_bridge(n) ? 360 : BRIDGE_EPOCH_BLOCKS;
+}
+// The bond a bridge seat locks. Testnet's is a tenth of mainnet's.
+constexpr uint64_t bridge_bond(network_type n)
+{
+  return is_testnet_bridge(n) ? BRIDGE_BOND / 10 : BRIDGE_BOND;
 }
 // Blocks a standby owner's takeover of the bridge gateway must wait after it begins, so a
 // live owner can cancel it: an hour at 30s blocks on public networks, a few minutes on
 // local ones so the failover can be exercised.
 constexpr uint64_t gateway_standby_takeover_blocks(network_type n)
 {
-  return is_local_bridge_net(n) ? 10 : 120;
+  return is_local_bridge_net(n) ? 10 : is_testnet_bridge(n) ? 20 : 120;
 }
 // Standby liveness (HF23): the standby proves it can still sign once per slot, over a block
 // at a slot boundary no older than the window; one that has not for `stale` blocks since it
 // was named or last proved itself is treated as gone, and replaced.
 constexpr uint64_t gateway_standby_alive_slot_blocks(network_type n)
 {
-  return is_local_bridge_net(n) ? 10 : 120; // ~1 hour
+  return is_local_bridge_net(n) ? 10 : is_testnet_bridge(n) ? 40 : 120; // ~1 hour (testnet ~20 min)
 }
 constexpr uint64_t gateway_standby_alive_window_blocks(network_type n)
 {
-  return is_local_bridge_net(n) ? 40 : 360; // three slots
+  return is_local_bridge_net(n) ? 40 : is_testnet_bridge(n) ? 120 : 360; // three slots
 }
 // Governance (HF23): a freeze or re-point is signed by the checkpoint quorum of a height no
 // older than this, so a quorum whose operators have since left cannot be dug up to sign one.
 constexpr uint64_t gateway_governance_max_age_blocks(network_type n)
 {
-  return is_local_bridge_net(n) ? 120 : 2880; // ~1 day: time to collect the signatures
+  return is_local_bridge_net(n) ? 120 : is_testnet_bridge(n) ? 360 : 2880; // ~1 day: time to collect the signatures
 }
 constexpr uint64_t gateway_standby_stale_blocks(network_type n)
 {
-  return is_local_bridge_net(n) ? 120 : 2880; // ~1 day
+  return is_local_bridge_net(n) ? 120 : is_testnet_bridge(n) ? 360 : 2880; // ~1 day (testnet: one epoch)
 }
 // Standby rounds (HF23): while the bridge gateway has no working standby, consensus draws a
 // fresh standby committee at the start of every round, so a committee that cannot generate
@@ -431,11 +444,11 @@ constexpr uint64_t gateway_standby_stale_blocks(network_type n)
 // only within the window from the round's start, and an epoch has at most max_rounds rounds.
 constexpr uint64_t bridge_standby_round_blocks(network_type n)
 {
-  return is_local_bridge_net(n) ? 10 : 60; // ~30 min: a 20-member DKG takes minutes
+  return is_local_bridge_net(n) ? 10 : is_testnet_bridge(n) ? 30 : 60; // ~30 min: a 20-member DKG takes minutes
 }
 constexpr uint64_t bridge_standby_round_window_blocks(network_type n)
 {
-  return is_local_bridge_net(n) ? 10 : 60;
+  return is_local_bridge_net(n) ? 10 : is_testnet_bridge(n) ? 30 : 60;
 }
 constexpr uint64_t bridge_standby_max_rounds(network_type n)
 {

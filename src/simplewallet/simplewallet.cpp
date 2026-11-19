@@ -3132,7 +3132,7 @@ Pending or Failed: "failed"|"pending",  "out", Lock, Checkpointed, Time, Amount*
   m_cmd_binder.set_handler("bridge_unbond",
                            [this](const auto& x) { return bridge_unbond(x); },
                            tr(USAGE_BRIDGE_UNBOND),
-                           tr("Voluntarily exit the bonded bridge set for this wallet's Master Node (HF23 Sovereign Bridge). The seat stops being committee-eligible immediately; the 100,000 BDX bond unlocks only after the ~30-day unbonding period, during which the operator remains bonded and slashable. <unbond_hex> is produced on the Master Node by the daemon's `get_bridge_unbond_cmd' RPC."));
+                           tr("Voluntarily exit the bonded bridge set for this wallet's Master Node (HF23 Sovereign Bridge). The seat stops being committee-eligible immediately; the bridge bond unlocks only after the ~30-day unbonding period, during which the operator remains bonded and slashable. <unbond_hex> is produced on the Master Node by the daemon's `get_bridge_unbond_cmd' RPC."));
   m_cmd_binder.set_handler("bridge_slash",
                            [this](const auto& x) { return bridge_slash(x); },
                            tr(USAGE_BRIDGE_SLASH),
@@ -6362,7 +6362,7 @@ bool simple_wallet::bridge_unbond(const std::vector<std::string> &args_)
   // A voluntary bridge-seat exit is a plain fee-only command tx (no bond moves
   // here): confirm the fee, then relay. The seat stops being committee-eligible
   // immediately; the 100k BDX bond unlocks in consensus after the ~30-day window.
-  std::string prompt = (boost::format(tr("Requesting a voluntary bridge-seat unbond for this wallet's Master Node. The 100,000 BDX bond unlocks after the ~30-day unbonding period, during which the operator stays bonded and slashable. Transaction fee is %s. Is this okay? (Y/Yes/N/No): ")) % print_money(result.ptx.fee)).str();
+  std::string prompt = (boost::format(tr("Requesting a voluntary bridge-seat unbond for this wallet's Master Node. The %s BDX bond unlocks after the ~30-day unbonding period, during which the operator stays bonded and slashable. Transaction fee is %s. Is this okay? (Y/Yes/N/No): ")) % print_money(cryptonote::bridge_bond(m_wallet->nettype())) % print_money(result.ptx.fee)).str();
   if (!command_line::is_yes(input_line(prompt, true)))
   {
     fail_msg_writer() << tr("Transaction cancelled.");
@@ -6421,7 +6421,7 @@ bool simple_wallet::bridge_slash(const std::vector<std::string> &args_)
   // Fee-only command tx. Worth being blunt in the prompt: submitting this burns
   // another operator's 100k bond if consensus accepts the evidence, and the
   // submitter is not the party being accused.
-  std::string prompt = (boost::format(tr("Submitting a bridge accountability slash report. If consensus accepts the committee evidence it carries, the accused Master Node's bridge seat is ejected and its 100,000 BDX bond is permanently forfeited. Transaction fee is %s. Is this okay? (Y/Yes/N/No): ")) % print_money(result.ptx.fee)).str();
+  std::string prompt = (boost::format(tr("Submitting a bridge accountability slash report. If consensus accepts the committee evidence it carries, the accused Master Node's bridge seat is ejected and its %s BDX bond is permanently forfeited. Transaction fee is %s. Is this okay? (Y/Yes/N/No): ")) % print_money(cryptonote::bridge_bond(m_wallet->nettype())) % print_money(result.ptx.fee)).str();
   if (!command_line::is_yes(input_line(prompt, true)))
   {
     fail_msg_writer() << tr("Transaction cancelled.");

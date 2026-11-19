@@ -4389,8 +4389,8 @@ namespace cryptonote::rpc {
     // signer or dashboard has to take a governance-typed number on trust.
     const uint64_t threshold = cryptonote::bridge_committee_threshold(nettype);
     cmd.response["committee_threshold"] = threshold;
-    cmd.response["bridge_bond"]         = cryptonote::BRIDGE_BOND;
-    cmd.response["slashable_backing"]   = threshold * cryptonote::BRIDGE_BOND;
+    cmd.response["bridge_bond"]         = cryptonote::bridge_bond(nettype);
+    cmd.response["slashable_backing"]   = threshold * cryptonote::bridge_bond(nettype);
     // The retention floor, same contract as gateway_release_ref_status: release
     // accounting is kept only for the current + immediately-previous window and
     // lazily pruned below that. Without this a caller passing an older `height`

@@ -8382,7 +8382,7 @@ wallet2::bridge_register_result wallet2::create_bridge_registration_tx(const std
   cryptonote::tx_destination_entry de = {};
   de.addr          = address;
   de.is_subaddress = false;
-  de.amount        = cryptonote::BRIDGE_BOND;
+  de.amount        = cryptonote::bridge_bond(nettype());
   dsts.push_back(de);
 
   try
