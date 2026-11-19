@@ -37,11 +37,12 @@
 # signer names the newest attested key whose committee shares at most 2 members with its own
 # as the standby, on both chains. A standby signer with no share set generates that key when
 # a standby round draws it: while no standby works, consensus draws a committee every 10 blocks
-# here (60 on mainnet), and its DKG has DKG_TIMEOUT_SECS (default 240 here, 900 by default) to
-# finish inside the round's window. The timeout must stay below a round's length (10 blocks of
-# about 30 s here, 60 on mainnet): a failed attempt that outlasts its round makes its members
-# join the next one late, that round fails for want of them, and the rounds never line up
-# again. A key takes about 2 to 3 minutes here. AUTO_DKG=0 turns that off.
+# here (60 on mainnet). Each drawn member checks in on L1 in the round's first 2 blocks (4 on
+# mainnet); the members that did, if at least 5 of 6 here (17 of 20), then run the DKG, which
+# has DKG_TIMEOUT_SECS (default 240 here, 900 by default) to finish inside the round's window.
+# The check-in blocks plus the timeout must stay below a round's length (10 blocks of about
+# 30 s here, 60 on mainnet): a failed attempt that outlasts its round keeps its members from
+# checking in to the next one. A key takes about 2 to 3 minutes here. AUTO_DKG=0 turns that off.
 # Attestations and namings are paid for by ACK_WALLET_RPC. Standby signers prove on L1, every
 # 10 blocks here (120 on mainnet), that their key can still sign; a standby that has not for
 # 120 blocks here (a day on mainnet) is stale. The live signers then name another, and with

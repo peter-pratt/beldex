@@ -2258,7 +2258,8 @@ BELDEX_RPC_DOC_INTROSPECT
       uint16_t    voter_index;   // The member's index in that committee.
       std::string signature;     // The member's ed25519 signature, hex.
       uint32_t    priority;      // (Optional) Transaction priority (flash not allowed).
-      uint64_t    round_height;  // (Optional) The standby round whose committee generated the key: its start. voter_index is then an index in that round's committee.
+      uint64_t    round_height;  // (Optional) The standby round whose committee generated the key: its start. voter_index is then an index among the round's members that checked in.
+      bool        check_in;      // (Optional) A standby round check-in instead (round_height required, pgw_vk and pevm_address left out): voter_index is an index in the round's drawn committee.
 
       KV_MAP_SERIALIZABLE
     };

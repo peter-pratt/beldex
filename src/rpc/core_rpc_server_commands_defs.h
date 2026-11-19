@@ -3135,8 +3135,13 @@ namespace cryptonote::rpc {
   ///   attested_height, overlap_with_owner}. `round_height` is 0 for an epoch committee's key.
   /// - `owner_committee_height` -- the height whose committee generated the owner key.
   /// - `standby_rounds` -- standby rounds still taking attestations (consensus draws one each
-  ///   round while no standby works): {round, round_height, window_end, members}.
+  ///   round while no standby works): {round, round_height, checkin_end, window_end, members,
+  ///   checked_in}. Members check in up to `checkin_end`; those that did generate the key.
   /// - `standby_round_window` -- how many blocks from its start a round takes attestations.
+  /// - `standby_round_checkin` -- how many blocks from its start a round takes check-ins.
+  /// - `standby_round_min_members` -- the fewest checked-in members that may generate a key.
+  /// - `standby_missed_checkins` -- seats drawn into a recent round that did not check in, and
+  ///   so are drawn last for an epoch: {master_node, round_height}.
   /// - `height` -- the chain tip these answers are for.
   /// - `waiting_key` -- the attested key waiting to be named, the one naming will accept if
   ///   several (absent if none): the first attested, from a committee newer than the owner's and

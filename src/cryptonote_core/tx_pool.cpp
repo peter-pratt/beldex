@@ -227,6 +227,7 @@ namespace cryptonote
       //   * rotation-ack (H.6.3)   — committee-driven, keyed by (chain_id, key_epoch);
       //   * takeover step          — a gateway committee's, keyed by (gateway, step, height);
       //   * key attestation        — one committee member's, keyed by (key, epoch, member);
+      //   * standby round check-in — one round member's, keyed by (round, member);
       //   * governance freeze / re-point — the checkpoint quorum's, keyed by (gateway, nonce);
       //   * absence report         — a committee's, keyed by its epoch;
       //   * resume                 — a paused seat's, keyed by its master node pubkey.
@@ -234,7 +235,7 @@ namespace cryptonote
       // may submit them — so they are keyed by their subject, not a pubkey.
       //
       // Dedupe so at most one pending bridge op per subject sits in the pool.
-      enum class bridge_kind { op_pubkey, slash, rotation, takeover, attestation, governance, absence, resume };
+      enum class bridge_kind { op_pubkey, slash, rotation, takeover, attestation, checkin, governance, absence, resume };
       struct bridge_key {
         bridge_kind kind;
         crypto::public_key            mn_pubkey{};
@@ -242,6 +243,7 @@ namespace cryptonote
         std::pair<uint64_t, uint64_t> rot_key{};
         std::tuple<crypto::public_key, uint8_t, uint64_t> takeover_key{};
         std::pair<crypto::public_key, uint64_t> attestation_key{}; // (key, epoch << 16 | voter)
+        std::pair<uint64_t, uint16_t> checkin_key{};              // (round height, member)
         std::pair<crypto::public_key, uint64_t> governance_key{};  // (gateway, governance nonce)
         uint64_t                      absence_epoch{};
       };
@@ -259,6 +261,13 @@ namespace cryptonote
           k.kind = bridge_kind::attestation;
           std::memcpy(k.attestation_key.first.data, att.pgw_vk.data, sizeof(att.pgw_vk.data));
           k.attestation_key.second = (att.epoch << 16) | att.voter_index;
+          // A check-in names no key: keyed by its round and member instead, so one round's
+          // member does not block another's at the same index.
+          if (att.version == BRIDGE_STANDBY_CHECKIN_VERSION)
+          {
+            k.kind = bridge_kind::checkin;
+            k.checkin_key = {att.round_height, att.voter_index};
+          }
           return true;
         }
         tx_extra_gateway_repoint repoint{};
@@ -312,6 +321,7 @@ namespace cryptonote
           case bridge_kind::rotation:  same_subject = pool_key.rot_key   == key.rot_key;   break;
           case bridge_kind::takeover:  same_subject = pool_key.takeover_key == key.takeover_key; break;
           case bridge_kind::attestation: same_subject = pool_key.attestation_key == key.attestation_key; break;
+          case bridge_kind::checkin:   same_subject = pool_key.checkin_key == key.checkin_key; break;
           case bridge_kind::governance: same_subject = pool_key.governance_key == key.governance_key; break;
           case bridge_kind::absence:   same_subject = pool_key.absence_epoch == key.absence_epoch; break;
           case bridge_kind::resume:    same_subject = pool_key.mn_pubkey == key.mn_pubkey; break;

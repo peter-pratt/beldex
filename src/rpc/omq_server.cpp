@@ -560,7 +560,9 @@ void omq_rpc::on_bridge_committee(oxenmq::Message& m)
   // for (default: current tip). No data => current committee. This is the shape
   // the Rust signer consumes to key its session engine (Phase B.9 / C.4).
   // Optional second data part "standby": the height is a standby round's start, and the
-  // committee is that round's (height = the round's start), in the same shape.
+  // committee is that round's (height = the round's start), in the same shape: while the round
+  // takes check-ins ("stage": "checkin") its drawn committee, and after ("stage": "keygen") the
+  // members that checked in, which generate the key ("size" is then how many they are).
   const auto nettype = core_.get_nettype();
   const uint64_t top = core_.get_current_blockchain_height();
   uint64_t height = top ? top - 1 : 0;
@@ -589,11 +591,13 @@ void omq_rpc::on_bridge_committee(oxenmq::Message& m)
   const uint64_t epoch_start = epoch * epoch_blocks;
 
   std::vector<crypto::public_key> committee;
+  bool checkin_closed = true;
   if (standby_round)
   {
     std::vector<crypto::ed25519_public_key> round_signer_keys;
     size_t round_threshold = 0;
-    if (!core_.get_master_node_list().get_bridge_round_committee(height, committee, round_signer_keys, round_threshold))
+    if (!core_.get_master_node_list().get_bridge_round_committee(height, committee, round_signer_keys, round_threshold,
+                                                                 /*attested_only=*/false, &checkin_closed))
       committee.clear();
   }
   else if (auto q = core_.get_quorum(master_nodes::quorum_type::bridge, epoch_start, true /*include_old*/))
@@ -659,7 +663,7 @@ void omq_rpc::on_bridge_committee(oxenmq::Message& m)
       {"x25519_keys", std::move(x25519_keys)},
       {"self_index", self_index},
       {"threshold", cryptonote::bridge_committee_threshold(nettype)},
-      {"size", cryptonote::bridge_committee_size(nettype)},
+      {"size", standby_round && checkin_closed ? uint64_t{committee.size()} : cryptonote::bridge_committee_size(nettype)},
       {"active", !committee.empty()},
       // Which network this is, so a signer can refuse its test-network-only settings
       // anywhere but a devnet (bridge/signer network_policy).
@@ -668,6 +672,8 @@ void omq_rpc::on_bridge_committee(oxenmq::Message& m)
                 : nettype == cryptonote::network_type::DEVNET    ? "devnet"
                                                                   : "fakechain"},
   };
+  if (standby_round)
+    resp["stage"] = checkin_closed ? "keygen" : "checkin";
 
   m.send_reply(OMQ_OK, resp.dump());
 }
