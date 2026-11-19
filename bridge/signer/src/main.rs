@@ -4837,10 +4837,17 @@ where
     match &ack_wallet {
         Some(_) => println!("  rotation acks: submitted and paid for by the configured wallet RPC"),
         None => println!(
-            "  rotation acks: no wallet RPC (BRIDGE_SIGNER_ACK_WALLET_RPC); each one is published on \
-             the bus for the runner's submitter to pay for, and printed"
+            "  rotation acks: no wallet RPC (BRIDGE_SIGNER_ACK_WALLET_RPC); each one is printed, to be \
+             submitted by hand"
         ),
     }
+    // The fee wallet reported low below this many atomic units (default 5 BDX): its balance and
+    // address are on /status, so whoever tops the seats' wallets up knows where and when.
+    let fee_wallet_low: u64 = std::env::var("BRIDGE_SIGNER_WALLET_LOW")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(5_000_000_000);
+    let mut fee_wallet_address: Option<String> = None;
     // L1's observed key epoch per chain, refreshed with the ack sweep.
     let mut l1_observed: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
 
@@ -5683,6 +5690,37 @@ where
                                  Until it is mined, departing members' bonds stay locked."
                             );
                         }
+                    }
+                }
+            }
+        }
+
+        // The fee wallet: its balance (whole and unlocked) and address on /status, and a problem
+        // on /health while it is low. Low is judged on the whole balance: right after paying,
+        // the change is locked for a few blocks and the unlocked part reads 0.
+        if ticks % (ack_sweep_ticks * 5) == 0 {
+            if let Some(w) = &ack_wallet {
+                use beldex_bridge_signer::evm_watcher::JsonRpcClient as _;
+                let b = w.call("get_balance", serde_json::json!({ "account_index": 0 })).ok();
+                let field = |k: &str| b.as_ref().and_then(|b| b.get(k).and_then(|x| x.as_u64()));
+                let (total, unlocked) = (field("balance"), field("unlocked_balance"));
+                status.set("fee_wallet_balance", total.map_or(serde_json::Value::Null, |u| u.into()));
+                status.set("fee_wallet_unlocked", unlocked.map_or(serde_json::Value::Null, |u| u.into()));
+                status.problem(
+                    "fee_wallet_low",
+                    match total {
+                        Some(t) if t < fee_wallet_low => Some(format!("{t} atomic units, below {fee_wallet_low}: top it up")),
+                        None => Some("fee wallet balance unreadable".into()),
+                        _ => None,
+                    },
+                );
+                if fee_wallet_address.is_none() {
+                    fee_wallet_address = w
+                        .call("get_address", serde_json::json!({ "account_index": 0 }))
+                        .ok()
+                        .and_then(|a| a.get("address").and_then(|x| x.as_str()).map(str::to_string));
+                    if let Some(a) = &fee_wallet_address {
+                        status.set("fee_wallet_address", a.as_str());
                     }
                 }
             }
