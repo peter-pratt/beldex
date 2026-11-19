@@ -2231,7 +2231,9 @@ fn run_relay_watch_standalone() -> Result<(), String> {
     // window: an `activate` arrives right after the new committee's DKG, long before the
     // contract will take it. One that could not be relayed yet is kept and tried again here
     // until it lands (or the relayer reports its key epoch already live), not left to a
-    // re-delivery that may never come.
+    // re-delivery that may never come. Held per signed copy (`<key>#<sig>`): a copy the
+    // contract refuses (signed with the wrong key, its nonce spent, its deadline passed) must
+    // not shut out the re-signed one that arrives later; the first copy that lands drops the rest.
     let mut held: std::collections::BTreeMap<String, (String, std::time::Instant)> = Default::default();
     let mut retried_at = std::time::Instant::now();
     const HOLD_RETRY: Duration = Duration::from_secs(30);
@@ -2240,7 +2242,11 @@ fn run_relay_watch_standalone() -> Result<(), String> {
     loop {
         if retried_at.elapsed() >= HOLD_RETRY && !held.is_empty() {
             retried_at = std::time::Instant::now();
-            held.retain(|key, (payload, since)| {
+            held.retain(|held_key, (payload, since)| {
+                let key = held_key.split('#').next().unwrap_or_default().to_string();
+                if handled.contains(&key) {
+                    return false;
+                }
                 if since.elapsed() >= HOLD_FOR {
                     eprintln!("     {key}: still not relayed after two days — dropped");
                     return false;
@@ -2304,7 +2310,8 @@ fn run_relay_watch_standalone() -> Result<(), String> {
                             (if txid.is_empty() { String::new() } else { format!("{txid}:{idx}") }, false)
                         }
                     };
-                    if !key.is_empty() && (handled.contains(&key) || held.contains_key(&key)) {
+                    let held_key = format!("{key}#{}", field("sig", true).unwrap_or_default());
+                    if !key.is_empty() && (handled.contains(&key) || held.contains_key(&held_key)) {
                         println!("(skip: {key} already relayed or held this session)");
                         continue;
                     }
@@ -2314,12 +2321,14 @@ fn run_relay_watch_standalone() -> Result<(), String> {
                         Ok(out) => {
                             println!("     relayed: {}", out.trim());
                             if !key.is_empty() {
+                                let prefix = format!("{key}#");
+                                held.retain(|k, _| !k.starts_with(&prefix));
                                 handled.insert(key);
                             }
                         }
                         Err(e) if hand_off => {
                             eprintln!("     not relayed yet ({e}) — held, retried every {}s", HOLD_RETRY.as_secs());
-                            held.insert(key, (payload, std::time::Instant::now()));
+                            held.insert(held_key, (payload, std::time::Instant::now()));
                         }
                         Err(e) => eprintln!(
                             "     RELAY FAILED ({e}) — will try again when it is re-delivered"
